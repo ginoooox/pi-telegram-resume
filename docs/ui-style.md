@@ -50,6 +50,8 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `⏹️` | Abort current Pi work | `/abort` command description and active `/stop` result | Stops active work; accompanying copy states separately when queued work is cleared. |
 | `🟥` | Destructive stop command | `/stop` command description | Strong warning at the command/action entrypoint; standalone results use the more precise idle or abort state icon. |
 | `🆕` | New session / fresh start | `/new`, session replacement notices | `/new` replaces the active Pi session while preserving the current classic chat or Thread target; use it only for a real session reset. |
+| `✏️` | Rename the Pi session | `/rename` command and menu entry | Distinct from `/name`, which changes the Telegram Thread title. |
+| `↩️` | Resume a saved Pi session | `/resume` list and menu entry | Switching can restore a different Telegram Thread. |
 | `🔄` | Refresh | Queue refresh row and future refresh buttons | Re-fetch/re-render current surface, not transport reconnect. |
 | `🔀` | Reroute to an existing target | Root `🔀 Reroute: send it to a Pi thread` button, the `🔀 Reroute … to:` submenu heading | Crossing arrows mean the held message branches off to another live thread; its target buttons use `🧵`. |
 | `🔁` | Replace/restore mode | Root `🔁 Restore: move a Pi into this tab` button and the `🔁 Restore into this tab & send …:` submenu heading | Same marker for the action at both levels, like `🔀` for Reroute; its target buttons use `🧵`. |

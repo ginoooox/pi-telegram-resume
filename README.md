@@ -6,7 +6,7 @@
 
 `pi-telegram` turns a private Telegram DM into a mobile operator surface for Pi. It accepts prompts, queues work, streams readable previews, delivers final replies and files, exposes safe controls, and lets companion extensions add Telegram-native capabilities without owning a second bot loop.
 
-It is a **runtime adapter**, not a remote terminal. Start or supervise work in the Pi TUI, then continue from Telegram while away from the keyboard. In Threaded Mode, a durable Workspace binding uses Pi's stable public session identity to restore the same Telegram Thread when that session resumes; live instance ownership and the exact Telegram target still authorize routing. The bridge preserves Pi session semantics instead of pretending Telegram is a PTY, shell, process launcher, or session browser. That boundary is the product: Telegram gets safe runtime handles, not raw terminal power.
+It is a **runtime adapter**, not a remote terminal. Start or supervise work in the Pi TUI, then continue from Telegram while away from the keyboard. In Threaded Mode, a durable Workspace binding uses Pi's stable public session identity to restore the same Telegram Thread when that session resumes; live instance ownership and the exact Telegram target still authorize routing. The bridge preserves Pi session semantics instead of pretending Telegram is a PTY, shell, process launcher, or unrestricted session browser. That boundary is the product: Telegram gets safe runtime handles, not raw terminal power.
 
 While connected, Telegram receives intermediate updates and final replies from local Pi work as well as Telegram-originated turns. The `Activity` setting controls whether thinking and tool details are shown. See [Outbound](docs/outbound.md#public-assistant-output) for delivery behavior.
 
@@ -170,6 +170,8 @@ Use these in the bot DM.
 | --- | --- |
 | `/start` | Pair when needed and open the main operator menu |
 | `/name [Name]` | Set a manual Thread title immediately, or open rename/reset controls when Name is omitted |
+| `/rename Name` | Rename the active Pi session without changing its Telegram Thread title |
+| `/resume [Name, number, or ID]` | List up to 12 recent sessions in the current workspace, or resume by exact name, a number from the last list, or a unique ID prefix |
 | `/new` | Start a new Pi session in the current classic chat or Thread after confirming the bridge is idle |
 | `/compact` | Confirm and run session compaction when safe |
 | `/next` | Dispatch the next queued turn, aborting first if needed |
@@ -303,7 +305,7 @@ Runtime files use `tmp/pi-telegram` with only `state.json` and `logs.jsonl` at i
 - Replace Pi session lifecycle without an official Pi API.
 - Let non-owner Telegram users control the bridge.
 
-Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, and `/new` uses Pi's public session API to start a new session in the current classic chat or Thread once the bridge is idle. Resuming, forking, browsing, and switching other sessions remain Pi TUI operations, not Telegram navigation.
+Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session; `/new` starts a new session, and `/resume` lists and switches saved sessions in the current workspace using Pi's public session API. Both switching flows require an idle bridge and preserve the connection's Thread ownership rules. Forking and tree navigation remain Pi TUI operations.
 
 Telegram prompts run in the active Pi session and use its current context, just like prompts sent from the terminal.
 

@@ -351,6 +351,8 @@ test("Command helpers expose Telegram bot command definitions", () => {
   );
   for (const command of [
     "new",
+    "rename",
+    "resume",
     "start",
     "compact",
     "next",
@@ -371,6 +373,8 @@ test("Command helpers expose Telegram bot command definitions", () => {
     },
     { command: "compact", description: "🗜 Compact current session" },
     { command: "new", description: "🆕 Start a new session" },
+    { command: "resume", description: "↩️ Resume a Pi session" },
+    { command: "rename", description: "✏️ Rename Pi session" },
     {
       command: "continue",
       description: "▶️ Queue continue prompt",
@@ -566,9 +570,9 @@ test("Command helpers register extension Telegram bot commands when visible", as
   });
   assert.deepEqual(calls, [
     [
-      ...TELEGRAM_BOT_COMMANDS.slice(0, 5),
+      ...TELEGRAM_BOT_COMMANDS.slice(0, 7),
       { command: "fresh", description: "🆕 Start fresh" },
-      ...TELEGRAM_BOT_COMMANDS.slice(5),
+      ...TELEGRAM_BOT_COMMANDS.slice(7),
     ],
   ]);
   dispose();
@@ -2536,6 +2540,91 @@ function createFencedCommandTargetFixture() {
   return { message, ctx, deps, effects, diagnostics,
     revoke: () => { current = false; }, replaceContext: () => { contextCurrent = false; } };
 }
+
+test("/rename targets the active Pi session without invoking Thread naming", async () => {
+  const f = createFencedCommandTargetFixture();
+  const names: string[] = [];
+  f.deps.setSessionName = (ctx, name) => {
+    assert.equal(ctx, f.ctx);
+    names.push(name);
+  };
+  const command = createTelegramCommandHandlerTargetRuntime(f.deps);
+  assert.equal(await command("rename", f.message, f.ctx, "  release  "), true);
+  assert.deepEqual(names, ["release"]);
+  assert.deepEqual(f.effects, ["reply"]);
+  assert.equal(await command("rename", f.message, f.ctx, "  "), true);
+  assert.deepEqual(names, ["release"]);
+  f.revoke();
+  await assert.rejects(command("rename", f.message, f.ctx, "stale"), /authority revoked/);
+  assert.deepEqual(names, ["release"]);
+});
+
+test("/resume lists numbered sessions and resolves names, stable numbers, and IDs", async () => {
+  const f = createFencedCommandTargetFixture();
+  const id = "12345678-1234-1234-1234-123456789abc";
+  const otherId = "abcdef01-1234-1234-1234-123456789abc";
+  const scheduled: string[] = [];
+  const responses: string[] = [];
+  let sessions = [
+    { id, cwd: "/repo", modified: new Date(2000), name: "Previous <work>" },
+    { id: otherId, cwd: "/repo", modified: new Date(1000), name: "Other" },
+    { id: "ffffffff-1234-1234-1234-123456789abc", cwd: "/elsewhere", modified: new Date(3000) },
+  ];
+  f.deps.listSessions = async () => sessions;
+  f.deps.getSessionId = () => "current";
+  f.deps.getCwd = () => "/repo";
+  f.deps.requestResumeSession = (_message, selected) => scheduled.push(selected);
+  f.deps.sendTextReply = async (_chat, _reply, text) => { responses.push(text); };
+  const command = createTelegramCommandHandlerTargetRuntime(f.deps);
+  assert.equal(await command("resume", f.message, f.ctx, "1"), true);
+  assert.match(responses.at(-1)!, /Run \/resume again/);
+  assert.equal(await command("resume", f.message, f.ctx, ""), true);
+  assert.match(responses.at(-1)!, /\n1\. Previous &lt;work&gt;/);
+  assert.match(responses.at(-1)!, /\n2\. Other/);
+  assert.doesNotMatch(responses.at(-1)!, /<code>\/resume/);
+  assert.doesNotMatch(responses.at(-1)!, /ffffffff/);
+  sessions = [
+    { ...sessions[0]!, modified: new Date(1000) },
+    { ...sessions[1]!, modified: new Date(3000) },
+    sessions[2]!,
+  ];
+  assert.equal(await command("resume", f.message, f.ctx, "1"), true);
+  assert.deepEqual(scheduled, [id], "A newer session must not reorder an already displayed number");
+  assert.equal(await command("resume", f.message, f.ctx, " previous <WORK> "), true);
+  assert.deepEqual(scheduled, [id, id]);
+  assert.equal(await command("resume", f.message, f.ctx, "abcdef01"), true);
+  assert.deepEqual(scheduled, [id, id, otherId]);
+  assert.equal(await command("resume", f.message, f.ctx, "unknown"), true);
+  assert.deepEqual(scheduled, [id, id, otherId]);
+});
+
+test("/resume numbers expire with their target, current session, or missing destination", async () => {
+  const f = createFencedCommandTargetFixture();
+  const id = "12345678-1234-1234-1234-123456789abc";
+  const responses: string[] = [], scheduled: string[] = [];
+  let sessions = [{ id, cwd: "/repo", modified: new Date(), name: "Saved" }];
+  let currentId = "current";
+  f.deps.assertExecutionCurrent = () => {};
+  f.deps.listSessions = async () => sessions;
+  f.deps.getSessionId = () => currentId;
+  f.deps.getCwd = () => "/repo";
+  f.deps.requestResumeSession = (_message, selected) => scheduled.push(selected);
+  f.deps.sendTextReply = async (_chat, _reply, text) => { responses.push(text); };
+  const command = createTelegramCommandHandlerTargetRuntime(f.deps);
+  await command("resume", f.message, f.ctx, "");
+  const otherThread = { ...f.message, message_thread_id: 42 };
+  await command("resume", otherThread, f.ctx, "1");
+  assert.match(responses.at(-1)!, /Run \/resume again/);
+  sessions = [];
+  await command("resume", f.message, f.ctx, "1");
+  assert.match(responses.at(-1)!, /no longer available/);
+  sessions = [{ id, cwd: "/repo", modified: new Date(), name: "Saved" }];
+  await command("resume", f.message, f.ctx, "");
+  currentId = "different";
+  await command("resume", f.message, f.ctx, "1");
+  assert.match(responses.at(-1)!, /Run \/resume again/);
+  assert.deepEqual(scheduled, []);
+});
 
 async function withControlCommandSurface(surface: "selected" | "held", f: ReturnType<typeof createFencedCommandTargetFixture>, name: "stop" | "next",
   admission: Parameters<ReturnType<typeof createTelegramCommandHandlerTargetRuntime<typeof f.message, typeof f.ctx>>["prepareSelectedCommand"]>[3],
@@ -5621,6 +5710,123 @@ test("Classic successor settles once across same-process and process-replacement
       assert.deepEqual(successorStore.listWorkspaceBindings(), []);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
+});
+
+test("Resume dispatch failure clears the pending action and reports failure", async () => {
+  const commands = new Map<string, RegisteredCommand>();
+  const results: string[] = [];
+  const runtime = createTelegramSessionActionRuntime({
+    registerCommand(name, definition) { commands.set(name, definition as RegisteredCommand); },
+    async sendUserMessage() { throw new Error("dispatch unavailable"); },
+    async notifyResult() { assert.fail("Not a new session"); },
+    async notifyResumeFailure() { results.push("failed"); },
+  });
+  runtime.register();
+  runtime.scheduleResumeAfterUpdate(42, target, "12345678-1234-1234-1234-123456789abc");
+  runtime.onUpdateCompleted(42);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(runtime.hasPending(), false);
+  assert.deepEqual(results, ["failed"]);
+  assert.ok(commands.has(TELEGRAM_INTERNAL_COMMAND_NAME));
+});
+
+test("Resume assembly validates session and Thread ownership again at the switch gateway", async () => {
+  const oldId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const resumeId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  for (const outcome of ["valid", "source-changed", "occupied", "missing"] as const) {
+    const commands = new Map<string, RegisteredCommand>(), dispatched: string[] = [];
+    const failures: string[] = [], switched: string[] = [];
+    const assembly = createTelegramSessionActionAssembly({
+      registerCommand(name, definition) { commands.set(name, definition as RegisteredCommand); },
+      async sendUserMessage(content) { dispatched.push(content as string); },
+      store: {
+        async load() {}, async refresh() {},
+        getWorkspaceBindingByTarget() {
+          return { cwd: "/repo", sessionId: outcome === "source-changed" ? "changed" : oldId,
+            target: { chatId: 7, threadId: 8 } };
+        },
+        listWorkspaceBindings() {
+          return outcome === "occupied" ? [{ cwd: "/repo", sessionId: resumeId,
+            target: { chatId: 7, threadId: 9 } }] : [];
+        },
+        getSessionReplacementIntent: () => undefined,
+        async commitSessionReplacementIntent() { return false; },
+        async removeSessionReplacementIntent() { return false; },
+      },
+      listSessions: async () => outcome === "missing" ? [] : [{ id: resumeId, cwd: "/repo",
+        path: "/repo/previous.jsonl", modified: new Date(), created: new Date(), messageCount: 1,
+        firstMessage: "", lastMessage: "", allMessagesText: "" }],
+      getProfileName: () => undefined, ownsPersistence: () => true,
+      async sendResult(_target, html) { failures.push(html); return { ok: true }; },
+      handoffTtlMs: 30_000, now: () => 1000,
+    });
+    assembly.action.register();
+    assert.equal(assembly.action.scheduleResumeAfterUpdate(42, target, resumeId), true);
+    assembly.action.onUpdateCompleted(42);
+    await Promise.resolve();
+    await commands.get(TELEGRAM_INTERNAL_COMMAND_NAME)!.handler(getInternalCommandToken(dispatched[0]!), {
+      cwd: "/repo", sessionManager: { getSessionId: () => oldId },
+      async switchSession(path: string) { switched.push(path); return { cancelled: false }; },
+    } as unknown as ExtensionCommandContext);
+    assert.deepEqual(switched, outcome === "valid" ? ["/repo/previous.jsonl"] : []);
+    assert.equal(failures.length, outcome === "valid" ? 0 : 1);
+  }
+});
+
+test("Resume action needs completed update and one-use token before switching", async () => {
+  const commands = new Map<string, RegisteredCommand>();
+  const dispatched: string[] = [], paths: string[] = [], failures: unknown[] = [];
+  const runtime = createTelegramSessionActionRuntime({
+    registerCommand(name, definition) { commands.set(name, definition as RegisteredCommand); },
+    async sendUserMessage(content) { dispatched.push(content as string); },
+    async notifyResult() { assert.fail("Resume must not report new-session result"); },
+    async prepareResume(_ctx, id, nextTarget) {
+      assert.equal(id, "12345678-1234-1234-1234-123456789abc");
+      assert.deepEqual(nextTarget, target);
+      return "/repo/previous.jsonl";
+    },
+    async notifyResumeFailure() { assert.fail("Successful resume cannot fail"); },
+    recordRuntimeEvent(_category, error) { failures.push(error); },
+  });
+  runtime.register();
+  assert.equal(runtime.scheduleResumeAfterUpdate(42, target, "12345678-1234-1234-1234-123456789abc"), true);
+  assert.equal(runtime.scheduleAfterUpdate(43, target), false);
+  runtime.onUpdateCompleted(43);
+  await Promise.resolve();
+  assert.deepEqual(dispatched, []);
+  runtime.onUpdateCompleted(42);
+  await Promise.resolve();
+  const command = commands.get(TELEGRAM_INTERNAL_COMMAND_NAME)!;
+  await command.handler("manual", { ui: { notify() {} } } as unknown as ExtensionCommandContext);
+  assert.equal(paths.length, 0);
+  const ctx = { switchSession: async (path: string) => { paths.push(path); return { cancelled: false }; } } as unknown as ExtensionCommandContext;
+  await command.handler(getInternalCommandToken(dispatched[0]!), ctx);
+  await command.handler(getInternalCommandToken(dispatched[0]!), { ui: { notify() {} } } as unknown as ExtensionCommandContext);
+  assert.deepEqual(paths, ["/repo/previous.jsonl"]);
+  assert.deepEqual(failures, []);
+});
+
+test("Resume action refuses a stale target before invoking Pi", async () => {
+  const commands = new Map<string, RegisteredCommand>();
+  const dispatched: string[] = [], failures: unknown[] = [];
+  let notified = 0;
+  const runtime = createTelegramSessionActionRuntime({
+    registerCommand(name, definition) { commands.set(name, definition as RegisteredCommand); },
+    async sendUserMessage(content) { dispatched.push(content as string); },
+    async notifyResult() { assert.fail("No new-session result"); },
+    async prepareResume() { throw new Error("Telegram source Thread binding changed."); },
+    async notifyResumeFailure() { notified++; },
+    recordRuntimeEvent(_category, error) { failures.push(error); },
+  });
+  runtime.register();
+  runtime.scheduleResumeAfterUpdate(42, target, "12345678-1234-1234-1234-123456789abc");
+  runtime.onUpdateCompleted(42);
+  await Promise.resolve();
+  await commands.get(TELEGRAM_INTERNAL_COMMAND_NAME)!.handler(getInternalCommandToken(dispatched[0]!), {
+    switchSession() { assert.fail("A stale target cannot switch Pi sessions"); },
+  } as unknown as ExtensionCommandContext);
+  assert.equal(notified, 1);
+  assert.match(String(failures[0]), /binding changed/);
 });
 
 test("Session action dispatch waits for the exact durable update completion", async () => {

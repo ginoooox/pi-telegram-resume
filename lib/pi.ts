@@ -5,6 +5,10 @@
  */
 
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
+import { createReadStream, type Dirent } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import {
   type AgentEndEvent,
   type AgentSettledEvent,
@@ -23,6 +27,7 @@ import {
   type UIPromptEndEvent,
   type UIPromptStartEvent,
   SettingsManager,
+  type SessionInfo,
 } from "@earendil-works/pi-coding-agent";
 
 export type {
@@ -40,10 +45,58 @@ export type {
   SessionCompactEvent,
   SessionShutdownEvent,
   SessionStartEvent,
+  SessionInfo,
   SlashCommandInfo,
   UIPromptEndEvent,
   UIPromptStartEvent,
 };
+
+export type PiSessionSummary = Pick<SessionInfo, "id" | "cwd" | "path" | "modified"> &
+  Partial<Pick<SessionInfo, "name">>;
+
+export async function listPiSessions(ctx: ExtensionContext): Promise<PiSessionSummary[]> {
+  const dir = ctx.sessionManager.getSessionDir();
+  let files: Dirent[];
+  try {
+    files = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  const sessions: PiSessionSummary[] = [];
+  for (const file of files.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))) {
+    const path = join(dir, file.name);
+    try {
+      const modified = (await stat(path)).mtime;
+      const stream = createReadStream(path, { encoding: "utf8" });
+      const lines = createInterface({ input: stream, crlfDelay: Infinity });
+      let header: { id: string; cwd: string } | undefined;
+      let name: string | undefined;
+      try {
+        for await (const line of lines) {
+          let entry: { type?: unknown; id?: unknown; cwd?: unknown; name?: unknown };
+          try { entry = JSON.parse(line); } catch { continue; }
+          if (!entry || typeof entry !== "object") continue;
+          if (!header) {
+            if (entry.type !== "session" || typeof entry.id !== "string" ||
+                typeof entry.cwd !== "string") break;
+            header = { id: entry.id, cwd: entry.cwd };
+          } else if (entry.type === "session_info") {
+            name = typeof entry.name === "string" ? entry.name.trim() || undefined : undefined;
+          }
+        }
+      } finally {
+        lines.close();
+        stream.destroy();
+      }
+      if (header && resolve(header.cwd) === resolve(ctx.cwd))
+        sessions.push({ id: header.id, cwd: ctx.cwd, path, modified, ...(name ? { name } : {}) });
+    } catch {
+      // A deleted or unreadable session does not prevent browsing other sessions.
+    }
+  }
+  return sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+}
 
 export interface SessionCompactFailedEvent {
   type: "session_compact_failed";

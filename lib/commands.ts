@@ -398,7 +398,9 @@ export const TELEGRAM_COMMAND_EMOJI = {
   abort: "⏹️",
   stop: "🟥",
   name: "🏷️",
+  rename: "✏️",
   new: "🆕",
+  resume: "↩️",
 } as const;
 
 export type TelegramCommandEmojiName = keyof typeof TELEGRAM_COMMAND_EMOJI;
@@ -494,6 +496,20 @@ const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinition[] = [
     description: formatTelegramBotCommandDescription(
       "new",
       "Start a new session",
+    ),
+  },
+  {
+    command: "resume",
+    description: formatTelegramBotCommandDescription(
+      "resume",
+      "Resume a Pi session",
+    ),
+  },
+  {
+    command: "rename",
+    description: formatTelegramBotCommandDescription(
+      "rename",
+      "Rename Pi session",
     ),
   },
   {
@@ -960,6 +976,8 @@ export function registerTelegramBridgeCommands(
 export const TELEGRAM_RESERVED_COMMAND_NAMES = [
   "stop",
   "name",
+  "rename",
+  "resume",
   "new",
   "abort",
   "next",
@@ -994,6 +1012,8 @@ export type TelegramCommandAction =
   | { kind: "ignore"; executionMode: "ignored" }
   | { kind: "stop"; executionMode: "immediate" }
   | { kind: "name"; executionMode: "immediate" }
+  | { kind: "rename"; executionMode: "immediate" }
+  | { kind: "resume"; executionMode: "immediate" }
   | { kind: "new"; executionMode: "immediate" }
   | { kind: "abort"; executionMode: "immediate" }
   | { kind: "next"; executionMode: "immediate" }
@@ -1013,6 +1033,8 @@ export type TelegramCommandAction =
 export interface TelegramCommandActionDeps<TMessage, TContext> {
   handleStop: (message: TMessage, ctx: TContext) => Promise<void>;
   handleName: (message: TMessage, ctx: TContext, name: string) => Promise<void>;
+  handleRename?: (message: TMessage, ctx: TContext, name: string) => Promise<void>;
+  handleResume?: (message: TMessage, ctx: TContext, args: string) => Promise<void>;
   handleNew: (message: TMessage, ctx: TContext) => Promise<void>;
   handleAbort: (message: TMessage, ctx: TContext) => Promise<void>;
   handleNext: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -1511,6 +1533,11 @@ export interface TelegramCommandRuntimeDeps<
     };
   };
   requestNewSession?: (message: TMessage) => void;
+  setSessionName?: (ctx: TContext, name: string) => void;
+  listSessions?: (ctx: TContext) => Promise<readonly TelegramSessionChoice[]>;
+  getSessionId?: (ctx: TContext) => string;
+  getCwd?: (ctx: TContext) => string;
+  requestResumeSession?: (message: TMessage, sessionId: string) => void;
   compact: (
     ctx: TContext,
     callbacks: { onComplete: () => void; onError: (error: unknown) => void },
@@ -1597,6 +1624,8 @@ function formatTelegramAppMenuIntroHtml(
     line("start", "Open menu / Pair bridge"),
     line("compact", "Compact current session"),
     line("new", "Start a new session"),
+    line("rename", "Rename Pi session"),
+    line("resume", "Resume a Pi session"),
     line("continue", "Queue continue prompt"),
     line("next", "Force next turn"),
     ...extensionLines,
@@ -1678,6 +1707,68 @@ function formatTelegramCompactionFailure(error: unknown): string {
   return `Compaction failed! ${sentence}`;
 }
 
+export function parseSessionRename(args: string):
+  | { name: string }
+  | { error: string } {
+  const name = args.trim();
+  if (!name) return { error: "Usage: /rename <session name>" };
+  if ([...name].length > 80 || /[\u0000-\u001f\u007f]/u.test(name)) {
+    return { error: "Session name must be at most 80 characters on one line." };
+  }
+  return { name };
+}
+
+export type TelegramSessionChoice = Pick<Pi.SessionInfo, "id" | "cwd" | "modified"> &
+  Partial<Pick<Pi.SessionInfo, "name">>;
+
+function normalizeSessionName(name: string): string {
+  return name.trim().replace(/\s+/gu, " ").toLowerCase();
+}
+
+export function selectSessionToResume(
+  sessions: readonly (Pick<Pi.SessionInfo, "id" | "cwd"> & Partial<Pick<Pi.SessionInfo, "name">>)[],
+  cwd: string,
+  currentId: string,
+  requested: string,
+): { id: string } | { error: string } {
+  const key = requested.trim().toLowerCase();
+  const local = sessions.filter((session) => session.cwd === cwd);
+  const ids = /^[a-f0-9-]{8,36}$/u.test(key)
+    ? local.filter((session) => session.id.toLowerCase().startsWith(key))
+    : [];
+  const matches = ids.length ? ids : local.filter((session) =>
+    session.name !== undefined && normalizeSessionName(session.name) === normalizeSessionName(requested),
+  );
+  if (matches.length > 1)
+    return { error: ids.length
+      ? "Session ID is ambiguous; use more characters."
+      : "Several sessions have that name; use a number from /resume or a session ID." };
+  if (!matches.length) return { error: "Session not found in this workspace." };
+  if (matches[0]!.id === currentId)
+    return { error: "This session is already active." };
+  return { id: matches[0]!.id };
+}
+
+interface TelegramResumeList {
+  cwd: string;
+  currentId: string;
+  ids: string[];
+  createdAt: number;
+}
+
+const RESUME_LIST_MAX_AGE_MS = 10 * 60_000;
+const RESUME_LIST_MAX_TARGETS = 32;
+
+export function renameSession(
+  args: string,
+  setName: (name: string) => void,
+): string {
+  const parsed = parseSessionRename(args);
+  if ("error" in parsed) return parsed.error;
+  setName(parsed.name);
+  return `Pi session renamed: ${parsed.name}`;
+}
+
 export function parseTelegramCommand(
   text: string,
 ): ParsedTelegramCommand | undefined {
@@ -1692,6 +1783,8 @@ export function parseTelegramCommand(
 export const TELEGRAM_COMMAND_ACTIONS = {
   stop: { kind: "stop", executionMode: "immediate" },
   name: { kind: "name", executionMode: "immediate" },
+  rename: { kind: "rename", executionMode: "immediate" },
+  resume: { kind: "resume", executionMode: "immediate" },
   new: { kind: "new", executionMode: "immediate" },
   abort: { kind: "abort", executionMode: "immediate" },
   next: { kind: "next", executionMode: "immediate" },
@@ -2144,6 +2237,14 @@ export async function executeTelegramCommandAction<TMessage, TContext>(
     case "name":
       await deps.handleName(message, ctx, commandArgs);
       return true;
+    case "rename":
+      if (!deps.handleRename) return false;
+      await deps.handleRename(message, ctx, commandArgs);
+      return true;
+    case "resume":
+      if (!deps.handleResume) return false;
+      await deps.handleResume(message, ctx, commandArgs);
+      return true;
     case "new":
       await deps.handleNew(message, ctx);
       return true;
@@ -2253,6 +2354,11 @@ export function createTelegramCommandHandlerTargetRuntime<
     heldTurn: deps.heldTurn,
     compact: deps.compact,
     requestNewSession: deps.requestNewSession,
+    setSessionName: deps.setSessionName,
+    listSessions: deps.listSessions,
+    getSessionId: deps.getSessionId,
+    getCwd: deps.getCwd,
+    requestResumeSession: deps.requestResumeSession,
     sendInteractiveMessage: deps.sendInteractiveMessage,
     enqueueControlItem: commandTargetRuntime.enqueueControlItem,
     showStatus: commandTargetRuntime.showStatus,
@@ -2358,6 +2464,7 @@ export function createTelegramCommandHandler<
   TMessage extends TelegramCommandRuntimeMessage,
   TContext,
 >(deps: TelegramCommandRuntimeDeps<TMessage, TContext>) {
+  const resumeLists = new Map<string, TelegramResumeList>();
   const handle = async (
     commandName: string | undefined,
     message: TMessage,
@@ -2370,6 +2477,7 @@ export function createTelegramCommandHandler<
       ctx,
       deps,
       commandArgs,
+      resumeLists,
     );
   };
   // Shared held-plan core: binds the exact saved carrier once and fences source, completion and owner ports.
@@ -2815,6 +2923,7 @@ export function createTelegramCommandHandler<
                   captured.showStatus(value, context, recipientOptions),
               },
               command.args,
+              resumeLists,
             );
           },
         };
@@ -3636,7 +3745,7 @@ export function createTelegramCommandHandler<
         assertIssuanceCurrent,
         async () =>
           reportCompleted.call(admission) &&
-          handleTelegramCommandRuntime(name, message, ctx, recipientDeps, args),
+          handleTelegramCommandRuntime(name, message, ctx, recipientDeps, args, resumeLists),
       );
     },
   });
@@ -3938,6 +4047,7 @@ async function handleTelegramCommandRuntime<
   ctx: TContext,
   deps: TelegramCommandRuntimeDeps<TMessage, TContext>,
   commandArgs = "",
+  resumeLists?: Map<string, TelegramResumeList>,
 ): Promise<boolean> {
   deps.assertExecutionCurrent?.(message);
   const assertExecutionCurrentFor = (nextMessage: TMessage) => (): void =>
@@ -4018,6 +4128,91 @@ async function handleTelegramCommandRuntime<
           () => deps.openQueueMenu(nextMessage, commandCtx),
           assertExecutionCurrentFor(nextMessage),
         );
+      },
+      handleRename: async (nextMessage, commandCtx, requestedName) => {
+        if (!deps.setSessionName) {
+          await sendReplyFor(nextMessage)("Pi session naming is unavailable.");
+          return;
+        }
+        deps.assertExecutionCurrent?.(nextMessage);
+        const text = renameSession(requestedName, (name) =>
+          deps.setSessionName!(commandCtx, name),
+        );
+        await sendReplyFor(nextMessage)(text);
+      },
+      handleResume: async (nextMessage, commandCtx, requested) => {
+        const reply = sendReplyFor(nextMessage);
+        if (!deps.listSessions || !deps.getSessionId || !deps.getCwd) {
+          await reply("Pi session browsing is unavailable.");
+          return;
+        }
+        const cwd = deps.getCwd(commandCtx);
+        const currentId = deps.getSessionId(commandCtx);
+        const target = getTelegramCommandMessageTarget(nextMessage);
+        const listKey = `${target.chatId}:${target.threadId ?? ""}`;
+        const sessions = (await deps.listSessions(commandCtx))
+          .filter((session) => session.cwd === cwd)
+          .sort((a, b) => b.modified.getTime() - a.modified.getTime());
+        deps.assertExecutionCurrent?.(nextMessage);
+        if (!requested.trim()) {
+          resumeLists?.delete(listKey);
+          const items = sessions.filter((session) => session.id !== currentId).slice(0, 12);
+          const list = items.length
+            ? items.map((session, index) => `${index + 1}. ${escapeHtml(session.name?.replace(/\s+/gu, " ").slice(0, 80) || session.id.slice(0, 12))}`).join("\n")
+            : "No previous sessions in this workspace.";
+          await reply(`<b>↩️ Recent Pi sessions:</b>\n${list}`, { parseMode: "HTML" });
+          if (resumeLists) {
+            resumeLists.set(listKey, { cwd, currentId, ids: items.map((session) => session.id), createdAt: Date.now() });
+            if (resumeLists.size > RESUME_LIST_MAX_TARGETS)
+              resumeLists.delete(resumeLists.keys().next().value!);
+          }
+          return;
+        }
+        if (isTelegramSessionBusy({
+          isIdle: () => deps.isIdle(commandCtx),
+          hasPendingMessages: () => deps.hasPendingMessages(commandCtx),
+          hasActiveTelegramTurn: deps.hasActiveTelegramTurn,
+          hasDispatchPending: deps.hasDispatchPending,
+          hasQueuedTelegramItems: deps.hasQueuedTelegramItems,
+          isCompactionInProgress: deps.isCompactionInProgress,
+        })) {
+          await reply("Pi or the Telegram queue is busy. Finish queued turns before resuming.");
+          return;
+        }
+        let key = requested.trim();
+        if (/^[1-9]\d?$/u.test(key)) {
+          const snapshot = resumeLists?.get(listKey);
+          if (!snapshot || snapshot.cwd !== cwd || snapshot.currentId !== currentId ||
+              Date.now() - snapshot.createdAt > RESUME_LIST_MAX_AGE_MS) {
+            resumeLists?.delete(listKey);
+            await reply("Run /resume again to get a numbered list for this chat.");
+            return;
+          }
+          const id = snapshot.ids[Number(key) - 1];
+          if (!id) {
+            await reply("Choose a number shown by /resume.");
+            return;
+          }
+          if (!sessions.some((session) => session.id === id)) {
+            resumeLists?.delete(listKey);
+            await reply("That session is no longer available. Run /resume again.");
+            return;
+          }
+          key = id;
+        }
+        const selection = selectSessionToResume(sessions, cwd, currentId, key);
+        if ("error" in selection) {
+          await reply(selection.error);
+          return;
+        }
+        if (!deps.requestResumeSession) {
+          await reply("Pi session switching is unavailable.");
+          return;
+        }
+        deps.assertExecutionCurrent?.(nextMessage);
+        deps.requestResumeSession(nextMessage, selection.id);
+        resumeLists?.delete(listKey);
+        await reply("Switching Pi session.");
       },
       handleNew: async (nextMessage, commandCtx) => {
         if (deps.sendInteractiveMessage) {
@@ -4161,6 +4356,12 @@ export interface TelegramSessionActionRuntimeDeps {
     updateId: number,
     target: { chatId: number; threadId?: number; messageId: number },
   ) => Promise<void>;
+  prepareResume?: (
+    ctx: Pi.ExtensionCommandContext,
+    sessionId: string,
+    target: { chatId: number; threadId?: number; messageId: number },
+  ) => Promise<string>;
+  notifyResumeFailure?: (target: { chatId: number; threadId?: number; messageId: number }) => Promise<void>;
   recordRuntimeEvent?: (category: string, error: unknown) => void;
 }
 
@@ -4251,6 +4452,12 @@ export interface TelegramSessionActionAssemblyDeps {
           target: { chatId: number; threadId: number };
         }
       | undefined;
+    listWorkspaceBindings?: () => readonly {
+      cwd: string;
+      sessionId?: string;
+      inactiveSinceMs?: number;
+      target: { chatId: number; threadId: number };
+    }[];
     getSessionReplacementIntent: () =>
       TelegramSessionReplacementIntent | undefined;
     commitSessionReplacementIntent: (
@@ -4263,6 +4470,8 @@ export interface TelegramSessionActionAssemblyDeps {
     ) => Promise<boolean>;
   };
   getProfileName: () => string | undefined;
+  listSessions?: (ctx: Pi.ExtensionContext) => Promise<readonly Pi.PiSessionSummary[]>;
+  assertResumeIdle?: (ctx: Pi.ExtensionCommandContext) => void;
   ownsPersistence: () => boolean;
   /**
    * Registered-follower port. A follower cannot persist leader-owned state, so
@@ -4317,6 +4526,37 @@ export function createTelegramSessionActionAssembly(
   const action = createTelegramSessionActionRuntime({
     registerCommand: deps.registerCommand,
     sendUserMessage: deps.sendUserMessage,
+    notifyResumeFailure(target) {
+      return deps.sendResult(target, "<b>⚠️ Pi session resume failed. Check /telegram-status --debug.</b>").then(() => {});
+    },
+    async prepareResume(ctx, sessionId, target) {
+      deps.assertResumeIdle?.(ctx);
+      if (deps.store.refresh) await deps.store.refresh();
+      else await deps.store.load();
+      const sourceId = ctx.sessionManager.getSessionId();
+      if (sourceId === sessionId) throw new Error("Pi session is already active.");
+      if (typeof target.threadId === "number") {
+        if (!deps.store.listWorkspaceBindings)
+          throw new Error("Telegram Thread occupancy is unavailable.");
+        if (!deps.ownsPersistence() && deps.follower && !deps.follower.isRegisteredFor(target))
+          throw new Error("Telegram follower no longer owns the source Thread.");
+        const source = deps.store.getWorkspaceBindingByTarget(target);
+        if (!source || source.cwd !== ctx.cwd || source.sessionId !== sourceId)
+          throw new Error("Telegram source Thread binding changed.");
+        const occupied = deps.store.listWorkspaceBindings?.().some((binding) =>
+          binding.cwd === ctx.cwd && binding.sessionId === sessionId &&
+          binding.inactiveSinceMs === undefined &&
+          (binding.target.chatId !== target.chatId || binding.target.threadId !== target.threadId),
+        );
+        if (occupied) throw new Error("Target Pi session belongs to another active Thread.");
+      }
+      if (!deps.listSessions) throw new Error("Pi session discovery is unavailable.");
+      const matches = (await deps.listSessions(ctx)).filter((session) =>
+        session.id === sessionId && session.cwd === ctx.cwd,
+      );
+      if (matches.length !== 1) throw new Error("Target Pi session is unavailable.");
+      return matches[0]!.path;
+    },
     notifyResult(target, result) {
       return sendTerminalResult(target, result);
     },
@@ -4440,10 +4680,11 @@ export function createTelegramSessionActionAssembly(
 }
 
 type TelegramPendingInternalAction = {
-  kind: "replace-session";
+  kind: "replace-session" | "resume-session";
   token: string;
   updateId: number;
   target: { chatId: number; threadId?: number; messageId: number };
+  sessionId?: string;
 };
 
 export interface TelegramSessionActionRuntime {
@@ -4451,6 +4692,11 @@ export interface TelegramSessionActionRuntime {
   scheduleAfterUpdate: (
     updateId: number,
     target: { chatId: number; threadId?: number; messageId: number },
+  ) => boolean;
+  scheduleResumeAfterUpdate: (
+    updateId: number,
+    target: { chatId: number; threadId?: number; messageId: number },
+    sessionId: string,
   ) => boolean;
   onUpdateCompleted: (updateId: number) => void;
   hasPending: () => boolean;
@@ -4468,11 +4714,12 @@ export function createTelegramSessionActionRuntime(
       }
     | undefined;
   let pendingAction: TelegramPendingInternalAction | undefined;
+  let pendingResumeId: string | undefined;
   let registered = false;
 
-  const reportFailure = (error: unknown): void => {
+  const reportFailure = (error: unknown, category = "new-session"): void => {
     try {
-      deps.recordRuntimeEvent?.("new-session", error);
+      deps.recordRuntimeEvent?.(category, error);
     } catch {
       // Diagnostics cannot make a completed durable update retryable.
     }
@@ -4507,6 +4754,18 @@ export function createTelegramSessionActionRuntime(
                 await deps.notifyResult(action.target, "failure");
               }
               return;
+            case "resume-session":
+              try {
+                if (!action.sessionId || !deps.prepareResume)
+                  throw new Error("Pi session resume is unavailable.");
+                const path = await deps.prepareResume(ctx, action.sessionId, action.target);
+                const result = await ctx.switchSession(path);
+                if (result.cancelled) await deps.notifyResumeFailure?.(action.target);
+              } catch (error) {
+                reportFailure(error, "resume-session");
+                await deps.notifyResumeFailure?.(action.target);
+              }
+              return;
           }
         },
       });
@@ -4518,6 +4777,14 @@ export function createTelegramSessionActionRuntime(
       pendingTarget = { ...target };
       return true;
     },
+    scheduleResumeAfterUpdate(updateId, target, sessionId) {
+      if (pendingUpdateId !== undefined || pendingAction !== undefined)
+        return false;
+      pendingUpdateId = updateId;
+      pendingTarget = { ...target };
+      pendingResumeId = sessionId;
+      return true;
+    },
     onUpdateCompleted(updateId) {
       if (pendingUpdateId !== updateId) return;
       pendingUpdateId = undefined;
@@ -4525,16 +4792,26 @@ export function createTelegramSessionActionRuntime(
       pendingTarget = undefined;
       if (!target) return;
       const token = randomUUID();
-      pendingAction = { kind: "replace-session", token, updateId, target };
+      pendingAction = {
+        kind: pendingResumeId ? "resume-session" : "replace-session",
+        token, updateId, target,
+        ...(pendingResumeId ? { sessionId: pendingResumeId } : {}),
+      };
+      pendingResumeId = undefined;
+      const action = pendingAction;
       void Promise.resolve()
         .then(() =>
           deps.sendUserMessage(`/${TELEGRAM_INTERNAL_COMMAND_NAME} ${token}`, {
             expandPromptTemplates: true,
           }),
         )
-        .catch((error) => {
-          pendingAction = undefined;
-          reportFailure(error);
+        .catch(async (error) => {
+          if (pendingAction === action) pendingAction = undefined;
+          reportFailure(error, action.kind);
+          if (action.kind === "resume-session") {
+            try { await deps.notifyResumeFailure?.(target); }
+            catch (notifyError) { reportFailure(notifyError, "resume-session"); }
+          }
         });
     },
     hasPending() {

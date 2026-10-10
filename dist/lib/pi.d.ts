@@ -4,8 +4,10 @@
  * Owns direct pi SDK imports and exposes narrow bridge-facing helpers/types for the extension composition layer
  */
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
-import { type AgentEndEvent, type AgentSettledEvent, type AgentStartEvent, type BeforeAgentStartEvent, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type InputEvent, type MessageEndEvent, type SessionBeforeCompactEvent, type SessionCompactEvent, type SessionShutdownEvent, type SessionStartEvent, type SlashCommandInfo, type UIPromptEndEvent, type UIPromptStartEvent } from "@earendil-works/pi-coding-agent";
-export type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, ExtensionAPI, ExtensionCommandContext, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionShutdownEvent, SessionStartEvent, SlashCommandInfo, UIPromptEndEvent, UIPromptStartEvent, };
+import { type AgentEndEvent, type AgentSettledEvent, type AgentStartEvent, type BeforeAgentStartEvent, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type InputEvent, type MessageEndEvent, type SessionBeforeCompactEvent, type SessionCompactEvent, type SessionShutdownEvent, type SessionStartEvent, type SlashCommandInfo, type UIPromptEndEvent, type UIPromptStartEvent, type SessionInfo } from "@earendil-works/pi-coding-agent";
+export type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, ExtensionAPI, ExtensionCommandContext, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionShutdownEvent, SessionStartEvent, SessionInfo, SlashCommandInfo, UIPromptEndEvent, UIPromptStartEvent, };
+export type PiSessionSummary = Pick<SessionInfo, "id" | "cwd" | "path" | "modified"> & Partial<Pick<SessionInfo, "name">>;
+export declare function listPiSessions(ctx: ExtensionContext): Promise<PiSessionSummary[]>;
 export interface SessionCompactFailedEvent {
     type: "session_compact_failed";
     reason: "manual" | "threshold" | "overflow";

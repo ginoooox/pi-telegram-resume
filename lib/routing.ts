@@ -1694,6 +1694,11 @@ export interface TelegramInboundRouteRuntimeDeps<
   isIdle: (ctx: TContext) => boolean;
   hasPendingMessages: (ctx: TContext) => boolean;
   requestNewSession?: (source: unknown) => void;
+  setSessionName?: (ctx: TContext, name: string) => void;
+  listSessions?: (ctx: TContext) => Promise<readonly Commands.TelegramSessionChoice[]>;
+  getSessionId?: (ctx: TContext) => string;
+  getCwd?: (ctx: TContext) => string;
+  requestResumeSession?: (source: unknown, sessionId: string) => void;
   compact: (
     ctx: TContext,
     callbacks: { onComplete: () => void; onError: (error: unknown) => void },
@@ -9327,6 +9332,11 @@ export function createTelegramInboundRouteRuntime<
     },
     compact: deps.compact,
     requestNewSession: deps.requestNewSession,
+    setSessionName: deps.setSessionName,
+    listSessions: deps.listSessions,
+    getSessionId: deps.getSessionId,
+    getCwd: deps.getCwd,
+    requestResumeSession: deps.requestResumeSession,
     allocateItemOrder: deps.bridgeRuntime.queue.allocateItemOrder,
     allocateControlOrder: deps.bridgeRuntime.queue.allocateControlOrder,
     appendControlItem: deps.queueMutationRuntime.append,

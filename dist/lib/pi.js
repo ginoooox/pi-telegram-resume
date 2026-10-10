@@ -3,7 +3,66 @@
  * Zones: pi agent sdk boundary, shared adapters
  * Owns direct pi SDK imports and exposes narrow bridge-facing helpers/types for the extension composition layer
  */
+import { createReadStream } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { SettingsManager, } from "@earendil-works/pi-coding-agent";
+export async function listPiSessions(ctx) {
+    const dir = ctx.sessionManager.getSessionDir();
+    let files;
+    try {
+        files = await readdir(dir, { withFileTypes: true });
+    }
+    catch (error) {
+        if (error.code === "ENOENT")
+            return [];
+        throw error;
+    }
+    const sessions = [];
+    for (const file of files.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))) {
+        const path = join(dir, file.name);
+        try {
+            const modified = (await stat(path)).mtime;
+            const stream = createReadStream(path, { encoding: "utf8" });
+            const lines = createInterface({ input: stream, crlfDelay: Infinity });
+            let header;
+            let name;
+            try {
+                for await (const line of lines) {
+                    let entry;
+                    try {
+                        entry = JSON.parse(line);
+                    }
+                    catch {
+                        continue;
+                    }
+                    if (!entry || typeof entry !== "object")
+                        continue;
+                    if (!header) {
+                        if (entry.type !== "session" || typeof entry.id !== "string" ||
+                            typeof entry.cwd !== "string")
+                            break;
+                        header = { id: entry.id, cwd: entry.cwd };
+                    }
+                    else if (entry.type === "session_info") {
+                        name = typeof entry.name === "string" ? entry.name.trim() || undefined : undefined;
+                    }
+                }
+            }
+            finally {
+                lines.close();
+                stream.destroy();
+            }
+            if (header && resolve(header.cwd) === resolve(ctx.cwd))
+                sessions.push({ id: header.id, cwd: ctx.cwd, path, modified, ...(name ? { name } : {}) });
+        }
+        catch {
+            // A deleted or unreadable session does not prevent browsing other sessions.
+        }
+    }
+    return sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+}
 function isPiRunMode(value) {
     return (value === "tui" || value === "rpc" || value === "json" || value === "print");
 }

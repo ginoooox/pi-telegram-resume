@@ -136,7 +136,9 @@ export declare const TELEGRAM_COMMAND_EMOJI: {
     readonly abort: "⏹️";
     readonly stop: "🟥";
     readonly name: "🏷️";
+    readonly rename: "✏️";
     readonly new: "🆕";
+    readonly resume: "↩️";
 };
 export type TelegramCommandEmojiName = keyof typeof TELEGRAM_COMMAND_EMOJI;
 export declare function formatTelegramCommandEmojiPrefix(command: TelegramCommandEmojiName): string;
@@ -215,7 +217,7 @@ export declare function createTelegramThreadDisplayNameRenameBinding(): {
     rename: TelegramThreadDisplayNameRenamePort;
 };
 export declare function registerTelegramBridgeCommands(pi: ExtensionAPI, deps: TelegramBridgeCommandRegistrationDeps): void;
-export declare const TELEGRAM_RESERVED_COMMAND_NAMES: readonly ["stop", "name", "new", "abort", "next", "continue", "status", "queue", "compact", "model", "thinking", "settings", "help", "start"];
+export declare const TELEGRAM_RESERVED_COMMAND_NAMES: readonly ["stop", "name", "rename", "resume", "new", "abort", "next", "continue", "status", "queue", "compact", "model", "thinking", "settings", "help", "start"];
 export type TelegramReservedCommandName = (typeof TELEGRAM_RESERVED_COMMAND_NAMES)[number];
 export declare function isTelegramReservedCommandName(commandName: string | undefined): commandName is TelegramReservedCommandName;
 export type TelegramCommandAction = {
@@ -226,6 +228,12 @@ export type TelegramCommandAction = {
     executionMode: "immediate";
 } | {
     kind: "name";
+    executionMode: "immediate";
+} | {
+    kind: "rename";
+    executionMode: "immediate";
+} | {
+    kind: "resume";
     executionMode: "immediate";
 } | {
     kind: "new";
@@ -265,6 +273,8 @@ export type TelegramCommandAction = {
 export interface TelegramCommandActionDeps<TMessage, TContext> {
     handleStop: (message: TMessage, ctx: TContext) => Promise<void>;
     handleName: (message: TMessage, ctx: TContext, name: string) => Promise<void>;
+    handleRename?: (message: TMessage, ctx: TContext, name: string) => Promise<void>;
+    handleResume?: (message: TMessage, ctx: TContext, args: string) => Promise<void>;
     handleNew: (message: TMessage, ctx: TContext) => Promise<void>;
     handleAbort: (message: TMessage, ctx: TContext) => Promise<void>;
     handleNext: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -466,6 +476,11 @@ export interface TelegramCommandRuntimeDeps<TMessage extends TelegramCommandRunt
         };
     };
     requestNewSession?: (message: TMessage) => void;
+    setSessionName?: (ctx: TContext, name: string) => void;
+    listSessions?: (ctx: TContext) => Promise<readonly TelegramSessionChoice[]>;
+    getSessionId?: (ctx: TContext) => string;
+    getCwd?: (ctx: TContext) => string;
+    requestResumeSession?: (message: TMessage, sessionId: string) => void;
     compact: (ctx: TContext, callbacks: {
         onComplete: () => void;
         onError: (error: unknown) => void;
@@ -507,6 +522,18 @@ export declare function createTelegramAppMenuHtmlBuilder<TContext>(deps: {
     buildStatusHtml: (ctx: TContext) => string;
     getPromptTemplateCommands?: () => readonly TelegramPromptTemplateMenuCommand[];
 }): (ctx: TContext) => string;
+export declare function parseSessionRename(args: string): {
+    name: string;
+} | {
+    error: string;
+};
+export type TelegramSessionChoice = Pick<Pi.SessionInfo, "id" | "cwd" | "modified"> & Partial<Pick<Pi.SessionInfo, "name">>;
+export declare function selectSessionToResume(sessions: readonly (Pick<Pi.SessionInfo, "id" | "cwd"> & Partial<Pick<Pi.SessionInfo, "name">>)[], cwd: string, currentId: string, requested: string): {
+    id: string;
+} | {
+    error: string;
+};
+export declare function renameSession(args: string, setName: (name: string) => void): string;
 export declare function parseTelegramCommand(text: string): ParsedTelegramCommand | undefined;
 export declare const TELEGRAM_COMMAND_ACTIONS: {
     readonly stop: {
@@ -515,6 +542,14 @@ export declare const TELEGRAM_COMMAND_ACTIONS: {
     };
     readonly name: {
         readonly kind: "name";
+        readonly executionMode: "immediate";
+    };
+    readonly rename: {
+        readonly kind: "rename";
+        readonly executionMode: "immediate";
+    };
+    readonly resume: {
+        readonly kind: "resume";
         readonly executionMode: "immediate";
     };
     readonly new: {
@@ -672,6 +707,16 @@ export interface TelegramSessionActionRuntimeDeps {
         threadId?: number;
         messageId: number;
     }) => Promise<void>;
+    prepareResume?: (ctx: Pi.ExtensionCommandContext, sessionId: string, target: {
+        chatId: number;
+        threadId?: number;
+        messageId: number;
+    }) => Promise<string>;
+    notifyResumeFailure?: (target: {
+        chatId: number;
+        threadId?: number;
+        messageId: number;
+    }) => Promise<void>;
     recordRuntimeEvent?: (category: string, error: unknown) => void;
 }
 export interface TelegramSessionReplacementSettlementDeps {
@@ -711,11 +756,22 @@ export interface TelegramSessionActionAssemblyDeps {
                 threadId: number;
             };
         } | undefined;
+        listWorkspaceBindings?: () => readonly {
+            cwd: string;
+            sessionId?: string;
+            inactiveSinceMs?: number;
+            target: {
+                chatId: number;
+                threadId: number;
+            };
+        }[];
         getSessionReplacementIntent: () => TelegramSessionReplacementIntent | undefined;
         commitSessionReplacementIntent: (intent: TelegramSessionReplacementIntent, isCurrent: () => boolean) => Promise<boolean>;
         removeSessionReplacementIntent: (intent: TelegramSessionReplacementIntent, isCurrent: () => boolean) => Promise<boolean>;
     };
     getProfileName: () => string | undefined;
+    listSessions?: (ctx: Pi.ExtensionContext) => Promise<readonly Pi.PiSessionSummary[]>;
+    assertResumeIdle?: (ctx: Pi.ExtensionCommandContext) => void;
     ownsPersistence: () => boolean;
     /**
      * Registered-follower port. A follower cannot persist leader-owned state, so
@@ -754,6 +810,11 @@ export interface TelegramSessionActionRuntime {
         threadId?: number;
         messageId: number;
     }) => boolean;
+    scheduleResumeAfterUpdate: (updateId: number, target: {
+        chatId: number;
+        threadId?: number;
+        messageId: number;
+    }, sessionId: string) => boolean;
     onUpdateCompleted: (updateId: number) => void;
     hasPending: () => boolean;
 }

@@ -311,6 +311,11 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     isIdle: (ctx: TContext) => boolean;
     hasPendingMessages: (ctx: TContext) => boolean;
     requestNewSession?: (source: unknown) => void;
+    setSessionName?: (ctx: TContext, name: string) => void;
+    listSessions?: (ctx: TContext) => Promise<readonly Commands.TelegramSessionChoice[]>;
+    getSessionId?: (ctx: TContext) => string;
+    getCwd?: (ctx: TContext) => string;
+    requestResumeSession?: (source: unknown, sessionId: string) => void;
     compact: (ctx: TContext, callbacks: {
         onComplete: () => void;
         onError: (error: unknown) => void;

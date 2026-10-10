@@ -309,6 +309,15 @@ export default function (pi: Pi.ExtensionAPI) {
     sendUserMessage,
     store: threadStore,
     getProfileName: configStore.getActiveProfileName,
+    listSessions: Pi.listPiSessions,
+    assertResumeIdle(ctx) {
+      if (!telegramSessionContextStore.isCurrent(ctx) || !ctx.isIdle() ||
+          ctx.hasPendingMessages() || activeTurnRuntime.has() ||
+          lifecycle.hasDispatchPending() || lifecycle.isCompactionInProgress() ||
+          Queue.countExecutableTelegramQueueItems(telegramQueueStore.getQueuedItems()) > 0) {
+        throw new Error("Pi or the Telegram queue changed before session resume.");
+      }
+    },
     ownsPersistence: lockRuntime.owns,
     follower: {
       instanceId: telegramInstanceId,
@@ -1448,6 +1457,40 @@ export default function (pi: Pi.ExtensionAPI) {
     },
     getSessionGeneration: telegramSessionContextStore.getGeneration,
     bridgeRuntime,
+    setSessionName(ctx, name) {
+      if (!telegramSessionContextStore.isCurrent(ctx)) {
+        throw new Error("Pi session context changed before rename.");
+      }
+      pi.setSessionName(name);
+    },
+    listSessions: Pi.listPiSessions,
+    getSessionId(ctx) {
+      return ctx.sessionManager.getSessionId();
+    },
+    getCwd(ctx) {
+      return ctx.cwd;
+    },
+    requestResumeSession(source, sessionId) {
+      const updateId = Updates.getTelegramUpdateExecutionFence(source)?.updateId;
+      if (updateId === undefined)
+        throw new Error("Telegram session resume requires durable update authority.");
+      const message = source as {
+        chat?: { id?: number };
+        message_id?: number;
+        message_thread_id?: number;
+      };
+      if (typeof message.chat?.id !== "number" || typeof message.message_id !== "number")
+        throw new Error("Telegram session resume target is unavailable.");
+      const target = {
+        chatId: message.chat.id,
+        messageId: message.message_id,
+        ...(typeof message.message_thread_id === "number"
+          ? { threadId: message.message_thread_id }
+          : {}),
+      };
+      if (!sessionActionsRuntime.scheduleResumeAfterUpdate(updateId, target, sessionId))
+        throw new Error("A Telegram session replacement is already pending.");
+    },
     requestNewSession(source) {
       const updateId =
         Updates.getTelegramUpdateExecutionFence(source)?.updateId;
