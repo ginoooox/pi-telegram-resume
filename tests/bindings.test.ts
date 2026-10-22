@@ -1,6 +1,7 @@
 /**
  * Regression tests for Telegram binding composition
  * Covers lifecycle binding delegation across composed runtimes
+ * Zones: telegram, pi agent, orchestration
  */
 
 import assert from "node:assert/strict";
@@ -80,7 +81,7 @@ import * as Updates from "../lib/updates.ts";
 import { prepareLiveRebindThreadCleanup } from "../lib/thread-reconciler.ts";
 import * as GenerativeApps from "../lib/generative-apps.ts";
 import type { TelegramQueueAdmissionItemLike } from "../lib/updates.ts";
-import type { ExtensionAPI, ExtensionContext } from "../lib/pi.ts";
+import type { ExtensionAPI, ExtensionContext, TurnEndEventResult } from "../lib/pi.ts";
 
 test("Live target work projection observes existing work and pre-API delivery owners without mutation", async () => {
   const old = { chatId: 7, threadId: 10 }, next = { chatId: 7, threadId: 42 }, ctx = {};
@@ -539,6 +540,148 @@ test("Queue binding requires durable handoff for every burst item and fails clos
       assert.equal(store.getQueuedItems().length, 3);
       assert.equal(committed.size, 0);
     }
+  }
+});
+
+test("Steer binding commits a whole receipt portfolio once and retains uncertain prefixes", () => {
+  for (const mode of ["success", "partial", "missing", "native", "compaction", "pending", "aborted", "wrong-profile", "mutation"] as const) {
+    const store = Queue.createTelegramQueueStore<string>();
+    const deferred = Queue.createTelegramDeferredQueueDispatchRuntime<string>();
+    deferred.bind("ctx");
+    let calls = 0, normalSends = 0, idle = false, discardAllowed = false;
+    const committed: number[] = [];
+    const receipt1 = Queue.createTelegramQueueAdmissionReceipt({ queueKind: "prompt", scope: "one", sourceUpdateIds: [1, 2] })!;
+    const receipt2 = Queue.createTelegramQueueAdmissionReceipt({ queueKind: "prompt", scope: "two", sourceUpdateIds: [3] })!;
+    const settlement = {
+      isItemReady: () => true, onControlSettled: () => {},
+      onItemsDiscarded(items: readonly Queue.TelegramQueueItem<string>[]) {
+        assert.deepEqual(items.flatMap(item => item.admissionReceipts ?? []), [receipt1, receipt2]);
+        return discardAllowed;
+      },
+      onPromptHandedOff(item: TelegramQueueAdmissionItemLike) {
+        calls++;
+        assert.deepEqual(item.admissionReceipts, [receipt1, receipt2]);
+        assert.strictEqual(item.admissionReceipts![0], receipt1);
+        committed.push(1);
+        if (mode === "partial") return false;
+        committed.push(3);
+        return true;
+      },
+    };
+    const runtime = createTelegramQueueBindingRuntime({ store, deferredDispatch: deferred,
+      queue: { allocateItemOrder: () => 4 },
+      lifecycle: { isCompactionInProgress: () => mode === "compaction", hasDispatchPending: () => mode === "pending" },
+      activeTurn: { has: () => false }, transportStamp: { isActive: () => mode !== "wrong-profile" },
+      admission: { getSettlement: () => mode === "missing" ? undefined : settlement,
+        hasPendingQueueMutationForItem: () => mode === "mutation" },
+      promptDispatch: { startTypingLoop: () => assert.fail("Steer cannot start a new Telegram turn"),
+        onPromptDispatchStart: () => {}, onPromptDispatchFailure: () => {} },
+      isIdle: () => idle, hasPendingMessages: () => mode === "native",
+      isContextCurrent: ctx => ctx === "ctx", isContextAborted: () => mode === "aborted",
+      updateStatus: () => {}, sendTextReply: async () => undefined, sendUserMessage: () => { normalSends++; },
+    });
+    for (const [index, receipt] of [receipt1, receipt2].entries()) runtime.mutation.append({
+      kind: "prompt", chatId: 7, target: { chatId: 7, threadId: 10 }, replyToMessageId: index + 1,
+      queueOrder: index + 1, queueLane: "steer", laneOrder: index + 1, sourceMessageIds: [index + 1],
+      queuedAttachments: [], content: [{ type: "text", text: `steer-${index}` }], historyText: "", statusSummary: "steer",
+      admissionReceipts: [receipt],
+    }, "ctx");
+    const result = runtime.onTurnEnd({ turnIndex: 1, outcome: "completed" }, "ctx");
+    assert.equal(result?.continue, mode === "success" ? true : undefined, mode);
+    assert.equal(calls, mode === "success" || mode === "partial" ? 1 : 0, mode);
+    assert.equal(normalSends, 0);
+    if (mode === "success") assert.equal(store.getQueuedItems().length, 0);
+    else assert.equal(store.getQueuedItems().length, 2);
+    if (mode === "partial") {
+      assert.deepEqual(committed, [1]);
+      assert.equal(runtime.onTurnEnd({ turnIndex: 2, outcome: "completed" }, "ctx"), undefined);
+      assert.equal(calls, 1);
+      assert.equal(Queue.createTelegramQueueItemCountGetter(store)(), 0);
+      runtime.mutation.append({ kind: "prompt", chatId: 7, queueOrder: 4, queueLane: "default", laneOrder: 4,
+        replyToMessageId: 4, sourceMessageIds: [4], queuedAttachments: [], content: [{ type: "text", text: "normal" }],
+        historyText: "", statusSummary: "normal" }, "ctx");
+      assert.equal(Queue.createTelegramQueueItemCountGetter(store)(), 1);
+      idle = true;
+      runtime.dispatchNext("ctx");
+      assert.equal(normalSends, 1, "A frozen failed packet cannot starve independent Normal work");
+      assert.equal(store.getQueuedItems()[0]!.queueOrder, 4, "agent_start must see the actual dispatched head");
+      assert.equal(runtime.mutation.applyReactionByMessageId(1,
+        { kind: "reaction-transition", promptLane: "default" }, "ctx"), false);
+      const retained = store.getQueuedItems();
+      assert.throws(() => runtime.mutation.clear("ctx"), /could not be discarded durably/);
+      assert.equal(store.getQueuedItems(), retained, "Unconfirmed cleanup cannot lose a frozen partial prefix");
+      discardAllowed = true;
+      assert.equal(runtime.mutation.clear("ctx"), 3);
+      assert.equal(store.getQueuedItems().length, 0);
+      assert.equal(calls, 1); assert.equal(normalSends, 1, "Explicit exact disposal never reissues the packet");
+    }
+  }
+});
+
+test("Steer idle binding preserves exact receipt identities through pending-head and active-turn handoff", () => {
+  for (const mode of ["success", "partial", "missing", "legacy-context", "after-start-native"] as const) {
+    const store = Queue.createTelegramQueueStore<string>();
+    const deferred = Queue.createTelegramDeferredQueueDispatchRuntime<string>(); deferred.bind("ctx");
+    const receipts = [1, 2].map(id => Queue.createTelegramQueueAdmissionReceipt({
+      queueKind: "prompt", scope: `idle-${id}`, sourceUpdateIds: [id * 2, id * 2 + 1],
+    })!);
+    const disposed = new Set<string>();
+    let sourceCalls = 0, sends = 0, pending = false, native = false;
+    let active: Queue.PendingTelegramTurn | undefined;
+    const settlement = {
+      isItemReady: (item: TelegramQueueAdmissionItemLike) => !disposed.has(item.admissionReceipts![0]!.receiptId),
+      onControlSettled: () => {}, onItemsDiscarded: () => false,
+      onPromptHandedOff(item: TelegramQueueAdmissionItemLike) {
+        sourceCalls += 1;
+        assert.equal(pending, false, "Journal disposition precedes pending-head publication");
+        assert.equal(item.admissionReceipts!.length, 2);
+        assert.equal(item.admissionReceipts![0], receipts[0]); assert.equal(item.admissionReceipts![1], receipts[1]);
+        disposed.add(receipts[0]!.receiptId);
+        if (mode === "partial") return false;
+        disposed.add(receipts[1]!.receiptId);
+        return true;
+      },
+    };
+    const runtime = createTelegramQueueBindingRuntime({ store, deferredDispatch: deferred,
+      queue: { allocateItemOrder: () => 3 },
+      lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => pending },
+      activeTurn: { has: () => active !== undefined }, transportStamp: { isActive: () => true },
+      admission: { getSettlement: () => mode === "missing" ? undefined : settlement, hasPendingQueueMutationForItem: () => false },
+      ...(mode === "legacy-context" ? {} : { isContextCurrent: (ctx: string) => ctx === "ctx", isContextAborted: () => false }),
+      isIdle: () => true, hasPendingMessages: () => native, updateStatus: () => {}, sendTextReply: async () => undefined,
+      promptDispatch: { startTypingLoop: () => {}, onPromptDispatchStart: () => {
+        pending = true; if (mode === "after-start-native") native = true;
+      }, onPromptDispatchFailure: () => { pending = false; } },
+      sendUserMessage: content => {
+        sends += 1;
+        Queue.handleTelegramAgentStartRuntime<Queue.PendingTelegramTurn, string>({
+          queuedItems: store.getQueuedItems(), hasPendingDispatch: pending, hasActiveTurn: false,
+          ...store, resetToolExecutions: () => {}, resetPendingModelSwitch: () => {},
+          clearDispatchPending: () => { pending = false; }, setFoldQueuedPromptsIntoHistory: () => {},
+          setActiveTurn: turn => { active = turn; assert.deepEqual(turn.content, content); },
+          onPromptHandedOff: turn => {
+            assert.equal(turn.admissionReceipts![0], receipts[0]); assert.equal(turn.admissionReceipts![1], receipts[1]);
+            assert.ok(turn.admissionReceipts!.every(receipt => disposed.has(receipt.receiptId)), "Only exact acknowledged sources reach agent_start");
+          }, createPreviewState: () => {}, startTypingLoop: () => {}, updateStatus: () => {},
+        });
+      },
+    });
+    for (const [index, receipt] of receipts.entries()) runtime.mutation.append({
+      kind: "prompt", chatId: 7, target: { chatId: 7, threadId: 10 }, replyToMessageId: index + 1,
+      queueOrder: index + 1, queueLane: "steer", laneOrder: index + 1, sourceMessageIds: [index + 1],
+      queuedAttachments: [], content: [{ type: "text", text: `idle-${index}` }], historyText: `idle-${index}`, statusSummary: "steer",
+      admissionReceipts: [receipt],
+    }, "ctx");
+    const originals = [...store.getQueuedItems()];
+    runtime.dispatchNext("ctx"); runtime.dispatchNext("ctx");
+    assert.equal(sourceCalls, mode === "missing" || mode === "legacy-context" ? 0 : 1);
+    assert.equal(sends, mode === "success" ? 1 : 0);
+    assert.equal(pending, false, "Refusal after pending publication cannot contaminate a later native agent_start");
+    assert.equal(store.getQueuedItems().length, mode === "success" ? 0 : 2);
+    if (mode === "success") {
+      assert.deepEqual(active!.sourceMessageIds, [1, 2]); assert.deepEqual(active!.steerPacketSourceOrders, [1, 2]);
+      assert.equal(active!.replyToMessageId, 1);
+    } else assert.deepEqual(store.getQueuedItems(), originals);
   }
 });
 
@@ -1309,7 +1452,8 @@ test("Named setup preserves a display preference changed while the token form wa
   const configPath = join(dir, "telegram.json");
   const store = Config.createTelegramConfigStore({ agentDir: dir, configPath, initialConfig: {
     profiles: { default: { botToken: "default-token" },
-      work: { botToken: "old-token", threadDisplayMode: "letters" } },
+      work: { botToken: "old-token" } },
+    threads: { displayMode: "letters" },
   } });
   await store.persist();
   t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
@@ -1342,7 +1486,8 @@ test("Named setup preserves a display preference changed while the token form wa
     } as unknown as ExtensionContext);
     const saved = await Config.readTelegramConfig(configPath);
     assert.equal(saved.profiles?.work.botToken, "new-token");
-    assert.equal(saved.profiles?.work.threadDisplayMode, "directory-snake");
+    assert.equal(saved.threads?.displayMode, "directory-snake");
+    assert.deepEqual(Object.keys(saved.profiles?.work ?? {}).sort(), ["botId", "botToken", "botUsername"]);
     assert.equal(store.getActiveProfileName(), "work");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -1459,6 +1604,7 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
     editInteractiveMessage: async () => undefined,
     deleteMessage: async () => undefined,
     dispatchNextQueuedTelegramTurn: () => {},
+    onSteerTurnEnd: () => ({ entries: [{ type: "custom_message", customType: "telegram-steer", content: "steer", display: true }], continue: true }),
     answerGuestQuery: async () => ({ ok: true }),
     sendGuestReply: async () => ({ ok: true }),
     finalizeMarkdownPreview: async () => undefined,
@@ -1474,6 +1620,14 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
   } as unknown as Parameters<typeof registerTelegramLifecycleRuntimeHooks>[0];
 
   registerTelegramLifecycleRuntimeHooks(deps);
+  const preceding = { type: "custom", customType: "preceding", data: { preserved: true } };
+  const step = await getRequiredBindingHandler(harness.handlers, "turn_end")(
+    { entries: [preceding], turnIndex: 1, outcome: "completed" }, {} as ExtensionContext,
+  ) as { entries: Array<{ customType: string }>; continue: boolean };
+  assert.strictEqual(step.entries[0], preceding);
+  assert.equal(step.entries[1]!.customType, "telegram-steer");
+  assert.equal(step.continue, true);
+  assert.deepEqual(events, [], "Model-step insertion cannot reset active reply/lifecycle ownership");
   await getRequiredBindingHandler(harness.handlers, "session_before_compact")(
     { type: "session_before_compact" },
     {} as ExtensionContext,
@@ -1521,9 +1675,18 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
 
 test("Lifecycle binding routes native typing, previews, and normalized activity", async () => {
   const events: string[] = [];
+  const typingEnsures: boolean[] = [];
+  let generation = 1, previewGate: Promise<void> | undefined, previewResets = 0;
   const harness = createBindingApiHarness();
   const runtime = Runtime.createTelegramBridgeRuntime();
-  let activeTurn = false;
+  const steerStore = Queue.createTelegramQueueStore<ExtensionContext>();
+  const steerContext = {} as ExtensionContext;
+  const deferred = Queue.createTelegramDeferredQueueDispatchRuntime<ExtensionContext>(); deferred.bind(steerContext);
+  const active: Queue.PendingTelegramTurn = { kind: "prompt", chatId: 42, target: { chatId: 42, threadId: 9 },
+    replyToMessageId: 20, queueOrder: 1, queueLane: "default", laneOrder: 1, statusSummary: "active",
+    sourceMessageIds: [20], content: [{ type: "text", text: "original" }], queuedAttachments: [], historyText: "original",
+    voiceReplyRequired: true };
+  let activeTurn = false, nativePending = false, aborted = false;
   const deps = {
     pi: harness.api,
     activityRuntime: {
@@ -1559,6 +1722,7 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
       capture: () => ({ target: { chatId: 7 }, isCurrent: () => true }),
     },
     assistantOutputRuntime: {
+      beginTurn: () => {},
       start: () => events.push("assistant-output:start"),
       stop: () => events.push("assistant-output:stop"),
     },
@@ -1578,33 +1742,33 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
     activeTurnRuntime: {
       clear: () => {},
       has: () => activeTurn,
-      set: () => {},
+      set: () => { activeTurn = true; },
       get: () =>
         activeTurn
-          ? { chatId: 42, target: { chatId: 42, threadId: 9 } }
+          ? active
           : undefined,
     },
-    telegramQueueStore: { getQueuedItems: () => [], setQueuedItems: () => {} },
+    telegramQueueStore: steerStore,
     modelSwitchController: {
       clearPendingSwitch: () => {},
       triggerPendingAbort: () => {},
     },
     previewRuntime: {
-      resetState: () => undefined,
-      clear: () => {},
+      resetState: () => { previewResets++; return undefined; },
+      clear: () => { previewResets++; },
       setPendingText: () => {},
-      onMessageStart: async () => events.push("preview:start"),
+      onMessageStart: async () => { events.push("preview:start"); await previewGate; },
       onMessageUpdate: async () => events.push("preview:update"),
     },
     promptDispatchRuntime: {
       startTypingLoop: (
         _ctx: ExtensionContext,
         chatId?: number,
-        options?: { target?: { threadId?: number } },
-      ) =>
-        events.push(
-          `typing:${chatId ?? "none"}:${options?.target?.threadId ?? "all"}`,
-        ),
+        options?: { target?: { threadId?: number }; ensure?: boolean },
+      ) => {
+        typingEnsures.push(options?.ensure === true);
+        return events.push(`typing:${chatId ?? "none"}:${options?.target?.threadId ?? "all"}`);
+      },
     },
     deferredQueueDispatchRuntime: { request: () => {} },
     modelContextAvailabilityRuntime: { reconcile: () => {} },
@@ -1629,9 +1793,20 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
     finalizeMarkdownPreview: async () => undefined,
     proactivePushTargetGetter: () => ({ chatId: 42, threadId: 8 }),
     canSendAgentActivity: () => true,
+    getSessionGeneration: () => generation,
     updateStatus: () => {},
     recordRuntimeEvent: () => {},
   } as unknown as Parameters<typeof registerTelegramLifecycleRuntimeHooks>[0];
+  const steerBinding = createTelegramQueueBindingRuntime({ store: steerStore, deferredDispatch: deferred,
+    queue: runtime.queue, lifecycle: runtime.lifecycle, activeTurn: deps.activeTurnRuntime,
+    admission: { getSettlement: () => undefined, hasPendingQueueMutationForItem: () => false },
+    transportStamp: { isActive: () => true }, isIdle: () => false, hasPendingMessages: () => nativePending,
+    isContextCurrent: ctx => ctx === steerContext, isContextAborted: () => aborted,
+    promptDispatch: { startTypingLoop: () => assert.fail("An active packet cannot start typing/preview ownership"),
+      onPromptDispatchStart: () => assert.fail("An active packet cannot publish a new pending head"), onPromptDispatchFailure() {} },
+    sendUserMessage: () => assert.fail("An active packet cannot issue an idle user prompt"), sendTextReply: async () => undefined,
+    updateStatus() {} });
+  deps.onSteerTurnEnd = steerBinding.onTurnEnd;
   registerTelegramLifecycleRuntimeHooks(deps);
 
   await getRequiredBindingHandler(harness.handlers, "agent_start")(
@@ -1662,6 +1837,44 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
     },
     {} as ExtensionContext,
   );
+  const waiting: Queue.PendingTelegramTurn[] = [11, 12].map((id, index) => ({ ...active,
+    queueOrder: index + 2, laneOrder: index + 2, queueLane: "steer", replyToMessageId: id,
+    sourceMessageIds: [id], content: [{ type: "text", text: `steer-${id}` }], voiceReplyRequired: false }));
+  const image = { type: "image" as const, data: "fixture-image", mimeType: "image/png" };
+  waiting[1]!.content.push(image);
+  const activeSnapshot = structuredClone(active);
+  for (const item of waiting) steerBinding.mutation.append(item, steerContext);
+  const boundary = getRequiredBindingHandler(harness.handlers, "turn_end");
+  const prior: NonNullable<TurnEndEventResult["entries"]> = [{ type: "custom_message", customType: "earlier-producer",
+    content: "prior", display: true }];
+  const event = { type: "turn_end", turnIndex: 1, outcome: "completed", entries: prior };
+  const beforeEvents = [...events], beforePreviewResets = previewResets;
+  for (const guard of ["native", "compaction", "tools", "abort", "control"] as const) {
+    nativePending = guard === "native"; aborted = guard === "abort";
+    runtime.lifecycle.setCompactionInProgress(guard === "compaction");
+    runtime.lifecycle.setActiveToolExecutions(guard === "tools" ? 1 : 0);
+    if (guard === "control") steerStore.setQueuedItems([{ ...active, queueOrder: 4, laneOrder: 4,
+      queueLane: "control", content: [{ type: "text", text: "continue after model selection" }] }, ...waiting]);
+    assert.equal(await boundary(event, steerContext), undefined, guard);
+    assert.ok(waiting.every(item => !item.steerAttempted), "Readiness refusal cannot spend waiting input");
+    steerStore.setQueuedItems([...waiting]);
+  }
+  const proposal = await boundary(event, steerContext) as TurnEndEventResult;
+  assert.equal(proposal.continue, true);
+  assert.equal(proposal.entries?.[0], prior[0], "Earlier producers retain their public boundary drafts");
+  assert.equal(proposal.entries?.length, 2);
+  const packetDraft = proposal.entries![1]!;
+  assert.equal(packetDraft.type, "custom_message");
+  if (packetDraft.type === "custom_message") {
+    assert.ok(Array.isArray(packetDraft.content));
+    assert.equal(packetDraft.content[packetDraft.content.length - 1], image, "Whole image blocks retain FIFO identity");
+  }
+  assert.deepEqual(active, activeSnapshot, "No anchor, source, voice or original content metadata is rewritten");
+  assert.equal(steerStore.getQueuedItems().length, 0);
+  assert.equal(deps.activeTurnRuntime.get(), active, "The existing reply/voice/anchor owner remains the same object");
+  assert.equal(active.replyToMessageId, 20); assert.equal(active.voiceReplyRequired, true);
+  assert.equal(previewResets, beforePreviewResets, "Model-step insertion cannot clear or replace preview state");
+  assert.deepEqual(events, beforeEvents, "No typing, activity restart or delivery is emitted by the packet hook");
   await getRequiredBindingHandler(harness.handlers, "tool_execution_start")(
     {
       type: "tool_execution_start",
@@ -1731,7 +1944,27 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
     "activity:compact-end:unknown",
     "send:**✅ Compaction completed.**",
   ];
+  assert.ok(typingEnsures.length > 0 && typingEnsures.every(Boolean), "Activity, streaming, UI resume and compaction must ensure existing presence");
   // Pi hooks keep their order without waiting for the independently delivered projection.
   assert.deepEqual(events.filter((event) => !event.startsWith("send:")), expected.filter((event) => !event.startsWith("send:")));
   assert.deepEqual(events.filter((event) => event.startsWith("send:")), expected.filter((event) => event.startsWith("send:")));
+
+  events.length = 0; activeTurn = true;
+  let finish!: () => void;
+  previewGate = new Promise<void>(resolve => { finish = resolve; });
+  const sameContext = { abort() {} } as ExtensionContext;
+  const oldMessage = getRequiredBindingHandler(harness.handlers, "message_start")({ message: {} }, sameContext);
+  await Promise.resolve(); generation++; finish(); await oldMessage;
+  assert.deepEqual(events, ["typing:42:9", "preview:start"], "A held old message cannot re-arm typing in its finally after a generation change");
+  events.length = 0;
+  const oldStart = getRequiredBindingHandler(harness.handlers, "agent_start")({ type: "agent_start" }, sameContext);
+  generation++; await oldStart;
+  assert.deepEqual(events, [], "A superseded agent-start continuation cannot publish activity or claim replacement typing");
+
+  typingEnsures.length = 0;
+  activeTurn = false;
+  steerStore.setQueuedItems([{ ...active, queueLane: "default" }]);
+  runtime.lifecycle.setDispatchPending(true);
+  await getRequiredBindingHandler(harness.handlers, "agent_start")({ type: "agent_start" }, sameContext);
+  assert.deepEqual(typingEnsures, [false, true], "Queued handoff replaces the owner before ordinary activity ensures it");
 });

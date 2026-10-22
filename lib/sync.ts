@@ -18,6 +18,7 @@ import {
   isSameTelegramProcessInstance,
   isTelegramTopicTargetStaleError,
   provisionOwnBusTopic,
+  resetTelegramConnectionProvisioning,
   type TelegramOwnTopicProvisionResult,
   type TelegramTopicTargetStore,
   type TelegramWorkspaceDisplayBinding,
@@ -826,6 +827,15 @@ export async function ensureTelegramLeaderThreadBinding(
     ...(deps.telegramProfile ? { telegramProfile: deps.telegramProfile } : {}),
   };
   const leaderProfileKey = getTelegramThreadOwnerKey(leaderOwner);
+  if (deps.forceFreshUnnamed) {
+    await resetTelegramConnectionProvisioning({
+      store: deps.topicTargetStore, owner: "leader", instanceId: deps.instanceId,
+      profileKey: leaderProfileKey, isCurrent: () => {
+        assertLeaderEpoch("connect-recovery");
+        return true;
+      }, recordEvent: deps.recordEvent,
+    });
+  }
   const legacyLeaderRecord =
     deps.topicTargetStore.getByProfileKey(leaderProfileKey);
   let capacityUnavailable = false;
@@ -836,6 +846,7 @@ export async function ensureTelegramLeaderThreadBinding(
         legacyLeaderRecord?.instanceId,
         {
           sessionId: deps.sessionId,
+          provisionProfileKey: leaderProfileKey,
           onCapacityUnavailable() {
             capacityUnavailable = true;
           },

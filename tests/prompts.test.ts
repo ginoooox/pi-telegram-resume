@@ -51,6 +51,47 @@ test("Prompt hooks normalize missing and null system prompts without losing Tele
   }), { systemPrompt: "suffix" });
 });
 
+test("Custom-message starts keep bridge guidance without claiming Telegram user input", async () => {
+  for (const systemPrompt of ["base", ["base", "context"], undefined, null]) {
+    for (const prompt of [undefined, "[telegram] stale user prompt"]) {
+      const event = {
+        type: "before_agent_start", messageType: "custom", systemPrompt,
+        systemPromptOptions: {
+          cwd: ".", selectedTools: [], hiddenTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [],
+          appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [],
+        },
+        message: { role: "custom", customType: "completion", content: "[telegram] quoted text", display: true, timestamp: 0 },
+        ...(prompt === undefined ? {} : { prompt }),
+      } as BeforeAgentStartHookEvent;
+      for (const available of [false, true]) {
+        let reconciled = 0;
+        const hook = createTelegramProactiveBeforeAgentStartHook({
+          baseHook: createTelegramBeforeAgentStartHook({ localSystemPromptSuffix: "local", telegramTurnSystemPromptSuffix: "telegram" }),
+          reconcileAvailability: () => { reconciled++; },
+          isAvailable: () => available,
+        });
+        const result = await hook(event, undefined);
+        const base = systemPrompt ?? "";
+        assert.deepEqual(result, {
+          systemPrompt: available ? (Array.isArray(base) ? [...base, "local"] : base + "local") : base,
+        });
+        assert.equal(reconciled, 1);
+      }
+    }
+  }
+});
+
+test("User starts recognize Telegram on both legacy and discriminated Pi events", () => {
+  const hook = createTelegramBeforeAgentStartHook({ localSystemPromptSuffix: "local", telegramTurnSystemPromptSuffix: "telegram" });
+  for (const messageType of [undefined, "user"] as const) {
+    const event = { ...createBeforeAgentStartEvent(" [telegram|thread:Test] hello", "base"), ...(messageType ? { messageType } : {}) };
+    assert.deepEqual(hook(event), { systemPrompt: "baselocaltelegram\n- The current user message came from Telegram." });
+  }
+  assert.deepEqual(buildTelegramBridgeSystemPrompt({
+    systemPrompt: "base", localSystemPromptSuffix: "local", telegramTurnSystemPromptSuffix: "telegram",
+  }), { systemPrompt: "baselocal" });
+});
+
 test("Prompt helpers append context-aware system prompt suffixes", () => {
   assert.deepEqual(
     buildTelegramBridgeSystemPrompt({

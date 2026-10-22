@@ -4,6 +4,18 @@
  * Owns small session-local runtime primitives that are shared by orchestration but are not specific to queueing, rendering, polling, or Telegram transport
  */
 
+import * as Machine from "./machine.ts";
+
+/**
+ * Structural port for run-collapsing diagnostics: a repeated identical failure extends its run instead of logging
+ * again, and the closing success records one outcome. The composition root owns the collapsed implementation.
+ */
+export interface TelegramRepeatedFailureLogPort {
+  record: (error: unknown, details?: Record<string, unknown>) => void;
+  settled: () => void;
+  reset: () => void;
+}
+
 const TELEGRAM_TYPING_ACTION_INTERVAL_MS = 3_000;
 const TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS = 250;
 
@@ -23,10 +35,6 @@ export interface TelegramRuntimeLifecycleFlags {
 export interface TelegramBridgeRuntimeState
   extends TelegramRuntimeQueueCounters, TelegramRuntimeLifecycleFlags {
   abortHandler?: () => void;
-  typingInterval?: ReturnType<typeof setInterval>;
-  typingInFlight?: Promise<void>;
-  typingLoopDeps?: TelegramTypingLoopDeps;
-  typingLoopKey?: string;
 }
 
 export interface TelegramRuntimeQueuePort {
@@ -66,7 +74,8 @@ export interface TelegramRuntimeAbortPort {
 export interface TelegramRuntimeTypingPort {
   start: (deps: TelegramTypingLoopDeps) => boolean;
   stop: () => boolean;
-  waitForIdle: () => Promise<void>;
+  /** Waits for the in-flight action, bounded so a never-settling request cannot hold shutdown. */
+  waitForIdle: (timeoutMs?: number) => Promise<void>;
 }
 
 export interface TelegramBridgeRuntime {
@@ -92,6 +101,7 @@ export function createTelegramBridgeRuntimeState(): TelegramBridgeRuntimeState {
 
 export function createTelegramBridgeRuntime(
   state = createTelegramBridgeRuntimeState(),
+  typing = createTelegramTypingLoop(),
 ): TelegramBridgeRuntime {
   return {
     state,
@@ -132,11 +142,7 @@ export function createTelegramBridgeRuntime(
       getHandler: () => getTelegramAbortHandler(state),
       abortTurn: () => abortTelegramTurn(state),
     },
-    typing: {
-      start: (deps) => startTelegramTypingLoop(state, deps),
-      stop: () => stopTelegramTypingLoop(state),
-      waitForIdle: () => waitForTelegramTypingLoopIdle(state),
-    },
+    typing,
   };
 }
 
@@ -302,15 +308,6 @@ export interface TelegramTypingLoopTarget {
   threadId?: number;
 }
 
-function getTelegramTypingLoopThreadParams(
-  target: TelegramTypingLoopTarget | undefined,
-): { message_thread_id?: number } | undefined {
-  const threadId = target?.threadId;
-  return Number.isInteger(threadId)
-    ? { message_thread_id: threadId }
-    : undefined;
-}
-
 export interface TelegramTypingLoopDeps {
   chatId: number | undefined;
   target?: TelegramTypingLoopTarget;
@@ -357,15 +354,19 @@ function updateTelegramRuntimeStatusSafely<TContext>(
 export interface TelegramTypingLoopStarterDeps<
   TContext,
 > extends TelegramRuntimeEventRecorderPort {
+  /** Collapses one sustained presence failure run; the caller supplies its owner. */
+  failureLog: TelegramRepeatedFailureLogPort;
   typing: TelegramRuntimeTypingPort;
   getDefaultChatId: () => number | undefined;
   sendTypingAction: (
     chatId: number,
-    options?: { message_thread_id?: number },
+    options?: { message_thread_id?: number; assertAuthority?: () => void },
   ) => Promise<unknown>;
   updateStatus: (ctx: TContext, error?: string) => void;
   isContextActive?: (ctx: TContext) => boolean;
+  getSessionGeneration?: () => number;
   isTransportAvailable?: () => boolean;
+  isThreadedMode?: () => boolean;
   getTransportAuthority?: () => string | number | undefined;
   intervalMs?: number;
 }
@@ -375,48 +376,104 @@ export function createTelegramTypingLoopStarter<TContext>(
 ): (
   ctx: TContext,
   chatId?: number,
-  options?: { target?: TelegramTypingLoopTarget },
+  options?: { target?: TelegramTypingLoopTarget; ensure?: boolean },
 ) => boolean {
+  let currentOwner: {
+    ctx: TContext;
+    sessionGeneration: number | undefined;
+    transportAuthority: string | number | undefined;
+    chatId: number;
+    threadId: number | undefined;
+    canContinue: () => boolean;
+  } | undefined;
+  // An unreachable transport repeats one identical presence failure every tick; the port collapses the run.
+  // Running it through one guard keeps a faulty diagnostics port from escaping the in-flight action owner.
+  const typingFailureLog: TelegramRepeatedFailureLogPort = {
+    record(error, details) {
+      try {
+        deps.failureLog.record(error, details);
+      } catch {
+        // Typing diagnostics cannot escape the in-flight action owner.
+      }
+    },
+    settled() {
+      try {
+        deps.failureLog.settled();
+      } catch {
+        // A successful presence outranks its own diagnostic.
+      }
+    },
+    reset() {
+      try {
+        deps.failureLog.reset();
+      } catch {
+        // Typing diagnostics cannot fail a loop stop.
+      }
+    },
+  };
   return (ctx, chatId, options) => {
+    const sessionGeneration = deps.getSessionGeneration?.();
     const transportAuthority = deps.getTransportAuthority?.();
+    const isContextCurrent = (): boolean => deps.isContextActive?.(ctx) !== false &&
+      (!deps.getSessionGeneration || Object.is(deps.getSessionGeneration(), sessionGeneration));
     const hasTransport = (): boolean =>
       deps.getTransportAuthority
         ? transportAuthority !== undefined &&
           Object.is(deps.getTransportAuthority(), transportAuthority)
         : deps.isTransportAvailable?.() !== false;
-    if (!hasTransport()) return false;
+    const target = options?.target ? { ...options.target } : undefined;
+    const canContinue = (): boolean => isContextCurrent() && hasTransport() &&
+      (deps.isThreadedMode?.() !== true ||
+        (target?.threadId !== undefined && Number.isSafeInteger(target.threadId) && target.threadId > 0));
+    // Queue dispatch precedes agent_start: only an explicit destination permits Threaded presence, never chat fallback.
+    if (!canContinue()) return false;
+    const resolvedChatId = chatId ?? deps.getDefaultChatId();
+    if (resolvedChatId === undefined || resolvedChatId === 0) return false;
+    // Streaming updates ensure presence without revoking the same owner's pending HTTP/IPC action.
+    // Explicit starts still replace the loop, including a new turn on the same session and Thread.
+    if (options?.ensure && currentOwner?.canContinue() &&
+      (deps.getSessionGeneration
+        ? Object.is(currentOwner.sessionGeneration, sessionGeneration)
+        : Object.is(currentOwner.ctx, ctx)) &&
+      Object.is(currentOwner.transportAuthority, transportAuthority) &&
+      currentOwner.chatId === resolvedChatId && currentOwner.threadId === target?.threadId) return false;
+    const owner = { ctx, sessionGeneration, transportAuthority, chatId: resolvedChatId,
+      threadId: target?.threadId, canContinue };
+    currentOwner = owner;
     let active = true;
     return deps.typing.start({
-      chatId: chatId ?? deps.getDefaultChatId(),
-      target: options?.target,
+      chatId: resolvedChatId,
+      target,
       intervalMs: deps.intervalMs ?? TELEGRAM_TYPING_ACTION_INTERVAL_MS,
       sendTypingAction: async (targetChatId, actionOptions) => {
         if (!active) return;
-        if (!hasTransport()) {
+        if (!canContinue()) {
           deps.typing.stop();
           return;
         }
         try {
-          await deps.sendTypingAction(targetChatId, actionOptions);
+          await deps.sendTypingAction(targetChatId, {
+            ...actionOptions,
+            // This stays process-local; adapters recheck it before HTTP/IPC issuance, not just loop ticks.
+            assertAuthority() {
+              if (!active || !canContinue()) throw new Error("Typing context authority changed.");
+            },
+          });
+          typingFailureLog.settled();
         } catch (error) {
-          if (deps.isContextActive?.(ctx) === false) return;
           if (!active) return;
-          if (!hasTransport()) {
+          if (!canContinue()) {
             deps.typing.stop();
             return;
           }
-          try {
-            deps.recordRuntimeEvent?.("typing", error, {
-              chatId: targetChatId,
-            });
-          } catch {
-            // Typing diagnostics cannot escape the in-flight action owner.
-          }
+          typingFailureLog.record(error, { chatId: targetChatId });
         }
       },
-      shouldContinue: hasTransport,
+      shouldContinue: canContinue,
       onStopped: () => {
         active = false;
+        typingFailureLog.reset();
+        if (currentOwner === owner) currentOwner = undefined;
       },
     });
   };
@@ -427,85 +484,239 @@ function getTelegramTypingLoopKey(deps: TelegramTypingLoopDeps): string {
   return `${deps.chatId ?? 0}:${Number.isInteger(threadId) ? threadId : "all"}`;
 }
 
-export function startTelegramTypingLoop(
-  state: TelegramBridgeRuntimeState,
-  deps: TelegramTypingLoopDeps,
-): boolean {
-  if (deps.chatId === undefined || deps.chatId === 0) return false;
-  const previousKey = state.typingLoopKey;
-  const previousDeps = state.typingLoopDeps;
-  const nextKey = getTelegramTypingLoopKey(deps);
-  if (previousDeps && previousDeps !== deps) {
-    previousDeps.onStopped?.();
-    state.typingInFlight = undefined;
-  }
-  state.typingLoopDeps = deps;
-  state.typingLoopKey = nextKey;
-  const sendTyping = (): void => {
-    const activeDeps = state.typingLoopDeps;
-    if (
-      !activeDeps ||
-      activeDeps.chatId === undefined ||
-      activeDeps.chatId === 0
-    )
-      return;
-    if (activeDeps.shouldContinue?.() === false) {
-      stopTelegramTypingLoop(state);
-      return;
+/** The whole typing-loop state; only `transitionTelegramTypingLoop` produces a new one. */
+export interface TelegramTypingMachineState {
+  /** The loop the interval serves; its callbacks live in the shell under `id`. A loop exists exactly while ticking. */
+  readonly loop: {
+    readonly id: number;
+    readonly key: string;
+    readonly chatId: number;
+    readonly threadParams?: { readonly message_thread_id: number };
+  } | null;
+  /** The action in flight; a tick waits for it, and replacing or stopping the loop forgets it. */
+  readonly inFlight: number | null;
+  readonly nextSendId: number;
+}
+
+export type TelegramTypingEvent =
+  | {
+      type: "started";
+      /** Shell-assigned, so the shell can hold the caller's callbacks before effects run. */
+      loopId: number;
+      chatId: number | undefined;
+      key: string;
+      threadParams?: { message_thread_id: number };
+      intervalMs: number;
+      /** The caller's `shouldContinue`, sampled at dispatch. */
+      continues: boolean;
     }
-    if (state.typingInFlight) return;
-    const targetChatId = activeDeps.chatId;
-    const threadParams = getTelegramTypingLoopThreadParams(activeDeps.target);
-    const typing = Promise.resolve()
-      .then(() => activeDeps.sendTypingAction(targetChatId, threadParams))
-      .then(() => undefined)
-      .catch(() => undefined);
-    state.typingInFlight = typing;
-    void typing.finally(() => {
-      if (state.typingInFlight === typing) state.typingInFlight = undefined;
-    });
+  | { type: "ticked"; continues: boolean }
+  | { type: "sendSettled"; sendId: number }
+  | { type: "stopRequested" };
+
+export type TelegramTypingEffect =
+  | {
+      type: "send";
+      loopId: number;
+      sendId: number;
+      chatId: number;
+      threadParams?: { message_thread_id: number };
+    }
+  | { type: "armInterval"; intervalMs: number }
+  | { type: "cancelInterval" }
+  | { type: "loopEnded"; loopId: number };
+
+export interface TelegramTypingStep extends Machine.TelegramMachineStep<
+  TelegramTypingMachineState,
+  TelegramTypingEffect
+> {
+  /** `start`: a loop began or moved to a new target. `stop`: a running loop ended. */
+  result: boolean;
+}
+
+export function createTelegramTypingMachineState(): TelegramTypingMachineState {
+  return { loop: null, inFlight: null, nextSendId: 0 };
+}
+
+const typingStep = (
+  state: TelegramTypingMachineState,
+  result: boolean,
+  ...effects: TelegramTypingEffect[]
+): TelegramTypingStep => ({ state, effects, result });
+
+function stopTypingLoop(state: TelegramTypingMachineState): TelegramTypingStep {
+  if (!state.loop) return typingStep(state, false);
+  return typingStep(
+    { ...state, loop: null, inFlight: null },
+    true,
+    { type: "cancelInterval" },
+    { type: "loopEnded", loopId: state.loop.id },
+  );
+}
+
+/** One action per tick, never two at once; a caller that stops continuing ends the loop instead. */
+function sendTypingAction(
+  state: TelegramTypingMachineState,
+  continues: boolean,
+): TelegramTypingStep {
+  const loop = state.loop;
+  if (!loop) return typingStep(state, false);
+  if (!continues) return stopTypingLoop(state);
+  if (state.inFlight !== null) return typingStep(state, false);
+  const sendId = state.nextSendId + 1;
+  return typingStep({ ...state, inFlight: sendId, nextSendId: sendId }, false, {
+    type: "send",
+    loopId: loop.id,
+    sendId,
+    chatId: loop.chatId,
+    ...(loop.threadParams ? { threadParams: loop.threadParams } : {}),
+  });
+}
+
+/**
+ * Pure typing-loop transition. Every start replaces the caller's callbacks, even on the same target, and forgets the
+ * old in-flight action; only a new target sends at once on a running loop, whose interval keeps its phase.
+ */
+export function transitionTelegramTypingLoop(
+  state: TelegramTypingMachineState,
+  event: TelegramTypingEvent,
+): TelegramTypingStep {
+  switch (event.type) {
+    case "started": {
+      if (event.chatId === undefined || event.chatId === 0)
+        return typingStep(state, false);
+      const previous = state.loop;
+      const replaced: TelegramTypingEffect[] = previous
+        ? [{ type: "loopEnded", loopId: previous.id }]
+        : [];
+      const next: TelegramTypingMachineState = {
+        ...state,
+        inFlight: previous ? null : state.inFlight,
+        loop: {
+          id: event.loopId,
+          key: event.key,
+          chatId: event.chatId,
+          ...(event.threadParams ? { threadParams: event.threadParams } : {}),
+        },
+      };
+      if (previous?.key === event.key)
+        return typingStep(next, false, ...replaced);
+      if (previous) {
+        const sent = sendTypingAction(next, event.continues);
+        return typingStep(sent.state, true, ...replaced, ...sent.effects);
+      }
+      // A fresh loop always arms its interval; a caller that already stopped continuing ends it on the first tick.
+      const sent = event.continues
+        ? sendTypingAction(next, true)
+        : typingStep(next, false);
+      return typingStep(sent.state, true, ...sent.effects, {
+        type: "armInterval",
+        intervalMs: event.intervalMs,
+      });
+    }
+    case "ticked":
+      return sendTypingAction(state, event.continues);
+    case "sendSettled":
+      return typingStep(
+        state.inFlight === event.sendId ? { ...state, inFlight: null } : state,
+        false,
+      );
+    case "stopRequested":
+      return stopTypingLoop(state);
+  }
+}
+
+/**
+ * The shell around `transitionTelegramTypingLoop`: it holds each loop's callbacks, samples `shouldContinue` into
+ * events, owns the interval and turns every action outcome into `sendSettled`.
+ */
+export function createTelegramTypingLoop(): TelegramRuntimeTypingPort {
+  const callbacks = new Map<number, TelegramTypingLoopDeps>();
+  let interval: ReturnType<typeof setInterval> | undefined;
+  let loopIds = 0;
+  const continues = (loopId: number | undefined): boolean =>
+    loopId === undefined
+      ? false
+      : callbacks.get(loopId)?.shouldContinue?.() !== false;
+  const machine = Machine.createTelegramMachineRunner<
+    TelegramTypingMachineState,
+    TelegramTypingEvent,
+    TelegramTypingEffect,
+    TelegramTypingStep
+  >({
+    initial: createTelegramTypingMachineState(),
+    transition: transitionTelegramTypingLoop,
+    run(effect) {
+      switch (effect.type) {
+        case "send": {
+          const send = callbacks.get(effect.loopId)?.sendTypingAction;
+          // Failures belong to the caller's action; the loop only needs to know the action is over.
+          void Promise.resolve()
+            .then(() => send?.(effect.chatId, effect.threadParams))
+            .then(
+              () => undefined,
+              () => undefined,
+            )
+            .then(() =>
+              machine.dispatch({ type: "sendSettled", sendId: effect.sendId }),
+            );
+          return;
+        }
+        case "armInterval":
+          interval = setInterval(
+            () =>
+              machine.dispatch({
+                type: "ticked",
+                continues: continues(machine.state.loop?.id),
+              }),
+            effect.intervalMs,
+          );
+          interval.unref?.();
+          return;
+        case "cancelInterval":
+          clearInterval(interval);
+          interval = undefined;
+          return;
+        case "loopEnded": {
+          const ended = callbacks.get(effect.loopId);
+          callbacks.delete(effect.loopId);
+          ended?.onStopped?.();
+          return;
+        }
+      }
+    },
+  });
+  return {
+    start(deps) {
+      const loopId = ++loopIds;
+      callbacks.set(loopId, deps);
+      const threadId = deps.target?.threadId;
+      const started = machine.dispatch({
+        type: "started",
+        loopId,
+        chatId: deps.chatId,
+        key: getTelegramTypingLoopKey(deps),
+        ...(Number.isInteger(threadId)
+          ? { threadParams: { message_thread_id: threadId! } }
+          : {}),
+        intervalMs: deps.intervalMs,
+        continues: continues(loopId),
+      });
+      if (machine.state.loop?.id !== loopId) callbacks.delete(loopId);
+      return started.result;
+    },
+    stop: () => machine.dispatch({ type: "stopRequested" }).result,
+    async waitForIdle(timeoutMs = TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS) {
+      if (machine.state.inFlight === null) return;
+      const idle = machine.waitFor((state) => state.inFlight === null);
+      await Promise.race([
+        idle,
+        timeoutMs <= 0
+          ? Promise.resolve()
+          : new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+      ]);
+    },
   };
-  if (state.typingInterval) {
-    if (previousKey === nextKey) return false;
-    sendTyping();
-    return true;
-  }
-  sendTyping();
-  state.typingInterval = setInterval(sendTyping, deps.intervalMs);
-  state.typingInterval.unref?.();
-  return true;
-}
-
-export function stopTelegramTypingLoop(
-  state: TelegramBridgeRuntimeState,
-): boolean {
-  if (!state.typingInterval) return false;
-  clearInterval(state.typingInterval);
-  const activeDeps = state.typingLoopDeps;
-  state.typingInterval = undefined;
-  state.typingLoopDeps = undefined;
-  state.typingLoopKey = undefined;
-  state.typingInFlight = undefined;
-  activeDeps?.onStopped?.();
-  return true;
-}
-
-export async function waitForTelegramTypingLoopIdle(
-  state: TelegramBridgeRuntimeState,
-  timeoutMs = TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS,
-): Promise<void> {
-  const inFlight = state.typingInFlight;
-  if (!inFlight) return;
-  if (timeoutMs <= 0) {
-    await Promise.race([inFlight, Promise.resolve()]);
-    return;
-  }
-  await Promise.race([
-    inFlight,
-    new Promise<void>((resolve) => {
-      setTimeout(resolve, timeoutMs);
-    }),
-  ]);
 }
 
 export function createTelegramContextAbortHandlerSetter<
@@ -566,9 +777,9 @@ export interface TelegramPromptDispatchRuntime<TContext> {
   startTypingLoop: (
     ctx: TContext,
     chatId?: number,
-    options?: { target?: TelegramTypingLoopTarget },
+    options?: { target?: TelegramTypingLoopTarget; ensure?: boolean },
   ) => boolean | void;
-  onPromptDispatchStart: (ctx: TContext, chatId?: number) => void;
+  onPromptDispatchStart: (ctx: TContext, chatId?: number, target?: TelegramTypingLoopTarget) => void;
   onPromptDispatchFailure: (ctx: TContext, message: string) => void;
 }
 
@@ -592,9 +803,9 @@ export function createTelegramPromptDispatchLifecycle<TContext>(
   deps: TelegramPromptDispatchLifecycleDeps<TContext>,
 ) {
   return {
-    onPromptDispatchStart: (ctx: TContext, chatId?: number): void => {
+    onPromptDispatchStart: (ctx: TContext, chatId?: number, target?: TelegramTypingLoopTarget): void => {
       deps.lifecycle.setDispatchPending(true);
-      deps.startTypingLoop(ctx, chatId);
+      deps.startTypingLoop(ctx, chatId, { target });
       updateTelegramRuntimeStatusSafely(deps.updateStatus, ctx, {
         category: "dispatch",
         phase: "status-update",

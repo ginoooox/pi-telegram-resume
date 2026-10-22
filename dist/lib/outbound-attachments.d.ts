@@ -73,6 +73,7 @@ export interface TelegramQueuedOutboundAttachmentView {
 export interface TelegramOutboundAttachmentQueueTargetView {
     queuedAttachments: TelegramQueuedOutboundAttachmentView[];
     guestQueryId?: string;
+    guestInlineMessageId?: string;
 }
 export interface TelegramQueuedOutboundAttachmentTurnView extends TelegramOutboundAttachmentQueueTargetView {
     chatId: number;
@@ -161,6 +162,17 @@ export declare function queueTelegramOutboundAttachments(options: {
 }): Promise<TelegramOutboundAttachmentToolResult>;
 export declare function deliverTelegramGuestCachedAttachment(options: {
     guestQueryId: string;
+    guestInlineMessageId?: string;
+    editGuestInlineMessage?: (inlineMessageId: string, content: {
+        media: {
+            type: "photo" | "document" | "audio";
+            media: string;
+            caption?: string;
+        };
+    }, options: {
+        assertAuthority: () => void;
+    }) => Promise<void>;
+    isDeliveryActive?: () => boolean;
     stagingChatId: number;
     stagingTarget?: TelegramTarget;
     attachment: TelegramQueuedOutboundAttachmentView;

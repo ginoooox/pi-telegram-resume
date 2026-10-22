@@ -2,7 +2,9 @@
  * Telegram preview streaming helpers
  * Zones: telegram outbound, native rich markdown drafts
  * Owns safe draft preview selection, runtime updates, and preview finalization
+ * The streaming state machine is a pure transition function driven by one imperative shell per runtime.
  */
+import * as Machine from "./machine.js";
 import { stripTelegramCommentMarkupForPreview } from "./outbound-markup.js";
 import { isTelegramMarkdownFenceClosing, normalizeTelegramNativeMarkdown, parseTelegramMarkdownFenceOpening, } from "./replies.js";
 import { getTelegramTargetThreadParams, } from "./target.js";
@@ -13,187 +15,411 @@ const TELEGRAM_DRAFT_PREVIEW_MAX_CHARS = 4096;
 // segment holds its first frame for one full interval so the opening frame is
 // an accumulated passage rather than a single streamed word.
 const TELEGRAM_DRAFT_INTERVAL_MS = 2_000;
-export function createTelegramPreviewControllerRuntime(deps) {
-    return createTelegramPreviewController({
-        getDefaultReplyToMessageId: deps.getDefaultReplyToMessageId,
-        maxMessageLength: deps.maxMessageLength,
-        initialDraftSupport: deps.initialDraftSupport,
-        sendDraft: deps.sendDraft,
-        canSend: deps.canSend,
-        maxDraftId: deps.maxDraftId,
-        recordRuntimeEvent: deps.recordRuntimeEvent,
+export function createTelegramPreviewMachineState() {
+    return {
+        segment: null,
+        generation: 0,
+        nextSegmentId: 0,
+        nextDraftId: 0,
+        nextDraftAt: 0,
+        inFlight: null,
+        pending: null,
+        publications: [],
+        timerSegmentId: null,
+    };
+}
+const step = (state, ...effects) => ({ state, effects });
+/** Drops the armed throttle timer, if any; every caller replaces or seals its segment. */
+const withoutTimer = (state) => state.timerSegmentId === null
+    ? step(state)
+    : step({ ...state, timerSegmentId: null }, { type: "cancelTimer" });
+/** A replaced segment takes its pending request and its throttle timer with it. */
+function replaceSegment(state, segment) {
+    return withoutTimer({ ...state, segment, pending: null });
+}
+function startSegment(state, carry = {}) {
+    const id = state.nextSegmentId + 1;
+    return replaceSegment({ ...state, nextSegmentId: id }, {
+        id,
+        mode: "draft",
+        pendingText: "",
+        lastSentText: "",
+        sealed: false,
+        ...carry,
     });
 }
-function sealTelegramPreviewState(state) {
-    if (!state)
-        return;
-    state.sealed = true;
-    state.flushRequested = false;
-    if (state.flushTimer)
-        clearTimeout(state.flushTimer);
-    state.flushTimer = undefined;
-}
-export function createTelegramNativeMarkdownPreviewFinalizer(deps) {
-    return (...args) => prepareTelegramNativeMarkdownPreviewFinalizer(deps)(...args);
-}
-function prepareTelegramNativeMarkdownPreviewFinalizer(deps) {
-    const state = deps.getState();
-    sealTelegramPreviewState(state);
-    const inFlight = state?.flushPromise ?? state?.precedingFlush;
-    return async (chatId, markdown, replyToMessageId, options) => {
-        if (deps.isDeliveryActive?.() === false)
-            return false;
-        await inFlight?.catch(() => { });
-        if (deps.getState() !== state || deps.isDeliveryActive?.() === false)
-            return false;
-        await deps.sendMarkdownReply(chatId, replyToMessageId, markdown, options);
-        if (deps.getState() === state && deps.isDeliveryActive?.() !== false)
-            deps.discard?.();
-        return true;
-    };
-}
-export function createTelegramAssistantPreviewRuntime(deps) {
-    const controller = createTelegramPreviewControllerRuntime(deps);
-    const finalizerDeps = {
-        getState: controller.getState,
-        clear: controller.clear,
-        discard: () => controller.setState(undefined),
-        sendMarkdownReply: deps.sendMarkdownReply,
-    };
+/** One flush attempt for the current segment: gate, throttle, safe snapshot and draft id. */
+function attemptFlush(state, request, clock, config) {
+    const segment = state.segment;
+    if (!segment || segment.sealed)
+        return step(state);
+    if (!clock.canSend)
+        return step(state, { type: "clearClosedGate", request });
+    const delay = state.nextDraftAt - clock.now;
+    if (delay > 0) {
+        if (state.timerSegmentId !== null)
+            return step(state);
+        return step({ ...state, timerSegmentId: segment.id }, { type: "armTimer", delay, request, segmentId: segment.id });
+    }
+    const idle = withoutTimer(state);
+    const snapshot = buildTelegramNativeMarkdownPreviewSnapshot(segment, config.maxMessageLength);
+    if (!snapshot)
+        return idle;
+    const draftId = segment.draftId ??
+        allocateTelegramDraftId(state.nextDraftId, config.maxDraftId);
     return {
-        ...controller,
-        finalizeMarkdown: createTelegramNativeMarkdownPreviewFinalizer(finalizerDeps),
-        prepareDelivery(isDeliveryActive) {
-            const state = controller.getState();
-            return {
-                setPreviewPendingText(text) {
-                    if (controller.getState() === state && isDeliveryActive())
-                        controller.setPendingText(text);
-                },
-                clearPreview: async (chatId, options) => {
-                    if (controller.getState() !== state || !isDeliveryActive())
-                        return;
-                    await controller.prepareClear(chatId, {
-                        ...options,
-                        isDeliveryActive,
-                    })();
-                },
-                finalizeMarkdownPreview: prepareTelegramNativeMarkdownPreviewFinalizer({
-                    ...finalizerDeps,
-                    isDeliveryActive,
-                }),
+        state: {
+            ...idle.state,
+            segment: { ...segment, draftId },
+            nextDraftId: segment.draftId === undefined ? draftId : state.nextDraftId,
+            nextDraftAt: clock.now + config.minDraftIntervalMs,
+            inFlight: segment.id,
+        },
+        effects: [
+            ...idle.effects,
+            {
+                type: "sendDraft",
+                request,
+                draftId,
+                text: snapshot.text,
+                segmentId: segment.id,
+                generation: state.generation,
+            },
+        ],
+    };
+}
+/** Single flight: a request during an in-flight draft or behind a publication waits as the one pending request. */
+function requestFlush(state, request, clock, config) {
+    // Only a live, unsealed segment accepts flush requests, whatever the caller checked.
+    if (!state.segment || state.segment.sealed)
+        return step(state);
+    if (state.inFlight !== null || state.publications.length > 0)
+        return step({ ...state, pending: request });
+    return attemptFlush(state, request, clock, config);
+}
+/** A coalesced request runs once the in-flight draft and every open publication have settled. */
+function drainPending(state, clock, config) {
+    const request = state.pending;
+    if (!request || state.inFlight !== null || state.publications.length > 0)
+        return step(state);
+    return attemptFlush({ ...state, pending: null }, request, clock, config);
+}
+export function transitionTelegramPreview(state, event, config) {
+    switch (event.type) {
+        case "reset":
+        case "invalidated": {
+            const replacement = {
+                ...state,
+                generation: state.generation + 1,
+                inFlight: null,
+                publications: [],
+                nextDraftAt: 0,
             };
-        },
-        ...createTelegramAssistantMessagePreviewHooks({
-            getActiveTurn: deps.getActiveTurn,
-            isAssistantMessage: deps.isAssistantMessage,
-            getState: controller.getState,
-            setState: controller.setState,
-            createPreviewState: controller.createState,
-            canSend: deps.canSend,
-            getMessageText: deps.getMessageText,
-            minDraftIntervalMs: TELEGRAM_DRAFT_INTERVAL_MS,
-            schedulePreviewFlush: controller.scheduleFlush,
-        }),
-    };
+            return event.type === "reset"
+                ? startSegment(replacement)
+                : replaceSegment(replacement, null);
+        }
+        case "segmentStarted": {
+            // Carry the previous delivery boundary; permanent text remains with its publication owner.
+            const draftId = state.segment?.draftId;
+            return startSegment(state, draftId === undefined ? {} : { draftId });
+        }
+        case "segmentEnsured":
+            return state.segment ? step(state) : startSegment(state);
+        case "sealed": {
+            const segment = state.segment;
+            return withoutTimer({
+                ...state,
+                segment: segment && !segment.sealed ? { ...segment, sealed: true } : segment,
+                pending: null,
+            });
+        }
+        case "discarded":
+            return replaceSegment(state, null);
+        case "textSet":
+            return state.segment
+                ? step({
+                    ...state,
+                    segment: { ...state.segment, pendingText: event.text },
+                })
+                : step(state);
+        case "draftWindowOpened":
+            return step({
+                ...state,
+                nextDraftAt: Math.max(state.nextDraftAt, event.at),
+            });
+        case "flushRequested":
+            return requestFlush(state, event.request, event, config);
+        case "timerFired": {
+            if (state.timerSegmentId !== event.segmentId ||
+                state.segment?.id !== event.segmentId)
+                return step(state);
+            return requestFlush({ ...state, timerSegmentId: null }, event.request, event, config);
+        }
+        case "draftSettled": {
+            if (state.generation !== event.generation ||
+                state.inFlight !== event.segmentId)
+                return step(state);
+            const segment = state.segment;
+            // A delivered draft updates only the segment and generation that issued it.
+            const applies = event.text !== undefined &&
+                segment?.id === event.segmentId &&
+                event.canSend;
+            return drainPending({
+                ...state,
+                inFlight: null,
+                segment: applies && segment
+                    ? { ...segment, lastSentText: event.text }
+                    : segment,
+            }, event, config);
+        }
+        case "publicationOpened":
+            return step({
+                ...state,
+                publications: [...state.publications, event.id],
+            });
+        case "publicationSettled":
+            if (!state.publications.includes(event.id))
+                return step(state);
+            return drainPending({
+                ...state,
+                publications: state.publications.filter((id) => id !== event.id),
+            }, event, config);
+    }
 }
-export function createTelegramPreviewController(deps) {
-    let state;
-    let generation = 0;
-    const maxDraftId = deps.maxDraftId ?? TELEGRAM_DRAFT_ID_MAX;
-    const maxMessageLength = deps.maxMessageLength ?? TELEGRAM_DRAFT_PREVIEW_MAX_CHARS;
-    let draftSupport = deps.initialDraftSupport ?? "unknown";
-    let nextDraftId = 0;
-    const setState = (nextState) => {
-        if (state !== nextState)
-            sealTelegramPreviewState(state);
-        state = nextState;
+/** True while a draft request is in flight, or, when publications block, a pending request waits behind one. */
+export function isTelegramPreviewBusy(state, blockedByPublication = true) {
+    return (state.inFlight !== null ||
+        (blockedByPublication &&
+            state.pending !== null &&
+            state.publications.length > 0));
+}
+/**
+ * The imperative shell around `transitionTelegramPreview`: it samples the clock and send gate into events, runs
+ * effects, records every transport failure in one place and resolves promise-shaped ports through `waitFor`.
+ */
+function createTelegramPreviewModel(deps) {
+    const config = {
+        maxDraftId: deps.maxDraftId ?? TELEGRAM_DRAFT_ID_MAX,
+        maxMessageLength: deps.maxMessageLength ?? TELEGRAM_DRAFT_PREVIEW_MAX_CHARS,
+        minDraftIntervalMs: deps.minDraftIntervalMs ?? TELEGRAM_DRAFT_INTERVAL_MS,
     };
-    const getRuntimeDeps = (operationGeneration = generation) => ({
-        getState: () => state,
-        setState,
-        maxMessageLength,
-        minDraftIntervalMs: TELEGRAM_DRAFT_INTERVAL_MS,
-        getDraftSupport: () => draftSupport,
-        setDraftSupport: (support) => {
-            draftSupport = support;
-        },
-        allocateDraftId: () => {
-            nextDraftId = allocateTelegramDraftId(nextDraftId, maxDraftId);
-            return nextDraftId;
-        },
-        sendDraft: deps.sendDraft,
-        canSend: () => operationGeneration === generation && (deps.canSend?.() ?? true),
-        recordRuntimeEvent: deps.recordRuntimeEvent,
+    let timer;
+    let publicationIds = 0;
+    const clock = () => ({
+        now: Date.now(),
+        canSend: deps.canSend?.() !== false,
     });
-    return {
-        getState: () => state,
-        setState,
-        setPendingText: (text) => {
-            if (state)
-                state.pendingText = text;
-        },
-        createState: () => createTelegramPreviewRuntimeState(),
-        resetState: () => {
-            generation += 1;
-            setState({
-                ...createTelegramPreviewRuntimeState(),
-                nextDraftAt: state?.nextDraftAt,
+    const machine = Machine.createTelegramMachineRunner({
+        initial: createTelegramPreviewMachineState(),
+        transition: (state, event) => transitionTelegramPreview(state, event, config),
+        run: (effect) => run(effect),
+    });
+    const { dispatch, waitFor } = machine;
+    const whenIdle = () => {
+        const generation = machine.state.generation;
+        return waitFor((current) => current.generation !== generation || !isTelegramPreviewBusy(current));
+    };
+    /** Captures predecessors only: a later draft/publication must never extend the boundary that blocks it. */
+    const whenBoundarySettles = (includePublications = true) => {
+        const { generation, inFlight, publications } = machine.state;
+        return waitFor((current) => current.generation !== generation ||
+            ((inFlight === null || current.inFlight !== inFlight) &&
+                (!includePublications ||
+                    publications.every((id) => !current.publications.includes(id)))));
+    };
+    const canSendFor = (generation) => machine.state.generation === generation && deps.canSend?.() !== false;
+    /** The one place preview transport failures become diagnostics; a failed call reports `false`. */
+    const callTransport = async (phase, request, draftId, text) => {
+        try {
+            return await deps.sendDraft(request.chatId, draftId, text, {
+                ...getTelegramTargetThreadParams(request.target ?? { chatId: request.chatId }),
             });
-        },
-        invalidate: () => {
-            generation += 1;
-            setState(undefined);
-        },
-        seal: () => sealTelegramPreviewState(state),
+        }
+        catch (error) {
+            deps.recordRuntimeEvent?.("preview", error, {
+                phase,
+                chatId: request.chatId,
+                draftId,
+            });
+            return false;
+        }
+    };
+    const sendDraft = async (effect) => {
+        const delivered = await callTransport("draft", effect.request, effect.draftId, normalizeTelegramNativeMarkdown(effect.text));
+        dispatch({
+            type: "draftSettled",
+            segmentId: effect.segmentId,
+            generation: effect.generation,
+            ...(delivered === false ? {} : { text: effect.text }),
+            ...clock(),
+        });
+    };
+    const run = (effect) => {
+        switch (effect.type) {
+            case "sendDraft":
+                void sendDraft(effect);
+                return;
+            case "armTimer":
+                timer = setTimeout(() => {
+                    timer = undefined;
+                    dispatch({
+                        type: "timerFired",
+                        request: effect.request,
+                        segmentId: effect.segmentId,
+                        ...clock(),
+                    });
+                }, effect.delay);
+                timer.unref?.();
+                return;
+            case "cancelTimer":
+                if (timer)
+                    clearTimeout(timer);
+                timer = undefined;
+                return;
+            case "clearClosedGate":
+                void clear(effect.request.chatId, {
+                    awaitFlush: false,
+                    target: effect.request.target,
+                });
+                return;
+        }
+    };
+    const seal = () => {
+        dispatch({ type: "sealed" });
+    };
+    const clear = async (chatId, options = {}, generation = machine.state.generation) => {
+        const segment = machine.state.segment;
+        if (!segment || options.isDeliveryActive?.() === false)
+            return;
+        seal();
+        if (machine.state.inFlight !== null && options.awaitFlush !== false) {
+            await whenBoundarySettles(false);
+            if (machine.state.segment?.id !== segment.id)
+                return;
+        }
+        if (options.isDeliveryActive?.() === false)
+            return;
+        const issued = machine.state.segment ?? segment;
+        dispatch({ type: "discarded" });
+        if (issued.draftId !== undefined && canSendFor(generation))
+            await callTransport("clear-draft", { chatId, target: options.target }, issued.draftId, undefined);
+    };
+    const flush = async (chatId, options = {}) => {
+        if (!machine.state.segment || machine.state.segment.sealed)
+            return;
+        dispatch({
+            type: "flushRequested",
+            request: { chatId, target: options.target },
+            ...clock(),
+        });
+        await whenIdle();
+    };
+    const prepareFinalizer = (input) => {
+        const segmentId = machine.state.segment?.id;
+        const generation = machine.state.generation;
+        seal();
+        const predecessors = whenBoundarySettles();
+        return async (chatId, markdown, replyToMessageId, options) => {
+            if (input.isDeliveryActive?.() === false)
+                return false;
+            await predecessors;
+            if (machine.state.generation !== generation ||
+                machine.state.segment?.id !== segmentId ||
+                input.isDeliveryActive?.() === false)
+                return false;
+            await input.sendMarkdownReply(chatId, replyToMessageId, markdown, options);
+            if (machine.state.segment?.id === segmentId &&
+                input.isDeliveryActive?.() !== false)
+                dispatch({ type: "discarded" });
+            return true;
+        };
+    };
+    const controller = {
+        getState: () => machine.state.segment ?? undefined,
+        isFlushing: () => isTelegramPreviewBusy(machine.state),
+        seal,
+        setPendingText: (text) => dispatch({ type: "textSet", text }),
+        resetState: () => dispatch({ type: "reset" }),
+        invalidate: () => dispatch({ type: "invalidated" }),
         preparePublication: () => {
-            if (!state)
+            if (!machine.state.segment)
                 return undefined;
-            sealTelegramPreviewState(state);
-            const prior = state.publicationPromise ?? state.flushPromise ?? state.precedingFlush;
-            let settle;
-            state.publicationPromise = new Promise((resolve) => {
-                settle = resolve;
-            });
+            seal();
+            const id = (publicationIds += 1);
+            const prior = whenBoundarySettles();
+            dispatch({ type: "publicationOpened", id });
+            let settled = false;
             return {
-                wait: async () => {
-                    await prior?.catch(() => { });
+                wait: () => prior,
+                settle: () => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    dispatch({ type: "publicationSettled", id, ...clock() });
                 },
-                settle,
             };
         },
         prepareClear: (chatId, options) => {
-            const admittedState = state;
-            const runtime = getRuntimeDeps();
+            const admitted = machine.state.segment?.id;
+            const generation = machine.state.generation;
             return async () => {
-                if (state !== admittedState)
+                if (machine.state.segment?.id !== admitted)
                     return;
-                await clearTelegramPreview(chatId, runtime, {
+                await clear(chatId, {
                     ...options,
-                    isDeliveryActive: () => runtime.canSend?.() !== false &&
-                        options?.isDeliveryActive?.() !== false,
-                });
+                    isDeliveryActive: () => canSendFor(generation) && options?.isDeliveryActive?.() !== false,
+                }, generation);
             };
         },
-        clear: (chatId, options) => clearTelegramPreview(chatId, getRuntimeDeps(), options),
-        flush: (chatId, options) => flushTelegramPreview(chatId, getRuntimeDeps(), options),
+        clear: (chatId, options) => clear(chatId, options),
+        flush,
         scheduleFlush: (chatId, options) => {
-            if (!state)
+            if (!machine.state.segment)
                 return;
-            void flushTelegramPreview(chatId, getRuntimeDeps(), options);
+            void flush(chatId, options);
         },
-        finalize: (chatId, _replyToMessageId, options) => finalizeTelegramPreview(chatId, getRuntimeDeps(), options),
+        finalize: async (chatId, _replyToMessageId, options) => {
+            const segment = machine.state.segment;
+            if (!segment)
+                return false;
+            if (!canSendFor(machine.state.generation)) {
+                await clear(chatId, options);
+                return false;
+            }
+            await flush(chatId, options);
+            const current = machine.state.segment;
+            if (current?.id !== segment.id)
+                return false;
+            const finalText = buildTelegramPreviewFinalText(current);
+            if (!finalText) {
+                await clear(chatId, options);
+                return false;
+            }
+            dispatch({ type: "discarded" });
+            return false;
+        },
+    };
+    return {
+        controller,
+        prepareFinalizer,
+        startSegment: () => {
+            dispatch({ type: "segmentStarted" });
+        },
+        ensureSegment: () => {
+            dispatch({ type: "segmentEnsured" });
+            return machine.state.segment;
+        },
+        openDraftWindow: (at) => {
+            dispatch({ type: "draftWindowOpened", at });
+        },
+        discard: () => {
+            dispatch({ type: "discarded" });
+        },
     };
 }
-function createTelegramAssistantMessagePreviewHooks(deps) {
-    return {
-        onMessageStart: async (event) => {
-            await handleTelegramAssistantMessagePreviewStart(event.message, deps);
-        },
-        onMessageUpdate: async (event) => {
-            await handleTelegramAssistantMessagePreviewUpdate(event.message, deps);
-        },
-    };
+export function createTelegramPreviewController(deps) {
+    return createTelegramPreviewModel(deps).controller;
 }
 /**
  * Returns true when the active turn is a Telegram Guest Mode query. A guest
@@ -203,66 +429,77 @@ function createTelegramAssistantMessagePreviewHooks(deps) {
 export function shouldSuppressPreviewForGuestTurn(turn) {
     return !!turn?.guestQueryId;
 }
-async function handleTelegramAssistantMessagePreviewStart(message, deps) {
-    const turn = deps.getActiveTurn();
-    if (!turn || !deps.isAssistantMessage(message))
-        return;
-    if (deps.canSend && !deps.canSend()) {
-        deps.setState(undefined);
-        return;
-    }
-    if (shouldSuppressPreviewForVoice(turn)) {
-        deps.setState(undefined);
-        return;
-    }
-    if (shouldSuppressPreviewForGuestTurn(turn)) {
-        deps.setState(undefined);
-        return;
-    }
-    const state = deps.getState();
-    sealTelegramPreviewState(state);
-    const next = deps.createPreviewState();
-    // Carry the previous delivery boundary; permanent text remains with its publication owner.
-    next.draftId = state?.draftId;
-    next.nextDraftAt = state?.nextDraftAt;
-    next.precedingFlush =
-        state?.publicationPromise ?? state?.flushPromise ?? state?.precedingFlush;
-    deps.setState(next);
-}
-async function handleTelegramAssistantMessagePreviewUpdate(message, deps) {
-    const turn = deps.getActiveTurn();
-    if (!turn || !deps.isAssistantMessage(message))
-        return;
-    if (deps.canSend && !deps.canSend()) {
-        deps.setState(undefined);
-        return;
-    }
-    if (shouldSuppressPreviewForVoice(turn))
-        return;
-    if (shouldSuppressPreviewForGuestTurn(turn))
-        return;
-    let state = deps.getState();
-    if (!state) {
-        state = deps.createPreviewState();
-        deps.setState(state);
-    }
-    if (state.sealed)
-        return;
-    const hadVisibleText = state.pendingText.length > 0;
-    state.pendingText = stripTelegramCommentMarkupForPreview(deps.getMessageText(message));
-    // The first visible text of a preview segment opens an initial accumulation
-    // window, so the segment's first frame cannot ship as a single word even
-    // when the previous cadence boundary has already passed (fresh turn, slow
-    // first token, or message rollover after tool work). Later deltas keep the
-    // trailing deadline instead of sliding it on every update.
-    const interval = deps.minDraftIntervalMs ?? 0;
-    if (interval > 0 &&
-        !hadVisibleText &&
-        !state.lastSentText &&
-        state.pendingText.length > 0) {
-        state.nextDraftAt = Math.max(state.nextDraftAt ?? 0, Date.now() + interval);
-    }
-    deps.schedulePreviewFlush(turn.chatId, { target: turn.target });
+export function createTelegramAssistantPreviewRuntime(deps) {
+    const model = createTelegramPreviewModel(deps);
+    const { controller } = model;
+    const suppressed = (turn) => shouldSuppressPreviewForVoice(turn) ||
+        shouldSuppressPreviewForGuestTurn(turn);
+    return {
+        ...controller,
+        finalizeMarkdown: (...args) => model.prepareFinalizer({
+            sendMarkdownReply: deps.sendMarkdownReply,
+        })(...args),
+        prepareDelivery(isDeliveryActive) {
+            const admitted = controller.getState()?.id;
+            return {
+                setPreviewPendingText(text) {
+                    if (controller.getState()?.id === admitted && isDeliveryActive())
+                        controller.setPendingText(text);
+                },
+                clearPreview: async (chatId, options) => {
+                    if (controller.getState()?.id !== admitted || !isDeliveryActive())
+                        return;
+                    await controller.prepareClear(chatId, {
+                        ...options,
+                        isDeliveryActive,
+                    })();
+                },
+                finalizeMarkdownPreview: model.prepareFinalizer({
+                    sendMarkdownReply: deps.sendMarkdownReply,
+                    isDeliveryActive,
+                }),
+            };
+        },
+        onMessageStart: async ({ message }) => {
+            const turn = deps.getActiveTurn();
+            if (!turn || !deps.isAssistantMessage(message))
+                return;
+            if ((deps.canSend && !deps.canSend()) || suppressed(turn)) {
+                model.discard();
+                return;
+            }
+            model.startSegment();
+        },
+        onMessageUpdate: async ({ message }) => {
+            const turn = deps.getActiveTurn();
+            if (!turn || !deps.isAssistantMessage(message))
+                return;
+            if (deps.canSend && !deps.canSend()) {
+                model.discard();
+                return;
+            }
+            if (suppressed(turn))
+                return;
+            const segment = model.ensureSegment();
+            if (segment.sealed)
+                return;
+            const hadVisibleText = segment.pendingText.length > 0;
+            const pendingText = stripTelegramCommentMarkupForPreview(deps.getMessageText(message));
+            controller.setPendingText(pendingText);
+            // The first visible text of a preview segment opens an initial accumulation
+            // window, so the segment's first frame cannot ship as a single word even
+            // when the previous cadence boundary has already passed (fresh turn, slow
+            // first token, or message rollover after tool work). Later deltas keep the
+            // trailing deadline instead of sliding it on every update.
+            const interval = deps.minDraftIntervalMs ?? TELEGRAM_DRAFT_INTERVAL_MS;
+            if (interval > 0 &&
+                !hadVisibleText &&
+                !segment.lastSentText &&
+                pendingText.length > 0)
+                model.openDraftWindow(Date.now() + interval);
+            controller.scheduleFlush(turn.chatId, { target: turn.target });
+        },
+    };
 }
 export function buildTelegramPreviewFinalText(state) {
     const finalText = state.pendingText.trim();
@@ -270,50 +507,8 @@ export function buildTelegramPreviewFinalText(state) {
         return finalText;
     return state.lastSentText.trim() || undefined;
 }
-export function createTelegramPreviewRuntimeState() {
-    return {
-        mode: "draft",
-        pendingText: "",
-        lastSentText: "",
-    };
-}
 export function allocateTelegramDraftId(currentDraftId, maxDraftId) {
     return currentDraftId >= maxDraftId ? 1 : currentDraftId + 1;
-}
-export function shouldUseTelegramDraftPreview(_options) {
-    return true;
-}
-export async function clearTelegramPreview(chatId, deps, options = {}) {
-    const state = deps.getState();
-    if (!state || options.isDeliveryActive?.() === false)
-        return;
-    sealTelegramPreviewState(state);
-    const inFlight = state.flushPromise ?? state.precedingFlush;
-    if (inFlight && options.awaitFlush !== false) {
-        state.flushRequested = false;
-        await inFlight.catch(() => { });
-        if (deps.getState() !== state)
-            return;
-    }
-    if (options.isDeliveryActive?.() === false)
-        return;
-    deps.setState(undefined);
-    if (state.mode === "draft" &&
-        state.draftId !== undefined &&
-        deps.canSend?.() !== false) {
-        try {
-            await deps.sendDraft(chatId, state.draftId, undefined, {
-                ...getTelegramTargetThreadParams(options.target ?? { chatId }),
-            });
-        }
-        catch (error) {
-            deps.recordRuntimeEvent?.("preview", error, {
-                phase: "clear-draft",
-                chatId,
-                draftId: state.draftId,
-            });
-        }
-    }
 }
 function createTelegramDraftInlineState() {
     return {
@@ -518,117 +713,4 @@ function buildTelegramNativeMarkdownPreviewSnapshot(state, maxMessageLength) {
     if (!safeText || safeText === state.lastSentText)
         return undefined;
     return { text: safeText };
-}
-async function performTelegramPreviewFlush(chatId, state, deps, options = {}) {
-    if (deps.canSend && !deps.canSend()) {
-        await clearTelegramPreview(chatId, deps, {
-            awaitFlush: false,
-            target: options.target,
-        });
-        return;
-    }
-    const snapshot = buildTelegramNativeMarkdownPreviewSnapshot(state, deps.maxMessageLength);
-    if (!snapshot)
-        return;
-    if (shouldUseTelegramDraftPreview({
-        draftSupport: deps.getDraftSupport(),
-        snapshot,
-    })) {
-        const draftId = state.draftId ?? deps.allocateDraftId();
-        state.draftId = draftId;
-        state.nextDraftAt = Date.now() + (deps.minDraftIntervalMs ?? 0);
-        try {
-            const delivered = await deps.sendDraft(chatId, draftId, normalizeTelegramNativeMarkdown(snapshot.text), { ...getTelegramTargetThreadParams(options.target ?? { chatId }) });
-            if (delivered === false ||
-                deps.getState() !== state ||
-                deps.canSend?.() === false)
-                return;
-            deps.setDraftSupport("supported");
-            state.mode = "draft";
-            state.lastSentText = snapshot.text;
-            return;
-        }
-        catch (error) {
-            deps.recordRuntimeEvent?.("preview", error, {
-                phase: "draft",
-                chatId,
-                draftId,
-            });
-            return;
-        }
-    }
-}
-export async function flushTelegramPreview(chatId, deps, options = {}) {
-    const state = deps.getState();
-    if (!state || state.sealed)
-        return;
-    if (state.flushPromise) {
-        state.flushRequested = true;
-        await state.flushPromise;
-        return;
-    }
-    state.flushPromise = (async () => {
-        if (state.precedingFlush) {
-            await state.precedingFlush.catch(() => { });
-            state.precedingFlush = undefined;
-            if (deps.getState() !== state || state.sealed)
-                return;
-        }
-        do {
-            state.flushRequested = false;
-            const delay = (state.nextDraftAt ?? 0) - Date.now();
-            if (delay > 0) {
-                if (!state.flushTimer) {
-                    state.flushTimer = setTimeout(() => {
-                        state.flushTimer = undefined;
-                        if (deps.getState() === state && !state.sealed)
-                            void flushTelegramPreview(chatId, deps, options);
-                    }, delay);
-                    state.flushTimer.unref?.();
-                }
-                break;
-            }
-            if (state.flushTimer)
-                clearTimeout(state.flushTimer);
-            state.flushTimer = undefined;
-            try {
-                await performTelegramPreviewFlush(chatId, state, deps, options);
-            }
-            catch (error) {
-                deps.recordRuntimeEvent?.("preview", error, {
-                    phase: "flush",
-                    chatId,
-                    draftId: state.draftId,
-                });
-                break;
-            }
-        } while (deps.getState() === state &&
-            !state.sealed &&
-            state.flushRequested);
-    })();
-    try {
-        await state.flushPromise;
-    }
-    finally {
-        if (deps.getState() === state) {
-            state.flushPromise = undefined;
-        }
-    }
-}
-export async function finalizeTelegramPreview(chatId, deps, options = {}) {
-    const state = deps.getState();
-    if (!state)
-        return false;
-    if (deps.canSend && !deps.canSend()) {
-        await clearTelegramPreview(chatId, deps, options);
-        return false;
-    }
-    await flushTelegramPreview(chatId, deps, options);
-    const finalText = buildTelegramPreviewFinalText(state);
-    if (!finalText) {
-        await clearTelegramPreview(chatId, deps, options);
-        return false;
-    }
-    deps.setState(undefined);
-    return false;
 }

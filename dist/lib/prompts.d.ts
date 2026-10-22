@@ -29,7 +29,9 @@ export declare function createTelegramModelContextAvailabilityRuntime(deps: {
     memory?: TelegramModelContextAvailabilityMemory;
 }): TelegramModelContextAvailabilityRuntime;
 export type TelegramSystemPrompt = string | string[];
-type TelegramBeforeAgentStartEvent = Omit<BeforeAgentStartEvent, "systemPrompt"> & {
+type TelegramBeforeAgentStartEvent = Omit<BeforeAgentStartEvent, "systemPrompt" | "prompt" | "messageType"> & {
+    messageType?: "user" | "custom";
+    prompt?: string;
     systemPrompt?: TelegramSystemPrompt | null;
 };
 type TelegramBeforeAgentStartResult = {
@@ -37,7 +39,7 @@ type TelegramBeforeAgentStartResult = {
 };
 type TelegramBeforeAgentStartHook = (event: TelegramBeforeAgentStartEvent) => TelegramBeforeAgentStartResult;
 export declare function buildTelegramBridgeSystemPrompt(options: {
-    prompt: string;
+    prompt?: string;
     systemPrompt?: TelegramSystemPrompt | null;
     telegramPrefix?: string;
     localSystemPromptSuffix: string;

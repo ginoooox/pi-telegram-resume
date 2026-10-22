@@ -1625,7 +1625,7 @@ export function createTelegramLockedPollingRuntime(deps) {
                 if (deps.registerFollowerWithOwner) {
                     let failureMessage;
                     try {
-                        const registered = await deps.registerFollowerWithOwner(ctx, acquired.lock);
+                        const registered = await deps.registerFollowerWithOwner(ctx, acquired.lock, options.forceFreshLeaderThread ? { recoverConnection: true } : undefined);
                         if (!isCurrent())
                             return cancelled;
                         if (registered) {
@@ -1838,8 +1838,8 @@ export function createTelegramLockedPollingRuntime(deps) {
             sessionAutoStartRun = run;
         },
         registerFollowerWithOwner: deps.registerFollowerWithOwner
-            ? async (ctx, owner) => {
-                const registered = await deps.registerFollowerWithOwner?.(ctx, owner);
+            ? async (ctx, owner, options) => {
+                const registered = await deps.registerFollowerWithOwner?.(ctx, owner, options);
                 if (registered)
                     deps.updateStatus(ctx);
                 return registered === true;

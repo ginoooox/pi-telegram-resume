@@ -3741,6 +3741,86 @@ export function isTelegramThreadCleanupJournalNamespaceClear(
   );
 }
 
+/** Demand-driven recovery only; caller holds temporary-cleanup admission. Never a deletion grant. */
+export function recoverTelegramThreadCleanupDeadQueueOwners(
+  input: Parameters<typeof isTelegramThreadCleanupJournalNamespaceClear>[0] & {
+    recoveryOwner: TelegramUpdateJournalQueueOwnerIdentity;
+    isCurrent: () => boolean;
+    withSourceSerialization: NonNullable<TelegramUpdateJournalStoreOptions["withSourceSerialization"]>;
+    getQueueProcessLiveness?: TelegramUpdateJournalStoreOptions["getQueueProcessLiveness"];
+  },
+): number {
+  return input.withSourceSerialization(() => {
+    const assertCurrent = () => {
+      if (!input.isCurrent()) throw new Error("Temporary cleanup queue recovery lost authority.");
+    };
+    assertCurrent();
+    if (!input.cleanup) return 0;
+    // Validate exact references and complete namespace coverage before considering any mutation.
+    if (isTelegramThreadCleanupJournalNamespaceClear(input)) return 0;
+    const namespace = inspectTelegramSessionJournalNamespace(input);
+    if (namespace.retainedInputs?.some(value => value.state !== "committed") ||
+        input.requiredJournalBindingKeys.some(key => !namespace.sources.some(source =>
+          source.path === getTelegramUpdateJournalBindingPath(key) && source.evidence.kind === "present"))) return 0;
+    const plans: Array<{ path: string; recovery: TelegramUpdateJournalDeadQueueOwnerRecoveryInput }> = [];
+    for (const source of namespace.sources) {
+      if (source.evidence.kind !== "present") continue;
+      const file = source.evidence.file;
+      if (file.version !== TELEGRAM_UPDATE_JOURNAL_VERSION) continue;
+      const groups = new Map<string, TelegramUpdateJournalEntry[]>();
+      for (const entry of file.entries) {
+        if (!entry.queueReceiptId) continue;
+        const group = groups.get(entry.queueReceiptId) ?? [];
+        group.push(entry);
+        groups.set(entry.queueReceiptId, group);
+      }
+      for (const group of groups.values()) {
+        const entry = group[0]!;
+        if (entry.state !== "queued" || !entry.queueReceiptId || !entry.queueOwner ||
+            !entry.queueKind || entry.queueHandoff || entry.inputClaim) continue;
+        if (group.some(value => value.state !== "queued" || value.queueHandoff || value.inputClaim ||
+            value.queueKind !== entry.queueKind || !isDeepStrictEqual(value.queueOwner, entry.queueOwner))) continue;
+        plans.push({ path: source.path, recovery: {
+          queueKind: entry.queueKind, receiptId: entry.queueReceiptId,
+          sourceUpdateIds: group.map(value => value.updateId).sort((a, b) => a - b),
+          deadOwner: cloneJournalQueueOwner(entry.queueOwner), recoveryOwner: { ...input.recoveryOwner },
+        } });
+      }
+    }
+    const liveness = input.getQueueProcessLiveness ?? getTelegramProcessLiveness;
+    const dead = plans.filter(plan => {
+      assertCurrent();
+      const result = liveness(plan.recovery.deadOwner);
+      assertCurrent();
+      return result === "dead";
+    });
+    let removed = 0;
+    for (const plan of dead) {
+      assertCurrent();
+      removed += input.withSourceReference(plan.path, () => {
+        const journal = createTelegramUpdateJournalStore({
+          path: plan.path, profileName: input.profile, botIdentity: input.botIdentity,
+          queueRuntimeIdentity: input.recoveryOwner,
+          // This private synchronous store stays inside the cross-family serializer already held above.
+          withSourceSerialization(operation) { assertCurrent(); return operation(); },
+          sourceAccess: { directory: dirname(plan.path), limits: input.limits },
+          getQueueProcessLiveness(owner) {
+            assertCurrent();
+            const result = liveness(owner);
+            assertCurrent();
+            return result;
+          },
+          withWriterAdmission(operation) { assertCurrent(); return operation(); },
+        });
+        // The journal transaction rechecks whole-group identity, absence of handoff and fresh process-death proof.
+        return journal.recoverDeadQueueOwner(plan.recovery).recoveredUpdateIds.length;
+      });
+    }
+    assertCurrent();
+    return removed;
+  });
+}
+
 function cloneEntry(
   entry: TelegramUpdateJournalEntry,
 ): TelegramUpdateJournalEntry {

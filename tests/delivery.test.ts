@@ -28,6 +28,37 @@ import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 
 const target = { chatId: 42, threadId: 7 };
 
+for (const outcome of ["sent", "failed", "stopped", "observer-failed", "async-observer-failed"] as const)
+test(`Delivery drain follows the last queued operation and keeps shutdown inert (${outcome})`, async () => {
+  const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  let notifications = 0;
+  const runtime = createConcreteDeliveryRuntime({
+    generation: "drain", getActiveTurnTarget: () => target, getInstanceTarget: () => target,
+    getAggregateTarget: () => target, isExplicitTargetAuthorized: () => true,
+    renderView: view => [{ text: view.text, parseMode: "plain" }],
+    async sendChunk() { entered.resolve(); await finish.promise; if (outcome === "failed") throw new Error("transport"); return 1; },
+    async editChunk() {}, async deleteMessage() {}, async sendChatAction() {},
+    captureDrain: () => () => {
+      assert.equal(runtime.hasPendingTarget?.(target), false);
+      if (outcome === "observer-failed") throw new Error("observer");
+      if (outcome === "async-observer-failed") return Promise.reject(new Error("observer"));
+      notifications++;
+    },
+  });
+  const first = runtime.sendView({ text: "first" }, { scope: { kind: "target", target } });
+  await entered.promise;
+  const last = runtime.sendView({ text: "last" }, { scope: { kind: "target", target } });
+  assert.equal(notifications, 0);
+  if (outcome === "stopped") runtime.shutdown();
+  finish.resolve();
+  const results = await Promise.all([first, last]);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(notifications, outcome === "sent" || outcome === "failed" ? 1 : 0);
+  assert.equal(runtime.hasPendingTarget?.(target), false);
+  assert.equal(results[0]!.ok, !["failed", "stopped"].includes(outcome));
+  runtime.shutdown();
+});
+
 function createRuntime(
   generation: string,
   calls: string[] = [],
@@ -270,6 +301,7 @@ test("Delivery target policy runtime projects live authority and excludes Guest 
   assert.deepEqual(runtime.getTargetPolicyView(), {
     canDeliver: true,
     ownsDirect: false,
+    threaded: false,
     allowedChatId: 42,
     followerTarget: { chatId: 42, threadId: 7 },
     leaderTarget: { chatId: 42, threadId: 8 },
@@ -287,6 +319,26 @@ test("Delivery target policy runtime projects live authority and excludes Guest 
   followerRegistered = false;
   ownsDirect = false;
   assert.equal(runtime.getTargetPolicyView().canDeliver, false);
+});
+
+test("Threaded delivery refuses implicit and explicit All scopes, even without a bound tab", async () => {
+  let threaded = true;
+  const sent: unknown[] = [];
+  const policy = createTelegramDeliveryTargetPolicyRuntime({ ownsDirect: () => true, isThreadedMode: () => threaded,
+    isFollowerRegistered: () => false, getAllowedChatId: () => 7, getFollowerTarget: () => undefined,
+    getLeaderTarget: () => undefined, listThreadRecords: () => [], getActiveTurnTarget: () => ({ chatId: 7 }), getActiveGuestQueryId: () => undefined });
+  const runtime = createTelegramBridgeDeliveryRuntime({ generation: "All-policy", getTargetPolicyView: policy.getTargetPolicyView,
+    getActiveTurnTarget: policy.getActiveTurnTarget, api: { async sendMessage(body) { sent.push(body); return { message_id: 1 }; },
+      async editMessageText(body) { sent.push(body); return "edited"; }, async deleteMessage() {}, async sendChatAction() { return true; } }, recordOwnership() {} });
+  for (const scope of [{ kind: "instance" }, { kind: "aggregate" }, { kind: "active-turn" }, { kind: "target", target: { chatId: 7 } }] as const)
+    assert.equal((await runtime.sendView({ text: "No All output" }, { scope })).ok, false);
+  assert.deepEqual(sent, []);
+  threaded = false;
+  const classic = await runtime.sendView({ text: "Classic DM" }, { scope: { kind: "instance" } }); assert.equal(classic.ok, true);
+  if (!classic.ok) return;
+  threaded = true;
+  assert.equal((await runtime.editView(classic.value, { text: "Cannot migrate into All" })).ok, false);
+  assert.equal(sent.length, 1, "An old classic handle cannot emit fresh output after Threaded Mode activates");
 });
 
 test("Delivery target policy resolves classic, leader, and follower instance surfaces", () => {

@@ -63,8 +63,10 @@ export interface TelegramBusLeaderTargetProvisionerDeps<TContext> {
 }
 export interface TelegramBusFollowerTargetProvisionerDeps {
     getAllowedUserId: () => number | undefined;
+    getLiveFollowers?: () => readonly TelegramBusFollowerView[];
+    isFollowerProcessAlive?: (pid: number) => boolean;
     topicTargetStore: Threads.TelegramTopicTargetStore;
-    callApi: <TResponse>(method: string, body: Record<string, unknown>) => Promise<TResponse>;
+    callApi: <TResponse>(method: string, body: Record<string, unknown>, options?: TelegramApiCallOptions) => Promise<TResponse>;
     getCurrentLeaderEpoch?: () => number | string | undefined;
     getSyncState: () => Sync.TelegramSyncState;
     setSyncState: (state: Sync.TelegramSyncState) => void;
@@ -185,6 +187,7 @@ export declare function createTelegramBusInstanceLifecycleAnnouncement(input: {
 }): TelegramBusFollowerLifecycleAnnouncement;
 export declare function createTelegramBusFollowerTargetProvisioner(deps: TelegramBusFollowerTargetProvisionerDeps): (registration: TelegramBusInstanceRegistration, options?: {
     existingWorkspaceBindingOnly?: boolean;
+    recoverConnection?: boolean;
 }) => Promise<(TelegramTarget & {
     slot?: string;
     threadName?: string;
@@ -246,6 +249,7 @@ export interface TelegramBusLeaderEnvelopeHandlerDeps {
     }>) => Promise<unknown> | unknown;
     provisionFollowerTarget?: (registration: TelegramBusInstanceRegistration, options?: {
         existingWorkspaceBindingOnly?: boolean;
+        recoverConnection?: boolean;
     }) => Promise<(TelegramTarget & {
         slot?: string;
         threadName?: string;
@@ -276,6 +280,7 @@ export interface TelegramBusLeaderEnvelopeHandlerDeps {
     recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
     applyThreadDisplayMode?: (mode: TelegramThreadDisplayMode, isCurrent: () => boolean) => Promise<void>;
     getThreadDisplayMode?: () => TelegramThreadDisplayMode;
+    requiresPreDispatchRebindReader?: () => boolean;
     getCurrentLeaderEpoch?: () => number | string | undefined;
     getTelegramProfile?: () => string | undefined;
     getAllowedUserId?: () => number | undefined;

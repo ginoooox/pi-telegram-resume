@@ -4,6 +4,7 @@
  * Normalizes inbound Telegram messages into reusable file, text, id, history, and media-group metadata
  */
 import { basename, dirname } from "node:path";
+import * as Machine from "./machine.js";
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
 const TELEGRAM_REPLY_CONTEXT_MAX_LENGTH = 1000;
 function guessExtensionFromMime(mimeType, fallback) {
@@ -237,145 +238,317 @@ export function getTelegramMediaGroupKey(message) {
         : "private";
     return `${message.chat.id}:${threadKey}:${message.media_group_id}`;
 }
-export function removePendingTelegramMediaGroupMessages(groups, messageIds, clearTimer) {
-    if (messageIds.length === 0 || groups.size === 0)
-        return 0;
-    const deletedMessageIds = new Set(messageIds);
-    let removedGroups = 0;
-    for (const [key, state] of groups.entries()) {
-        if (!state.messages.some((message) => deletedMessageIds.has(message.message_id))) {
-            continue;
-        }
-        if (state.flushTimer)
-            clearTimer(state.flushTimer);
-        groups.delete(key);
-        removedGroups += 1;
-    }
-    return removedGroups;
+export function createTelegramPendingGroupsState() {
+    return { groups: new Map(), nextTimerId: 0, nextDispatchId: 0 };
 }
-export function queueTelegramMediaGroupMessage(options) {
-    const key = getTelegramMediaGroupKey(options.message);
-    if (!key)
-        return false;
-    const existing = options.groups.get(key) ?? { messages: [] };
-    const duplicateIndex = existing.messages.findIndex((message) => message.message_id === options.message.message_id);
-    if (duplicateIndex >= 0) {
-        existing.messages[duplicateIndex] = options.message;
-    }
-    else {
-        existing.messages.push(options.message);
-    }
-    existing.context = options.context;
-    const dispatchQueued = () => {
-        existing.flushTimer = undefined;
-        const state = options.groups.get(key);
-        if (!state)
-            return Promise.resolve();
-        if (state.dispatching)
-            return state.dispatchPromise ?? Promise.resolve();
-        const dispatchedMessages = [...state.messages];
-        const dispatchedIds = new Set(dispatchedMessages.map((message) => message.message_id));
-        state.dispatching = true;
-        const operation = Promise.resolve(options.dispatchMessages(dispatchedMessages, state.context)).then(() => {
-            if (options.groups.get(key) !== state)
-                return;
-            state.messages = state.messages.filter((message) => !dispatchedIds.has(message.message_id));
-            state.dispatching = false;
-            state.dispatchPromise = undefined;
-            if (state.messages.length === 0)
-                options.groups.delete(key);
-            else if (!state.flushTimer)
-                scheduleDispatch();
-        }, (error) => {
-            if (options.groups.get(key) === state) {
-                state.dispatching = false;
-                state.dispatchPromise = undefined;
-                if (!state.flushTimer)
-                    scheduleDispatch();
-            }
-            throw error;
+/**
+ * Pure transition for delayed input groups shared by media albums and split text. A group dispatches one batch at a
+ * time; messages that arrive meanwhile wait for the next batch, a failure keeps the batch for a retry, and suspension
+ * keeps every admitted message for the replacement context.
+ */
+export function transitionTelegramPendingGroups(state, event, config) {
+    const groups = new Map(state.groups);
+    const effects = [];
+    let { nextTimerId, nextDispatchId } = state;
+    let result = 0;
+    const cancelTimer = (group) => {
+        if (group.timerId === null)
+            return group;
+        effects.push({ type: "cancelTimer", timerId: group.timerId });
+        return { ...group, timerId: null };
+    };
+    const armTimer = (key, group, delayMs) => {
+        if (group.suspended)
+            return group;
+        nextTimerId += 1;
+        effects.push({ type: "armTimer", key, timerId: nextTimerId, delayMs });
+        return { ...group, timerId: nextTimerId };
+    };
+    const startDispatch = (key, group) => {
+        if (group.dispatch)
+            return group;
+        if (config.requireContext && group.context === undefined)
+            return group;
+        const boundary = group.boundaryId === undefined
+            ? -1
+            : group.messages.findIndex((message) => message.message_id === group.boundaryId);
+        const batch = boundary < 0
+            ? [...group.messages]
+            : group.messages.slice(0, boundary + 1);
+        nextDispatchId += 1;
+        effects.push({
+            type: "dispatch",
+            key,
+            dispatchId: nextDispatchId,
+            messages: batch,
+            ...(group.context === undefined ? {} : { context: group.context }),
         });
-        state.dispatchPromise = operation;
-        return operation;
+        const { boundaryId: _consumed, ...rest } = group;
+        return {
+            ...rest,
+            dispatch: {
+                id: nextDispatchId,
+                messageIds: batch.map((message) => message.message_id),
+            },
+        };
     };
-    const scheduleDispatch = () => {
-        if (existing.suspended)
-            return;
-        existing.flushTimer = options.setTimer(() => {
-            void dispatchQueued().catch(() => undefined);
-        }, options.debounceMs);
-        existing.flushTimer.unref?.();
+    const drop = (key, group) => {
+        cancelTimer(group);
+        groups.delete(key);
     };
-    existing.reschedule = scheduleDispatch;
-    existing.dispatchNow = dispatchQueued;
-    if (existing.flushTimer)
-        options.clearTimer(existing.flushTimer);
-    scheduleDispatch();
-    options.groups.set(key, existing);
-    return true;
-}
-export function createTelegramPendingGroupLifecycle(groups, clearTimer) {
-    return {
-        async flushMessage(messageId) {
-            for (const state of groups.values()) {
-                if (!state.messages.some((message) => message.message_id === messageId)) {
-                    continue;
-                }
-                if (state.flushTimer)
-                    clearTimer(state.flushTimer);
-                state.flushTimer = undefined;
-                await state.dispatchNow?.();
-                if (state.messages.some((message) => message.message_id === messageId) &&
-                    !state.dispatching) {
-                    await state.dispatchNow?.();
-                }
-                return true;
+    switch (event.type) {
+        case "queued": {
+            let group = groups.get(event.key) ?? {
+                messages: [],
+                timerId: null,
+                dispatch: null,
+                suspended: false,
+            };
+            const duplicate = group.messages.findIndex((message) => message.message_id === event.message.message_id);
+            group = {
+                ...group,
+                messages: duplicate < 0
+                    ? [...group.messages, event.message]
+                    : group.messages.map((message, index) => index === duplicate ? event.message : message),
+                context: event.context,
+                meta: event.meta,
+            };
+            const held = group.suspended || group.dispatch !== null || group.timerId !== null;
+            if (event.rearm === "always" || !held)
+                group = armTimer(event.key, cancelTimer(group), event.delayMs);
+            groups.set(event.key, group);
+            break;
+        }
+        case "batchClosed": {
+            const group = groups.get(event.key);
+            const last = group?.messages.at(-1);
+            if (group && last)
+                groups.set(event.key, { ...group, boundaryId: last.message_id });
+            break;
+        }
+        case "timerFired": {
+            const group = groups.get(event.key);
+            if (!group || group.timerId !== event.timerId)
+                break;
+            groups.set(event.key, startDispatch(event.key, { ...group, timerId: null }));
+            break;
+        }
+        case "dispatchSettled": {
+            const group = groups.get(event.key);
+            if (!group || group.dispatch?.id !== event.dispatchId)
+                break;
+            const sent = new Set(group.dispatch.messageIds);
+            const remaining = event.ok
+                ? group.messages.filter((message) => !sent.has(message.message_id))
+                : group.messages;
+            if (remaining.length === 0) {
+                drop(event.key, group);
+                break;
             }
-            return false;
+            const settled = { ...group, messages: remaining, dispatch: null };
+            groups.set(event.key, settled.timerId === null
+                ? armTimer(event.key, settled, config.debounceMs)
+                : settled);
+            break;
+        }
+        case "flushRequested": {
+            const group = groups.get(event.key);
+            if (!group)
+                break;
+            groups.set(event.key, startDispatch(event.key, cancelTimer(group)));
+            break;
+        }
+        case "suspended":
+            for (const [key, group] of groups)
+                groups.set(key, { ...cancelTimer(group), suspended: true });
+            break;
+        case "resumed":
+            for (const [key, group] of groups) {
+                const resumed = {
+                    ...group,
+                    context: event.context,
+                    suspended: false,
+                };
+                groups.set(key, resumed.dispatch === null && resumed.timerId === null
+                    ? armTimer(key, resumed, config.debounceMs)
+                    : resumed);
+            }
+            break;
+        case "removed": {
+            const removed = new Set(event.messageIds);
+            for (const [key, group] of groups) {
+                if (!group.messages.some((message) => removed.has(message.message_id)))
+                    continue;
+                drop(key, group);
+                result += 1;
+            }
+            break;
+        }
+        case "keyCleared": {
+            const group = groups.get(event.key);
+            if (group)
+                drop(event.key, group);
+            break;
+        }
+        case "cleared":
+            for (const [key, group] of groups)
+                drop(key, group);
+            break;
+    }
+    return { state: { groups, nextTimerId, nextDispatchId }, effects, result };
+}
+/**
+ * The shell around `transitionTelegramPendingGroups`: it owns timer handles and each key's latest dispatcher, turns
+ * every dispatch outcome, including a synchronous throw, into `dispatchSettled`, and keeps each batch's promise for
+ * flush callers.
+ */
+export function createTelegramPendingGroups(options) {
+    const config = {
+        debounceMs: options.debounceMs,
+        requireContext: options.requireContext,
+    };
+    const timers = new Map();
+    const dispatchers = new Map();
+    const batches = new Map();
+    const machine = Machine.createTelegramMachineRunner({
+        initial: createTelegramPendingGroupsState(),
+        transition: (state, event) => transitionTelegramPendingGroups(state, event, config),
+        run(effect) {
+            switch (effect.type) {
+                case "armTimer": {
+                    const timer = options.setTimer(() => {
+                        timers.delete(effect.timerId);
+                        machine.dispatch({
+                            type: "timerFired",
+                            key: effect.key,
+                            timerId: effect.timerId,
+                        });
+                    }, effect.delayMs);
+                    timer.unref?.();
+                    timers.set(effect.timerId, timer);
+                    return;
+                }
+                case "cancelTimer": {
+                    const timer = timers.get(effect.timerId);
+                    timers.delete(effect.timerId);
+                    if (timer !== undefined)
+                        options.clearTimer(timer);
+                    return;
+                }
+                case "dispatch": {
+                    const settle = (ok) => {
+                        batches.delete(effect.dispatchId);
+                        machine.dispatch({
+                            type: "dispatchSettled",
+                            key: effect.key,
+                            dispatchId: effect.dispatchId,
+                            ok,
+                        });
+                    };
+                    let outcome;
+                    try {
+                        // Synchronous on purpose: a fired timer hands its batch to admission in the same turn.
+                        outcome = dispatchers.get(effect.key)?.(effect.messages, effect.context);
+                    }
+                    catch (error) {
+                        outcome = Promise.reject(error);
+                    }
+                    const batch = Promise.resolve(outcome).then(() => settle(true), (error) => {
+                        settle(false);
+                        throw error;
+                    });
+                    batch.catch(() => undefined);
+                    batches.set(effect.dispatchId, batch);
+                    return;
+                }
+            }
+        },
+    });
+    const dispatch = (event) => {
+        const step = machine.dispatch(event);
+        for (const key of dispatchers.keys())
+            if (!machine.state.groups.has(key))
+                dispatchers.delete(key);
+        return step.result;
+    };
+    const keyOf = (messageId) => {
+        for (const [key, group] of machine.state.groups)
+            if (group.messages.some((message) => message.message_id === messageId))
+                return key;
+        return undefined;
+    };
+    const awaitBatch = async (key) => {
+        const id = machine.state.groups.get(key)?.dispatch?.id;
+        if (id !== undefined)
+            await batches.get(id);
+    };
+    return {
+        get: (key) => machine.state.groups.get(key),
+        queue({ dispatchMessages, ...event }) {
+            dispatchers.set(event.key, dispatchMessages);
+            dispatch({ type: "queued", ...event });
+        },
+        clearKey: (key) => {
+            dispatch({ type: "keyCleared", key });
+        },
+        closeBatch: (key) => {
+            dispatch({ type: "batchClosed", key });
+        },
+        removeMessages: (messageIds) => dispatch({ type: "removed", messageIds }),
+        async flushMessage(messageId) {
+            const key = keyOf(messageId);
+            if (key === undefined)
+                return false;
+            dispatch({ type: "flushRequested", key });
+            await awaitBatch(key);
+            // The batch in flight may have predated this message; send what is left once it settles.
+            if (keyOf(messageId) === key &&
+                !machine.state.groups.get(key)?.dispatch) {
+                dispatch({ type: "flushRequested", key });
+                await awaitBatch(key);
+            }
+            return true;
         },
         suspend: () => {
-            for (const state of groups.values()) {
-                state.suspended = true;
-                if (state.flushTimer)
-                    clearTimer(state.flushTimer);
-                state.flushTimer = undefined;
-            }
+            dispatch({ type: "suspended" });
         },
         resume: (context) => {
-            for (const state of groups.values()) {
-                state.context = context;
-                state.suspended = false;
-                if (!state.dispatching && !state.flushTimer)
-                    state.reschedule?.();
-            }
+            dispatch({ type: "resumed", context });
         },
         clear: () => {
-            for (const state of groups.values()) {
-                if (state.flushTimer)
-                    clearTimer(state.flushTimer);
-            }
-            groups.clear();
+            dispatch({ type: "cleared" });
         },
     };
 }
 export function createTelegramMediaGroupController(options = {}) {
-    const groups = new Map();
     const debounceMs = options.debounceMs ?? TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS;
-    const setTimer = options.setTimer ??
-        ((callback, ms) => setTimeout(callback, ms));
-    const clearTimer = options.clearTimer ?? clearTimeout;
+    const groups = createTelegramPendingGroups({
+        debounceMs,
+        requireContext: false,
+        setTimer: options.setTimer ??
+            ((callback, ms) => setTimeout(callback, ms)),
+        clearTimer: options.clearTimer ?? clearTimeout,
+    });
     return {
-        queueMessage: ({ message, context, dispatchMessages }) => queueTelegramMediaGroupMessage({
-            message,
-            context,
-            groups,
-            debounceMs,
-            setTimer,
-            clearTimer,
-            dispatchMessages,
-        }),
-        removeMessages: (messageIds) => removePendingTelegramMediaGroupMessages(groups, messageIds, clearTimer),
-        ...createTelegramPendingGroupLifecycle(groups, clearTimer),
+        queueMessage: ({ message, context, dispatchMessages }) => {
+            const key = getTelegramMediaGroupKey(message);
+            if (!key)
+                return false;
+            groups.queue({
+                key,
+                message,
+                ...(context === undefined ? {} : { context }),
+                delayMs: debounceMs,
+                rearm: "always",
+                dispatchMessages,
+            });
+            return true;
+        },
+        removeMessages: groups.removeMessages,
+        flushMessage: groups.flushMessage,
+        suspend: groups.suspend,
+        resume: groups.resume,
+        clear: groups.clear,
     };
 }
 export function createTelegramMediaGroupDispatchRuntime(deps) {

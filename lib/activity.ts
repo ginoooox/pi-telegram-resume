@@ -243,6 +243,7 @@ function createTelegramActivityContext(
 }
 
 interface TelegramActivityHandlerQueue {
+  notifyDrained?: () => void;
   registration: RegisteredTelegramActivityHandler;
   events: TelegramActivityEvent[];
   running: boolean;
@@ -287,6 +288,19 @@ function coalesceActivityEvents(
   return next;
 }
 
+/** Optional observation must not change queue/transport settlement. */
+function captureActivityDrainObserver(capture?: () => (() => void) | undefined): () => void {
+  try {
+    const notify = capture?.();
+    return () => {
+      try {
+        const emitted: unknown = notify?.();
+        if (emitted) void Promise.resolve(emitted).catch(() => undefined);
+      } catch { /* Observer failure is inert. */ }
+    };
+  } catch { return () => {}; }
+}
+
 /** @internal */
 export interface TelegramActivityDispatcher {
   hasPending?: () => boolean;
@@ -297,6 +311,7 @@ export interface TelegramActivityDispatcher {
 /** @internal */
 export function createTelegramActivityDispatcher(
   deps: {
+    captureDrain?: () => (() => void) | undefined;
     recordFailure?: (
       handlerId: string,
       event: TelegramActivityEvent,
@@ -306,6 +321,7 @@ export function createTelegramActivityDispatcher(
 ): TelegramActivityDispatcher {
   const queues = new Map<string, TelegramActivityHandlerQueue>();
   let stopped = false;
+  const hasPending = () => Array.from(queues.values()).some(queue => queue.active && (queue.running || queue.events.length > 0));
   const drain = async (queue: TelegramActivityHandlerQueue): Promise<void> => {
     if (queue.running || !queue.active) return;
     queue.running = true;
@@ -341,13 +357,11 @@ export function createTelegramActivityDispatcher(
       }
     } finally {
       queue.running = false;
+      if (!stopped && !hasPending()) queue.notifyDrained?.();
     }
   };
   return {
-    hasPending: () =>
-      Array.from(queues.values()).some(
-        (queue) => queue.active && (queue.running || queue.events.length > 0),
-      ),
+    hasPending,
     dispatch(event) {
       if (stopped) return;
       for (const registration of getTelegramActivityHandlers()) {
@@ -361,6 +375,8 @@ export function createTelegramActivityDispatcher(
           };
           queues.set(registration.id, queue);
         }
+        if (!queue.running && queue.events.length === 0)
+          queue.notifyDrained = captureActivityDrainObserver(deps.captureDrain);
         const previous = queue.events.at(-1);
         if (previous && canCoalesceActivityEvents(previous, event)) {
           queue.events[queue.events.length - 1] = coalesceActivityEvents(
@@ -389,6 +405,7 @@ export function createTelegramActivityDispatcher(
 /** @internal */
 export function createTelegramActivityBridgeRuntime(deps: {
   generation: string;
+  captureDrain?: () => (() => void) | undefined;
   observeEvent?: (event: TelegramActivityEvent) => void;
   recordFailure?: (
     handlerId: string,
@@ -407,6 +424,7 @@ export function createTelegramActivityBridgeRuntime(deps: {
       runtime = createTelegramActivityRuntime({
         generation: `${deps.generation}:${++generationSequence}`,
         dispatcher: createTelegramActivityDispatcher({
+          captureDrain: deps.captureDrain,
           recordFailure: deps.recordFailure,
         }),
         observeEvent: deps.observeEvent,
@@ -766,7 +784,9 @@ export interface TelegramActivityPublicationRuntime {
   reset: () => void;
 }
 
-export function createTelegramActivityPublicationRuntime(): TelegramActivityPublicationRuntime {
+export function createTelegramActivityPublicationRuntime(deps: {
+  captureDrain?: () => (() => void) | undefined;
+} = {}): TelegramActivityPublicationRuntime {
   let generation = 0;
   let tail = Promise.resolve();
   let outstanding = 0,
@@ -774,6 +794,7 @@ export function createTelegramActivityPublicationRuntime(): TelegramActivityPubl
   const pending = new Set<() => void>();
   const reserve = (): TelegramActivityPublicationReservation => {
     const admittedGeneration = generation;
+    const notifyDrained = captureActivityDrainObserver(deps.captureDrain);
     let state: "pending" | "published" | "cancelled" = "pending";
     let resolve!: (task: (() => Promise<void>) | undefined) => void;
     const ready = new Promise<(() => Promise<void>) | undefined>((accept) => {
@@ -794,6 +815,7 @@ export function createTelegramActivityPublicationRuntime(): TelegramActivityPubl
       })
       .finally(() => {
         outstanding -= 1;
+        if (admittedGeneration === generation && outstanding === 0 && !unconfirmed) notifyDrained();
       });
     tail = result.catch(() => {});
     return {
@@ -818,6 +840,7 @@ export function createTelegramActivityPublicationRuntime(): TelegramActivityPubl
     hasUnconfirmed: () => unconfirmed,
     beginWork() {
       const admittedGeneration = generation;
+      const notifyDrained = captureActivityDrainObserver(deps.captureDrain);
       let settled = false;
       outstanding += 1;
       return {
@@ -827,6 +850,7 @@ export function createTelegramActivityPublicationRuntime(): TelegramActivityPubl
           outstanding -= 1;
           if (outcome === "unconfirmed" && admittedGeneration === generation)
             unconfirmed = true;
+          if (admittedGeneration === generation && outstanding === 0 && !unconfirmed) notifyDrained();
         },
       };
     },

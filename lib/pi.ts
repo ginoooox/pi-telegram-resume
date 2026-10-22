@@ -24,6 +24,8 @@ import {
   type SessionShutdownEvent,
   type SessionStartEvent,
   type SlashCommandInfo,
+  type TurnEndEvent,
+  type TurnEndEventResult,
   type UIPromptEndEvent,
   type UIPromptStartEvent,
   SettingsManager,
@@ -47,9 +49,15 @@ export type {
   SessionStartEvent,
   SessionInfo,
   SlashCommandInfo,
+  TurnEndEvent,
+  TurnEndEventResult,
   UIPromptEndEvent,
   UIPromptStartEvent,
 };
+
+export function setExtensionSessionName(api: Pick<ExtensionAPI, "setSessionName">, name: string): void {
+  api.setSessionName(name);
+}
 
 export type PiSessionSummary = Pick<SessionInfo, "id" | "cwd" | "path" | "modified"> &
   Partial<Pick<SessionInfo, "name">>;
@@ -345,6 +353,10 @@ export function getExtensionContextSessionId(
 
 export function isExtensionContextIdle(ctx: ExtensionContext): boolean {
   return ctx.isIdle();
+}
+
+export function isExtensionContextAbortRequested(ctx: ExtensionContext): boolean {
+  return ctx.signal?.aborted === true;
 }
 
 export function hasExtensionContextPendingMessages(

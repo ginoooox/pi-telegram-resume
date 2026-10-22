@@ -1,12 +1,12 @@
 /**
  * Telegram queue core contracts and pure planning helpers
  * Zones: telegram queue, pi agent lifecycle, scheduling
- * Owns queue item contracts, lane admission, pure queue mutations, and dispatch planning
+ * Owns queue item contracts, lane admission, mutations, dispatch planning, and protected Steer publication attempts
  */
 
 import { createHash } from "node:crypto";
 
-import { isPiStaleContextError } from "./pi.ts";
+import { isPiStaleContextError, type TurnEndEvent, type TurnEndEventResult } from "./pi.ts";
 import { isTelegramApiCommitUnknownError } from "./telegram-api.ts";
 import { isVoiceTurn } from "./voice.ts";
 import { isWireRecord as isQueuePayloadRecord } from "./wire.ts";
@@ -31,7 +31,7 @@ export type TelegramPromptContent =
   TelegramPromptTextContent | TelegramPromptImageContent;
 
 export type TelegramQueueItemKind = "prompt" | "control";
-export type TelegramQueueLane = "control" | "priority" | "default";
+export type TelegramQueueLane = "control" | "steer" | "priority" | "default";
 export type TelegramQueueReactionDisposition =
   | { kind: "default" }
   | { kind: "priority"; emoji: string }
@@ -43,6 +43,7 @@ export type TelegramQueueReactionDisposition =
     }
   | {
       kind: "reaction-transition";
+      promptLane?: Exclude<TelegramQueueLane, "control">;
       priorityEmoji?: string | null;
       suppressionEmoji?: string | null;
     };
@@ -54,7 +55,7 @@ export interface TelegramQueueAdmissionReceipt {
   journalBindingKey?: string;
 }
 export type TelegramQueueAdmissionMode =
-  "control-queue" | "priority-queue" | "default-queue";
+  "control-queue" | "steer-queue" | "priority-queue" | "default-queue";
 
 export interface TelegramQueueLaneContract {
   lane: TelegramQueueLane;
@@ -75,15 +76,21 @@ export const TELEGRAM_QUEUE_LANE_CONTRACTS: readonly TelegramQueueLaneContract[]
       allowedKinds: ["control", "prompt"],
     },
     {
+      lane: "steer",
+      admissionMode: "steer-queue",
+      dispatchRank: 1,
+      allowedKinds: ["prompt"],
+    },
+    {
       lane: "priority",
       admissionMode: "priority-queue",
-      dispatchRank: 1,
+      dispatchRank: 2,
       allowedKinds: ["prompt"],
     },
     {
       lane: "default",
       admissionMode: "default-queue",
-      dispatchRank: 2,
+      dispatchRank: 3,
       allowedKinds: ["prompt"],
     },
   ] as const;
@@ -126,6 +133,11 @@ export interface PendingTelegramTurn extends TelegramQueueItemBase {
   historyText: string;
   priorityEmoji?: string;
   reactionSuppressionEmoji?: string;
+  /** Frozen before receipt mutation; failed/partial attempts must never become executable again. */
+  steerAttempted?: true;
+  /** Original tail objects of an issued idle packet; metadata only, not another waiting queue. */
+  steerPacketTail?: readonly PendingTelegramTurn[];
+  steerPacketSourceOrders?: readonly number[];
   /** Emit the explicit aborted-turn notice when /next settles this active turn. */
   announceNextAbortOnEnd?: boolean;
 
@@ -226,7 +238,8 @@ export function parseTelegramQueueHandoffPayload(
 ): TelegramQueueHandoffPayload | undefined {
   if (
     !isQueuePayloadRecord(value) ||
-    (value.kind !== "prompt" && value.kind !== "control")
+    (value.kind !== "prompt" && value.kind !== "control") ||
+    value.steerAttempted !== undefined || value.steerPacketTail !== undefined || value.steerPacketSourceOrders !== undefined
   )
     return undefined;
   const target =
@@ -259,6 +272,7 @@ export function parseTelegramQueueHandoffPayload(
       typeof value.guestInlineMessageId !== "string") ||
     !Number.isSafeInteger(value.queueOrder) ||
     (value.queueLane !== "control" &&
+      value.queueLane !== "steer" &&
       value.queueLane !== "priority" &&
       value.queueLane !== "default") ||
     !Number.isSafeInteger(value.laneOrder) ||
@@ -300,6 +314,7 @@ export function parseTelegramQueueHandoffPayload(
   }
   if (
     value.queueLane === "control" ||
+    (value.queueLane === "steer" && (value.guestQueryId !== undefined || value.guestInlineMessageId !== undefined)) ||
     !Array.isArray(value.sourceMessageIds) ||
     value.sourceMessageIds.some((id) => !Number.isSafeInteger(id)) ||
     !Array.isArray(value.queuedAttachments) ||
@@ -589,7 +604,8 @@ function isTelegramQueueItemSkipped<TContext = unknown>(
 export function countExecutableTelegramQueueItems<TContext = unknown>(
   items: readonly TelegramQueueItem<TContext>[],
 ): number {
-  return items.filter((item) => !isTelegramQueueItemSkipped(item)).length;
+  return items.filter((item) => !isTelegramQueueItemSkipped(item) &&
+    !(item.kind === "prompt" && item.steerAttempted)).length;
 }
 
 export function createTelegramQueueItemCountGetter<TContext = unknown>(
@@ -677,7 +693,7 @@ export function partitionTelegramQueueItemsForHistory<TContext = unknown>(
   const historyTurns: PendingTelegramTurn[] = [];
   const remainingItems: TelegramQueueItem<TContext>[] = [];
   for (const item of items) {
-    if (isPendingTelegramTurn(item)) {
+    if (isPendingTelegramTurn(item) && item.queueLane !== "steer" && !item.steerAttempted) {
       historyTurns.push(item);
       continue;
     }
@@ -774,13 +790,14 @@ export function appendTelegramQueueItem<
 export function createTelegramQueueHandoff<TContext>(input: {
   handoffToken: string;
   item: TelegramQueueItem<TContext>;
+  steerSupported?: boolean;
 }): TelegramQueueHandoff {
   if (!input.handoffToken) {
     throw new Error("Telegram queue handoff token is required.");
   }
   const handoff = {
     handoffToken: input.handoffToken,
-    payload: createTelegramQueueHandoffPayload(input.item),
+    payload: createTelegramQueueHandoffPayload(input.item, { steerSupported: input.steerSupported }),
   };
   if (
     Buffer.byteLength(JSON.stringify(handoff)) >
@@ -793,8 +810,18 @@ export function createTelegramQueueHandoff<TContext>(input: {
 
 export function createTelegramQueueHandoffPayload<TContext>(
   item: TelegramQueueItem<TContext>,
+  options: { steerSupported?: boolean } = {},
 ): TelegramQueueHandoffPayload {
   assertTelegramQueueItemAdmissionValid(item);
+  if (item.kind === "prompt" && (item.steerAttempted || item.steerPacketTail !== undefined || item.steerPacketSourceOrders !== undefined)) {
+    throw new Error("Attempted Steer work cannot be transferred.");
+  }
+  if (item.queueLane === "steer" && (item.guestQueryId !== undefined || item.guestInlineMessageId !== undefined)) {
+    throw new Error("Guest prompts cannot use Steer queue transfer.");
+  }
+  if (item.queueLane === "steer" && options.steerSupported !== true) {
+    throw new Error("Steer queue transfer requires compatible lane support.");
+  }
   if (!item.admissionReceipts?.length) {
     throw new Error(
       "Telegram queue handoff requires durable admission receipts.",
@@ -1098,6 +1125,7 @@ export function removeTelegramQueueItemsByMessageIds<TContext = unknown>(
   for (const item of items) {
     const shouldRemove =
       isPendingTelegramTurn(item) &&
+      !item.steerAttempted &&
       isTelegramQueueItemInMessageScope(item, scope) &&
       item.sourceMessageIds.some((messageId) =>
         deletedMessageIds.has(messageId),
@@ -1142,10 +1170,18 @@ export function applyTelegramQueuePromptReactionDisposition<TContext = unknown>(
   destinationLaneOrder?: number,
   scope?: TelegramQueueMessageScope,
 ): { items: TelegramQueueItem<TContext>[]; changed: boolean } {
+  if (
+    disposition.kind === "reaction-transition" &&
+    disposition.promptLane !== undefined &&
+    !["steer", "priority", "default"].includes(disposition.promptLane)
+  ) {
+    throw new Error("Telegram prompt lane selection is invalid.");
+  }
   let nextItems = items;
   for (const [index, item] of items.entries()) {
     if (
       !isPendingTelegramTurn(item) ||
+      item.steerAttempted ||
       item.queueLane === "control" ||
       !isTelegramQueueItemInMessageScope(item, scope) ||
       !item.sourceMessageIds.includes(messageId)
@@ -1159,7 +1195,13 @@ export function applyTelegramQueuePromptReactionDisposition<TContext = unknown>(
           : disposition.priorityEmoji !== null
         : disposition.kind === "priority" ||
           disposition.kind === "priority-suppressed";
-    const queueLane: TelegramQueueLane = isPriority ? "priority" : "default";
+    const queueLane: TelegramQueueLane =
+      disposition.kind === "reaction-transition"
+        ? (disposition.promptLane ??
+          (disposition.priorityEmoji === undefined
+            ? item.queueLane
+            : isPriority ? "priority" : "default"))
+        : isPriority ? "priority" : "default";
     const laneOrder =
       item.queueLane === queueLane ? item.laneOrder : destinationLaneOrder;
     if (laneOrder === undefined) {
@@ -1219,14 +1261,12 @@ export function consumeDispatchedTelegramPrompt<TContext = unknown>(
   if (!nextItem || !isPendingTelegramTurn(nextItem)) {
     return { activeTurn: undefined, remainingItems: items };
   }
+  if (nextItem.steerPacketTail !== undefined) {
+    const packet = [nextItem, ...nextItem.steerPacketTail];
+    const originals = new Set<TelegramQueueItem<TContext>>(packet);
+    return { activeTurn: projectTelegramSteerPacketTurn(packet), remainingItems: items.filter(item => !originals.has(item)) };
+  }
   return { activeTurn: nextItem, remainingItems: items.slice(1) };
-}
-
-export function formatQueuedTelegramItemsStatus<TContext = unknown>(
-  items: TelegramQueueItem<TContext>[],
-): string {
-  const count = countExecutableTelegramQueueItems(items);
-  return count === 0 ? "" : ` +${count}`;
 }
 
 export function truncateTelegramQueueSummary(
@@ -1336,6 +1376,7 @@ export function createTelegramControlItemBuilder<TContext = unknown>(
 
 export type TelegramQueueDispatchAction<TContext = unknown> =
   | { kind: "none"; remainingItems: TelegramQueueItem<TContext>[] }
+  | { kind: "steer"; item: PendingTelegramTurn; packet: readonly PendingTelegramTurn[]; remainingItems: TelegramQueueItem<TContext>[] }
   | {
       kind: "control";
       item: PendingTelegramControlItem<TContext>;
@@ -1346,6 +1387,177 @@ export type TelegramQueueDispatchAction<TContext = unknown> =
       item: PendingTelegramTurn;
       remainingItems: TelegramQueueItem<TContext>[];
     };
+
+export type TelegramSteerPacketPlan =
+  | { kind: "none" }
+  | { kind: "skip"; item: PendingTelegramTurn }
+  | { kind: "packet"; items: readonly PendingTelegramTurn[] };
+
+/** Plan a fixed ready prefix; publication/settlement remain with the Queue effect shell. */
+export function planTelegramSteerPacket<TContext>(
+  items: readonly TelegramQueueItem<TContext>[],
+  options: {
+    blocked: boolean;
+    isItemReady: (item: TelegramQueueItem<TContext>) => boolean;
+    canAppend?: (packet: readonly PendingTelegramTurn[], item: PendingTelegramTurn) => boolean;
+  },
+): TelegramSteerPacketPlan {
+  if (options.blocked) return { kind: "none" };
+  const ordered = [...items].sort(compareTelegramQueueItems);
+  if (ordered.some((item) => item.queueLane === "control" && options.isItemReady(item))) {
+    return { kind: "none" };
+  }
+  const packet: PendingTelegramTurn[] = [];
+  for (const item of ordered) {
+    if (item.queueLane !== "steer" || !isPendingTelegramTurn(item)) continue;
+    if (item.steerAttempted || !options.isItemReady(item) || item.guestQueryId !== undefined || item.guestInlineMessageId !== undefined) break;
+    if (item.reactionSuppressionEmoji) {
+      if (packet.length === 0) return { kind: "skip", item };
+      break;
+    }
+    const first = packet[0];
+    if (first && !isSameTelegramPromptNamespace(first, item)) break;
+    if (options.canAppend && !options.canAppend(packet, item)) break;
+    packet.push(item);
+  }
+  return packet.length > 0 ? { kind: "packet", items: packet } : { kind: "none" };
+}
+
+function buildTelegramSteerPacketContent(packet: readonly PendingTelegramTurn[], idleTask = false): TelegramPromptContent[] {
+  const content = packet.flatMap((item, index) => [
+    ...(index > 0 ? [{ type: "text" as const, text: "\n\n" }] : []), ...item.content,
+  ]);
+  // Ordinary idle prompts must retain origin detection by before_agent_start.
+  return idleTask ? [{ type: "text", text: "[telegram]\n" }, ...content] : content;
+}
+
+function createTelegramSteerPacketBudget(idleTask = false) {
+  let packetBytes = idleTask ? 64 : 0;
+  return (packet: readonly PendingTelegramTurn[], item: PendingTelegramTurn): boolean => {
+    const bytes = Buffer.byteLength(JSON.stringify(item.content)) +
+      (packet.length > 0 ? Buffer.byteLength("\n\n") : 0) + 64;
+    if (packetBytes + bytes > TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BYTES) return false;
+    packetBytes += bytes;
+    return true;
+  };
+}
+
+export function isTelegramSteerItemWithinIdleCapacity(item: PendingTelegramTurn): boolean {
+  return createTelegramSteerPacketBudget(true)([], item);
+}
+
+function projectTelegramSteerPacketTurn(packet: readonly PendingTelegramTurn[]): PendingTelegramTurn {
+  const first = packet[0];
+  if (!first) throw new Error("Steer packet cannot be empty.");
+  const projected: PendingTelegramTurn = {
+    ...first,
+    content: buildTelegramSteerPacketContent(packet, true),
+    historyText: packet.map(item => item.historyText).join("\n\n"),
+    sourceMessageIds: [...new Set(packet.flatMap(item => item.sourceMessageIds))],
+    queuedAttachments: packet.flatMap(item => item.queuedAttachments),
+    admissionReceipts: packet.flatMap(item => item.admissionReceipts ?? []),
+    voiceReplyPreferred: packet.some(item => item.voiceReplyPreferred === true),
+    voiceReplyRequired: packet.some(item => item.voiceReplyRequired === true),
+    steerPacketSourceOrders: packet.map(item => item.queueOrder),
+  };
+  delete projected.steerPacketTail;
+  return projected;
+}
+
+function isSameTelegramPromptNamespace(left: PendingTelegramTurn, right: PendingTelegramTurn): boolean {
+  return left.chatId === right.chatId &&
+    left.target?.chatId === right.target?.chatId &&
+    left.target?.threadId === right.target?.threadId &&
+    left.transportStamp?.profile === right.transportStamp?.profile &&
+    left.transportStamp?.generation === right.transportStamp?.generation;
+}
+
+export interface TelegramSteerBoundaryRuntimeDeps<TContext> extends TelegramQueueStore<TContext> {
+  isContextCurrent: (ctx: TContext) => boolean;
+  isBlocked: (ctx: TContext) => boolean;
+  getGeneration: () => number;
+  isItemReady: (item: TelegramQueueItem<TContext>, ctx: TContext) => boolean;
+  isItemCurrent: (item: PendingTelegramTurn, ctx: TContext) => boolean;
+  getActiveTurn: () => PendingTelegramTurn | undefined;
+  commitPacket: (items: readonly PendingTelegramTurn[], ctx: TContext) => boolean;
+  discardItem: (item: PendingTelegramTurn, ctx: TContext) => boolean;
+  updateStatus: (ctx: TContext) => void;
+  recordRuntimeEvent?: TelegramRuntimeEventRecorderPort["recordRuntimeEvent"];
+}
+
+/** One publication attempt; journal ACK is source disposition, never SDK/model-use confirmation. */
+export function createTelegramSteerBoundaryRuntime<TContext>(deps: TelegramSteerBoundaryRuntimeDeps<TContext>) {
+  const updateStatus = (ctx: TContext): void => {
+    try { if (deps.isContextCurrent(ctx)) deps.updateStatus(ctx); } catch (error) {
+      if (!isPiStaleContextError(error)) {
+        try { deps.recordRuntimeEvent?.("queue", error, { phase: "steer-status" }); } catch { /* Diagnostic failure cannot replay input. */ }
+      }
+    }
+  };
+  const report = (error: unknown, phase: string, ctx: TContext): void => {
+    try { deps.recordRuntimeEvent?.("queue", error, { phase }); } catch { /* Diagnostics cannot replay input. */ }
+    updateStatus(ctx);
+  };
+  return {
+    onTurnEnd(event: Pick<TurnEndEvent, "turnIndex" | "outcome">, ctx: TContext): TurnEndEventResult | undefined {
+      const generation = deps.getGeneration();
+      const current = () => deps.isContextCurrent(ctx) && generation === deps.getGeneration();
+      const blocked = () => !current() || event.outcome !== "completed" || deps.isBlocked(ctx);
+      try {
+        if (blocked()) return;
+        const matchesActive = (item: TelegramQueueItem<TContext>) => {
+          const active = deps.getActiveTurn();
+          return item.kind !== "prompt" || !active || isSameTelegramPromptNamespace(active, item);
+        };
+        const ready = (item: TelegramQueueItem<TContext>) => deps.isItemReady(item, ctx) && matchesActive(item);
+        // Skipped heads settle under the same exact owner before recapturing a fresh packet.
+        const budget = deps.getQueuedItems().length;
+        for (let index = 0; index <= budget; index++) {
+          const plan = planTelegramSteerPacket(deps.getQueuedItems(), {
+            blocked: blocked(), isItemReady: ready, canAppend: createTelegramSteerPacketBudget(),
+          });
+          if (plan.kind === "none") return;
+          if (plan.kind === "skip") {
+            if (blocked() || !deps.discardItem(plan.item, ctx)) return;
+            if (!current()) return;
+            deps.setQueuedItems(deps.getQueuedItems().filter(item => item !== plan.item));
+            continue;
+          }
+          const packet = plan.items;
+          const content = buildTelegramSteerPacketContent(packet);
+          const draft: NonNullable<TurnEndEventResult["entries"]>[number] = {
+            type: "custom_message", customType: "telegram-steer", content, display: true,
+            details: { boundaryTurnIndex: event.turnIndex, queueOrders: packet.map(item => item.queueOrder) },
+          };
+          if (packet.some(item => !ready(item)) ||
+              packet.some(item => !deps.getQueuedItems().includes(item)) || blocked()) return;
+          // Keep the same Queue objects/receipts: a refused prefix cannot become a new attempt.
+          for (const item of packet) item.steerAttempted = true;
+          if (!deps.commitPacket(packet, ctx)) {
+            report(new Error("Steer packet receipt settlement is unconfirmed."), "steer-settlement-unconfirmed", ctx);
+            return;
+          }
+          if (blocked() || packet.some(item => !matchesActive(item) ||
+              !deps.isItemCurrent(item, ctx) || !deps.getQueuedItems().includes(item))) {
+            report(new Error("Steer packet authority changed before publication."), "steer-publication-refused", ctx);
+            return;
+          }
+          const selected = new Set<TelegramQueueItem<TContext>>(packet);
+          deps.setQueuedItems(deps.getQueuedItems().filter(item => !selected.has(item)));
+          updateStatus(ctx);
+          if (!current() || deps.isBlocked(ctx)) {
+            report(new Error("Steer publication was refused after source disposition."), "steer-publication-refused", ctx);
+            return;
+          }
+          return { entries: [draft], continue: true };
+        }
+      } catch (error) {
+        report(error, "steer-attempt-failed", ctx);
+      }
+      return undefined;
+    },
+  };
+}
 
 export function planNextTelegramQueueAction<TContext = unknown>(
   items: TelegramQueueItem<TContext>[],
@@ -1360,6 +1572,9 @@ export function planNextTelegramQueueAction<TContext = unknown>(
   }
   assertTelegramQueueItemAdmissionValid(firstItem);
   if (isPendingTelegramTurn(firstItem)) {
+    if (firstItem.steerAttempted) return { kind: "none", remainingItems: items };
+    // Steer needs whole-packet idle/boundary dispatch, never this single-prompt fallback.
+    if (firstItem.queueLane === "steer") return { kind: "none", remainingItems: items };
     return { kind: "prompt", item: firstItem, remainingItems: items };
   }
   return { kind: "control", item: firstItem, remainingItems };
@@ -1768,13 +1983,18 @@ export interface TelegramAgentEndRuntimeDeps<
   ) => Promise<void>;
   sendGuestReply?: (guestQueryId: string, markdown: string) => Promise<void>;
   /** Replaces the early guest ACK with the final text. */
-  editGuestReply?: (inlineMessageId: string, markdown: string) => Promise<void>;
+  editGuestReply?: (
+    inlineMessageId: string,
+    markdown: string,
+    options?: { assertAuthority?: () => void },
+  ) => Promise<void>;
   /** Cancels the animated guest placeholder before the final edit. */
   stopGuestPlaceholder?: (inlineMessageId: string) => Promise<void>;
   sendGuestAttachment?: (
     turn: TTurn,
     attachment: QueuedAttachment,
     caption?: string,
+    options?: { isDeliveryActive?: () => boolean },
   ) => Promise<void>;
   sendGuestVoiceReply?: (
     turn: TTurn,
@@ -2135,13 +2355,46 @@ export async function handleTelegramAgentEndRuntime<
         });
       }
     }
-    if (turn.guestInlineMessageId && deps.editGuestReply) {
-      const experimentText = assistant.errorMessage
+    if (!isDeliveryActive()) return;
+    if (turn.guestInlineMessageId) {
+      let experimentText = assistant.errorMessage
         ? "Telegram bridge: Pi failed while processing the request."
         : finalText;
+      const [attachment] = turn.queuedAttachments;
+      if (!assistant.errorMessage && attachment) {
+        try {
+          if (!deps.sendGuestAttachment) throw new Error("Guest attachment delivery is unavailable.");
+          await deps.sendGuestAttachment(turn, attachment, finalText || undefined, { isDeliveryActive });
+          if (isDeliveryActive() && endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
+          return;
+        } catch (error) {
+          deps.recordRuntimeEvent?.("delivery", error, {
+            phase: "guest-attachment", guestQueryId: turn.guestQueryId,
+          });
+          if (!isDeliveryActive()) return;
+          if (isTelegramApiCommitUnknownError(error)) {
+            if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
+            return;
+          }
+          experimentText = "Telegram bridge could not deliver the requested attachment. Please retry in a normal bot chat.";
+        }
+      } else if (!assistant.errorMessage && hasOutboundArtifacts) {
+        experimentText = [finalText, "Telegram Guest Mode cannot replace an inline placeholder with a voice note. Please request MP3 audio or use a normal bot chat."].filter(Boolean).join("\n\n");
+      }
+      if (!deps.editGuestReply) {
+        deps.recordRuntimeEvent?.("delivery", new Error("Guest inline reply editing is unavailable."), {
+          phase: "guest-ack-edit", guestQueryId: turn.guestQueryId,
+        });
+        if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
+        return;
+      }
       if (experimentText) {
         try {
-          await deps.editGuestReply(turn.guestInlineMessageId, experimentText);
+          await deps.editGuestReply(turn.guestInlineMessageId, experimentText, {
+            assertAuthority() {
+              if (!isDeliveryActive()) throw new Error("Guest reply edit lost authority.");
+            },
+          });
           deps.recordRuntimeEvent?.(
             "guest",
             new Error("Guest ACK edited the guest answer"),
@@ -2186,6 +2439,7 @@ export async function handleTelegramAgentEndRuntime<
           turn,
           guestAttachment,
           finalText || undefined,
+          { isDeliveryActive },
         );
       } catch (error) {
         deps.recordRuntimeEvent?.("delivery", error, {
@@ -2966,8 +3220,12 @@ function removeTelegramQueuedGuestPromptByOrderRuntime<TContext>(
   queueOrder: number,
   deps: TelegramQueueMutationRuntimeDeps<TContext>,
 ): boolean {
+  const queuedItems = deps.getQueuedItems();
+  const head = queuedItems[0];
+  // agent_start must consume the issued guest, not adopt the next waiting reply owner.
+  if (deps.hasPendingDispatch?.() && head?.queueOrder === queueOrder) return false;
   const { items, removedItems, removedCount } =
-    removeTelegramQueuedGuestPromptByOrder(deps.getQueuedItems(), queueOrder);
+    removeTelegramQueuedGuestPromptByOrder(queuedItems, queueOrder);
   if (removedCount === 0) return false;
   // A menu Skip means permanent discard, so settle durable admission before
   // removing the live item. A failed settlement keeps the prompt retryable.
@@ -2984,6 +3242,9 @@ export function applyTelegramQueuePromptReactionDispositionRuntime<TContext>(
   scope?: TelegramQueueMessageScope,
 ): boolean {
   const queuedItems = deps.getQueuedItems();
+  const head = queuedItems[0];
+  if (deps.hasPendingDispatch?.() && head?.kind === "prompt" &&
+      isTelegramQueueItemInMessageScope(head, scope) && head.sourceMessageIds.includes(messageId)) return false;
   const suppression =
     disposition.kind === "reaction-transition"
       ? disposition.suppressionEmoji
@@ -3021,6 +3282,7 @@ export function applyTelegramQueuePromptReactionDispositionRuntime<TContext>(
   const changesLane = queuedItems.some((item) => {
     if (
       !isPendingTelegramTurn(item) ||
+      item.steerAttempted ||
       item.queueLane === "control" ||
       !isTelegramQueueItemInMessageScope(item, scope) ||
       !item.sourceMessageIds.includes(messageId)
@@ -3029,11 +3291,9 @@ export function applyTelegramQueuePromptReactionDispositionRuntime<TContext>(
     }
     const queueLane: TelegramQueueLane =
       disposition.kind === "reaction-transition"
-        ? disposition.priorityEmoji === undefined
+        ? (disposition.promptLane ?? (disposition.priorityEmoji === undefined
           ? item.queueLane
-          : disposition.priorityEmoji === null
-            ? "default"
-            : "priority"
+          : disposition.priorityEmoji === null ? "default" : "priority"))
         : disposition.kind === "priority" ||
             disposition.kind === "priority-suppressed"
           ? "priority"
@@ -3082,6 +3342,8 @@ export async function enqueueTelegramPromptTurnRuntime<
     if (
       (pendingDispatch && index === 0) ||
       !isPendingTelegramTurn(item) ||
+      item.steerAttempted ||
+      item.queueLane === "steer" ||
       !historyOrders.has(item.queueOrder)
     )
       return true;
@@ -3354,7 +3616,7 @@ export interface TelegramDispatchRuntimeDeps<TContext = unknown> {
       { kind: "control" }
     >["item"],
   ) => void;
-  onPromptDispatchStart: (chatId: number) => void;
+  onPromptDispatchStart: (chatId: number, target?: TelegramQueueTarget) => void;
   commitPromptDispatch?: (
     item: Extract<
       TelegramQueueDispatchAction<TContext>,
@@ -3383,7 +3645,7 @@ export interface TelegramQueueDispatchControllerDeps<
   isDispatchGenerationActive?: (generation: number) => boolean;
   updateStatus: (ctx: TContext, error?: string) => void;
   sendTextReply: TelegramControlRuntimeDeps<TContext>["sendTextReply"];
-  onPromptDispatchStart: (ctx: TContext, chatId: number) => void;
+  onPromptDispatchStart: (ctx: TContext, chatId: number, target?: TelegramQueueTarget) => void;
   commitPromptDispatch?: (
     item: Extract<
       TelegramQueueDispatchAction<TContext>,
@@ -3396,6 +3658,12 @@ export interface TelegramQueueDispatchControllerDeps<
   reconcileNextDispatchAnnouncementReplyOwnership?: (
     item: PendingTelegramTurn,
   ) => void;
+  steerDispatch?: {
+    commitPacket: (items: readonly PendingTelegramTurn[], ctx: TContext) => boolean;
+    isContextCurrent?: (ctx: TContext) => boolean;
+    /** Rechecks idle/native/abort guards without rejecting this packet's own pending flag. */
+    canSubmit?: (ctx: TContext) => boolean;
+  };
   isQueueItemTransportActive?: (item: TelegramQueueItem<TContext>) => boolean;
   hasPendingInboundQueueMutationForItem?: (
     item: TelegramQueueItem<TContext>,
@@ -3426,7 +3694,8 @@ export function executeTelegramQueueDispatchPlan<TContext = unknown>(
     deps.executeControlItem(plan.item);
     return;
   }
-  deps.onPromptDispatchStart(plan.item.chatId);
+  if (plan.kind === "steer") throw new Error("Steer packet requires dedicated Queue dispatch.");
+  deps.onPromptDispatchStart(plan.item.chatId, plan.item.target);
   try {
     if (deps.commitPromptDispatch && !deps.commitPromptDispatch(plan.item)) {
       throw new Error(
@@ -3470,6 +3739,7 @@ export function createTelegramQueueDispatchRuntime<TContext = unknown>(
     onPromptDispatchFailure: deps.onPromptDispatchFailure,
     reconcileNextDispatchAnnouncementReplyOwnership:
       deps.reconcileNextDispatchAnnouncementReplyOwnership,
+    steerDispatch: deps.steerDispatch,
     isQueueItemTransportActive: deps.isQueueItemTransportActive,
     hasPendingInboundQueueMutationForItem:
       deps.hasPendingInboundQueueMutationForItem,
@@ -3510,6 +3780,11 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
       const retainedItems: TelegramQueueItem<TContext>[] = [];
       let droppedInactiveItemCount = 0;
       for (const item of queuedItems) {
+        if (item.kind === "prompt" && item.steerAttempted) {
+          protectedInactiveItems.push(item);
+          retainedItems.push(item);
+          continue;
+        }
         if (
           !deps.isQueueItemTransportActive ||
           deps.isQueueItemTransportActive(item)
@@ -3619,14 +3894,26 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
         return;
       }
       const dispatchBasisItems = deps.getQueuedItems();
-      const dispatchPlan = planNextTelegramQueueAction(
-        dispatchableItems,
-        canDispatch,
-      );
+      let dispatchPlan = planNextTelegramQueueAction(dispatchableItems, canDispatch);
+      if (canDispatch && nextItem?.kind === "prompt" && nextItem.queueLane === "steer" &&
+          deps.steerDispatch && deps.steerDispatch.isContextCurrent?.(ctx) !== false &&
+          deps.steerDispatch.canSubmit?.(ctx) !== false) {
+        const packetPlan = planTelegramSteerPacket(deps.getQueuedItems(), {
+          blocked: false,
+          isItemReady: item => deps.isQueueItemTransportActive?.(item) !== false &&
+            deps.hasPendingInboundQueueMutationForItem?.(item) !== true &&
+            deps.isQueueItemAdmissionReady?.(item) !== false,
+          canAppend: createTelegramSteerPacketBudget(true),
+        });
+        if (packetPlan.kind === "packet" && packetPlan.items[0] === nextItem) {
+          dispatchPlan = { kind: "steer", item: nextItem, packet: packetPlan.items, remainingItems: dispatchableItems };
+        }
+      }
       const commitDispatchPlan = (): boolean => {
         if (dispatchPlan.kind === "none") return true;
         const currentItems = deps.getQueuedItems();
-        if (dispatchPlan.kind === "prompt") {
+        if (dispatchPlan.kind === "prompt" || dispatchPlan.kind === "steer") {
+          const inputs = dispatchPlan.kind === "steer" ? dispatchPlan.packet : [dispatchPlan.item];
           const queueDrifted =
             currentItems.length !== dispatchBasisItems.length ||
             currentItems.some(
@@ -3634,10 +3921,10 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
             );
           const dispatchEligibilityDrifted =
             !deps.canDispatch(ctx) ||
-            deps.hasPendingInboundQueueMutationForItem?.(dispatchPlan.item) ===
-              true ||
-            deps.isQueueItemAdmissionReady?.(dispatchPlan.item) === false ||
-            deps.isQueueItemTransportActive?.(dispatchPlan.item) === false;
+            (dispatchPlan.kind === "steer" && (deps.steerDispatch?.isContextCurrent?.(ctx) === false ||
+              deps.steerDispatch?.canSubmit?.(ctx) === false)) ||
+            inputs.some(item => deps.hasPendingInboundQueueMutationForItem?.(item) === true ||
+              deps.isQueueItemAdmissionReady?.(item) === false || deps.isQueueItemTransportActive?.(item) === false);
           if (queueDrifted || dispatchEligibilityDrifted) {
             const selectedItemRetained = currentItems.includes(
               dispatchPlan.item,
@@ -3669,6 +3956,53 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
       };
       const executePlan = (): void => {
         if (!commitDispatchPlan()) return;
+        if (dispatchPlan.kind === "steer") {
+          const { packet, item: first } = dispatchPlan;
+          const content = buildTelegramSteerPacketContent(packet, true);
+          const generation = deps.getDispatchGeneration?.();
+          const current = (): boolean => {
+            try {
+              return (!deps.hasDispatchContext || deps.hasDispatchContext()) &&
+                (generation === undefined || deps.isDispatchGenerationActive?.(generation) !== false) &&
+                deps.steerDispatch?.isContextCurrent?.(ctx) !== false;
+            } catch { return false; }
+          };
+          const refuse = (message: string): void => {
+            deps.recordRuntimeEvent?.("dispatch", new Error(message), { phase: "steer-idle-attempt" });
+            if (current()) deps.onPromptDispatchFailure(ctx, message);
+          };
+          controlDispatchPending = true;
+          try {
+            for (const item of packet) item.steerAttempted = true;
+            if (deps.steerDispatch?.commitPacket(packet, ctx) !== true) {
+              refuse("Steer packet receipt settlement is unconfirmed.");
+              return;
+            }
+            const sourceChanged = packet.some(item => !deps.getQueuedItems().includes(item) ||
+              deps.isQueueItemTransportActive?.(item) === false || deps.hasPendingInboundQueueMutationForItem?.(item) === true);
+            const readyControl = deps.getQueuedItems().some(item => item.queueLane === "control" &&
+              deps.isQueueItemTransportActive?.(item) !== false && deps.isQueueItemAdmissionReady?.(item) !== false);
+            if (!current() || deps.steerDispatch?.canSubmit?.(ctx) === false || !deps.canDispatch(ctx) || sourceChanged || readyControl) {
+              refuse("Steer packet lost idle readiness before submission.");
+              return;
+            }
+            first.steerPacketTail = packet.slice(1);
+            // Pin the original head, retaining every original until agent_start consumes the packet.
+            deps.setQueuedItems([first, ...deps.getQueuedItems().filter(item => item !== first)]);
+            deps.onPromptDispatchStart(ctx, first.chatId, first.target);
+            if (!current() || deps.steerDispatch?.canSubmit?.(ctx) === false || packet.some(item => !deps.getQueuedItems().includes(item) ||
+                deps.isQueueItemTransportActive?.(item) === false || deps.hasPendingInboundQueueMutationForItem?.(item) === true)) {
+              refuse("Steer packet authority changed before submission.");
+              return;
+            }
+            deps.sendUserMessage(content);
+          } catch (error) {
+            refuse(getTelegramQueueErrorMessage(error));
+          } finally {
+            controlDispatchPending = false;
+          }
+          return;
+        }
         executeTelegramQueueDispatchPlan(dispatchPlan, {
           executeControlItem: (item) => {
             controlDispatchPending = true;
@@ -3702,8 +4036,8 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
               },
             });
           },
-          onPromptDispatchStart: (chatId) => {
-            deps.onPromptDispatchStart(ctx, chatId);
+          onPromptDispatchStart: (chatId, target) => {
+            deps.onPromptDispatchStart(ctx, chatId, target);
           },
           commitPromptDispatch: deps.commitPromptDispatch
             ? (item) => deps.commitPromptDispatch!(item, ctx)
@@ -3717,7 +4051,7 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
           },
         });
       };
-      if (dispatchPlan.kind === "prompt" && nextDispatchAnnouncementRequested) {
+      if ((dispatchPlan.kind === "prompt" || dispatchPlan.kind === "steer") && nextDispatchAnnouncementRequested) {
         nextDispatchAnnouncementRequested = false;
         controlDispatchPending = true;
         const announcementGeneration = nextDispatchAnnouncementGeneration;

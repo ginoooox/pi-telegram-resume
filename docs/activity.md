@@ -222,7 +222,7 @@ Default scope:
 - `telegram` uses `{ kind: "target", target: event.target }`, binding delayed handlers to the immutable originating thread rather than whichever turn happens to be active later.
 - `local`, `autonomous`, and `unknown` use `{ kind: "instance" }`.
 
-Handlers may explicitly choose aggregate or another authorized scope. Context methods delegate to the public delivery runtime on every call; they do not retain Telegram clients, Pi contexts, or transport ownership objects. The Delivery API rechecks authorization when an operation runs, so a captured target that is no longer owned fails closed instead of rerouting.
+Handlers may explicitly choose an authorized scope; aggregate output is available only in Classic Mode, never Threaded Mode's input-only All. Context methods delegate to the public delivery runtime on every call; they do not retain Telegram clients, Pi contexts, or transport ownership objects. The Delivery API rechecks authorization when an operation runs, so a captured target that is no longer owned fails closed instead of rerouting.
 
 A handler may still receive events while no target is currently deliverable. Delivery then returns the normal structured `target-unavailable`, `target-unauthorized`, or `runtime-unavailable` result.
 

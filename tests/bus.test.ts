@@ -55,7 +55,6 @@ import {
   isTelegramBusForwardOwnershipCurrent,
   isTelegramFollowerApiCallAllowed,
   isSameTelegramBusFollowerRegistration,
-  markTelegramBusAggregateDelivery,
   markTelegramBusCrossTargetDelivery,
   parseTelegramBusEnvelope,
   probeTelegramBusLeader,
@@ -67,6 +66,8 @@ import {
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+  TELEGRAM_BUS_CAPABILITY_QUEUE_STEER,
+  hasTelegramBusSteerQueueHandoffCapability,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
@@ -84,6 +85,23 @@ function selectedCommandInputWire(kind: "leader.prepareLiveRebind" | "leader.app
     selectedCommand: { name, target: { chatId: 7, threadId: 42 } },
     ...(kind === "leader.prepareLiveRebind" ? { updates: [{ update_id: 100, message: { text: `/${name}` } }] } : { sourceUpdateIds: [100], mode: kind === "leader.applyLiveRebind" ? "apply" : "release",
       preparedSource: { journalBindingKey: "journal", updateId: 100, sourceSha256: "a".repeat(64) } }) };
+}
+
+for (const fault of ["current", "missing-old", "foreign-old", "source", "unknown-mode"] as const) {
+  test(`Pre-dispatch work observation is an exact read-only wire branch (${fault})`, () => {
+    const wire: Record<string, unknown> = { ...selectedCommandInputWire("leader.settleLiveRebind"),
+      mode: fault === "unknown-mode" ? "observe-hold" : "observe-held", oldTarget: { chatId: 7, threadId: 11 } };
+    if (fault === "missing-old") delete wire.oldTarget;
+    if (fault === "foreign-old") wire.oldTarget = { chatId: 7, threadId: 0 };
+    if (fault === "source") wire.sourceUpdateIds = [101];
+    const parsed = parseTelegramBusEnvelope(JSON.stringify(wire));
+    assert.equal(!!parsed, fault === "current");
+    if (parsed) {
+      assert.equal(parsed.kind, "leader.settleLiveRebind");
+      assert.equal(Reflect.get(parsed, "mode"), "observe-held");
+      assert.equal(Reflect.get(parsed, "updates"), undefined);
+    }
+  });
 }
 
 for (const name of ["status", "abort"] as const) for (const kind of ["leader.prepareLiveRebind", "leader.applyLiveRebind", "leader.settleLiveRebind"] as const) {
@@ -343,6 +361,17 @@ test("Bus envelope auth compares the exact secret in constant time", () => {
   );
 });
 
+test("Explicit connection recovery is a register-only true wire flag", () => {
+  const registration = { instanceId: "follower", connectedAtMs: 1 };
+  const envelope = { kind: "follower.register", requestId: "connect", registration, recoverConnection: true };
+  const parsed = parseTelegramBusEnvelope(JSON.stringify(envelope));
+  assert.equal(parsed?.kind === "follower.register" && parsed.recoverConnection, true);
+  for (const recoverConnection of [false, "true", 1, null]) {
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, recoverConnection })), undefined);
+  }
+  assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, kind: "follower.restoreWorkspace" })), undefined);
+});
+
 test("Bus envelopes classify bootstrap, fenced traffic, and responses", () => {
   assert.equal(
     getTelegramBusEnvelopeTrafficClass({
@@ -370,6 +399,14 @@ test("Bus envelopes classify bootstrap, fenced traffic, and responses", () => {
     }),
     "response",
   );
+});
+
+test("Steer wire capability requires independent base handoff support", () => {
+  for (const caps of [[], [TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF], [TELEGRAM_BUS_CAPABILITY_QUEUE_STEER],
+    [TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_QUEUE_STEER]]) {
+    assert.equal(hasTelegramBusSteerQueueHandoffCapability(createTelegramBusProtocolIdentity({ runtimeBuild: "fixture", capabilities: caps })), caps.length === 2);
+  }
+  assert.equal(hasTelegramBusSteerQueueHandoffCapability(undefined), false);
 });
 
 test("Bus protocol capabilities are explicit and independently negotiable", () => {
@@ -1449,7 +1486,7 @@ test("Bus follower API allowlist permits own-chat typing and safe identity reads
       method: "call",
       args: ["sendChatAction", { chat_id: 100, action: "typing" }],
     }),
-    true,
+    false,
   );
   assert.equal(
     isTelegramFollowerApiCallAllowed({
@@ -1461,24 +1498,21 @@ test("Bus follower API allowlist permits own-chat typing and safe identity reads
   );
 });
 
-test("Bus follower API allowlist permits marked aggregate delivery only in its own chat", () => {
+test("Bus follower API refuses All even with a retained aggregate marker", () => {
   const follower = {
     instanceId: "inst-a",
     connectedAtMs: 1000,
     lastHeartbeatMs: 1000,
     target: { chatId: 100, threadId: 42 },
   };
-  const marked = markTelegramBusAggregateDelivery({
-    chat_id: 100,
-    text: "Aggregate",
-  });
+  const marked = { chat_id: 100, text: "Aggregate", __piTelegramAggregateDelivery: true };
   assert.equal(
     isTelegramFollowerApiCallAllowed({
       follower,
       method: "call",
       args: ["sendMessage", marked],
     }),
-    true,
+    false,
   );
   assert.equal(
     isTelegramFollowerApiCallAllowed({
@@ -1494,7 +1528,7 @@ test("Bus follower API allowlist permits marked aggregate delivery only in its o
       method: "call",
       args: [
         "sendMessage",
-        markTelegramBusAggregateDelivery({ chat_id: 101, text: "Wrong chat" }),
+        { chat_id: 101, text: "Wrong chat", __piTelegramAggregateDelivery: true },
       ],
     }),
     false,
@@ -1978,6 +2012,32 @@ test("Bus local client transport events include request diagnostics", async () =
       getTelegramBusTransportKind(resolveTelegramBusSocketPath(socketPath)),
     );
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus local client logs the first failure and the outcome, not every retry attempt", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-client-retry-log-"));
+  const socketPath = join(dir, "bus.sock");
+  const envelope = { kind: "follower.heartbeat" as const, requestId: "inst-a:retry-log", instanceId: "inst-a", sentAtMs: 2000 };
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: (request) => ({ kind: "bus.ack", requestId: request.requestId, ok: true }),
+  });
+  try {
+    const failed: string[] = [];
+    await assert.rejects(sendTelegramBusLocalEnvelope({ socketPath, envelope, retry: { attempts: 6, delayMs: 1 },
+      recordTransportEvent: (phase, details) => failed.push(`${phase}:${details.attempt}`) }));
+    assert.deepEqual(failed, ["client-failed:1", "client-retry:1", "client-failed:6"]);
+    const recovered: string[] = [];
+    setTimeout(() => void server.start(), 30);
+    await sendTelegramBusLocalEnvelope({ socketPath, envelope, retry: { attempts: 200, delayMs: 5 },
+      recordTransportEvent: (phase, details) => recovered.push(`${phase}:${details.attempt}`) });
+    assert.deepEqual(recovered.slice(0, 2), ["client-failed:1", "client-retry:1"]);
+    assert.equal(recovered.length, 3);
+    assert.match(recovered[2]!, /^client-recovered:\d+$/);
+  } finally {
+    await server.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -2502,6 +2562,60 @@ test("Bus foreign-owned update forwarder sends routed update envelopes", async (
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const mode of ["current", "source-ended-initial", "source-ended-before-connect", "source-ended-before-write",
+  "recipient-ended-before-connect", "source-ended-after-write", "recipient-ended-after-write", "connection-refused"] as const) {
+  test(`Guarded foreign forward fences native IPC issuance and ACK (${mode})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-telegram-forward-guard-"));
+    const socketPath = getTelegramBusFollowerSocketPath("guarded", dir);
+    const ownership = { instanceId: "guarded", ownerGeneration: "g1", recipientBindingKey: "manual:guarded" };
+    let sourceCurrent = mode !== "source-ended-initial", ownershipCurrent = true;
+    let guardCalls = 0, ownershipReads = 0;
+    const received: TelegramBusEnvelope[] = [];
+    const server = createTelegramBusLocalServer({ socketPath, handleEnvelope(envelope) {
+      received.push(envelope);
+      assert.equal(envelope.kind, "leader.forwardMessage");
+      if (envelope.kind !== "leader.forwardMessage") throw new Error("Unexpected probe request");
+      assert.equal(envelope.auth, "guard-secret");
+      assert.equal(envelope.recipientRegistrationGeneration, "g1");
+      if (mode === "source-ended-after-write") sourceCurrent = false;
+      if (mode === "recipient-ended-after-write") ownershipCurrent = false;
+      return { kind: "bus.ack", requestId: envelope.requestId, ok: true,
+        result: { deliveryId: envelope.delivery.deliveryId, sourceUpdateId: envelope.delivery.sourceUpdateId } };
+    } });
+    const message = { message_id: 1000, pi_telegram_source_update_id: 51,
+      get text() { if (mode === "source-ended-before-write") sourceCurrent = false; return "held source"; } };
+    const forwarder = createTelegramBusForeignOwnedUpdateForwarder({ socketPath,
+      createRequestId: () => "guarded:request", getAuthSecret: () => "guard-secret",
+      validateForwardOwnership() { ownershipReads++; return ownershipCurrent; },
+    });
+    try {
+      if (mode !== "connection-refused") await server.start();
+      const pending = forwarder.forwardMessage({ message, ownership, ctx: { generation: 1 }, assertAuthority() {
+        guardCalls++;
+        if (!sourceCurrent) throw new Error("Source authority changed.");
+      } });
+      if (mode === "source-ended-before-connect") queueMicrotask(() => { sourceCurrent = false; });
+      if (mode === "recipient-ended-before-connect") queueMicrotask(() => { ownershipCurrent = false; });
+      const result = await pending;
+      assert.equal(result.status, mode === "current" ? "accepted" : "retryable");
+      const alreadyIssued = mode === "current" || mode.endsWith("after-write");
+      assert.equal(received.length, alreadyIssued ? 1 : 0,
+        "Ended authority prevents new issuance; it never claims to unsend an issued envelope");
+      assert.doesNotMatch(JSON.stringify(received), /assertAuthority|Source authority changed|generation/);
+      assert.equal(result.delivery?.sourceUpdateId, 51, "Authority refusal retains the same durable delivery/source identity");
+      if (mode === "current") {
+        assert.ok(guardCalls >= 4, "The local guard reaches connect, post-encoding write and ACK boundaries");
+        assert.ok(ownershipReads >= 4, "Ownership is not a one-time pre-connect observation");
+      }
+      if (mode === "connection-refused") assert.equal(guardCalls, 1, "Guarded sends disable platform reconnect retry");
+      if (mode.startsWith("source-ended")) {
+        assert.equal(result.status, "retryable");
+        assert.match("message" in result ? result.message ?? "" : "", /authority/);
+      }
+    } finally { await server.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}
 
 test("Bus forwarder selects payload-free custody wake only for capable peers", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-custody-forwarder-"));

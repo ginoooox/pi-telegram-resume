@@ -1,4 +1,4 @@
-/** Native routing composition shared by route regressions and cross-domain custody acceptance. */
+/** Native routing composition shared by route regressions and cross-domain custody acceptance. Zones: telegram, pi agent, shared utils. */
 import * as Bindings from "../../lib/bindings.ts";
 import * as Commands from "../../lib/commands.ts";
 import * as Media from "../../lib/media.ts";
@@ -107,10 +107,13 @@ export interface RouteHarnessOptions {
   inspectRestoreQueuedReceipt?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectRestoreQueuedReceipt"];
   hasWorkspaceRestoreAuthority?: () => boolean;
   hasWorkspaceLiveRebindAuthority?: () => boolean;
+  canUsePreDispatchRebind?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["canUsePreDispatchRebind"];
   inspectTemporaryThreadSources?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectTemporaryThreadSources"];
+  recoverTemporaryThreadDeadQueueOwners?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["recoverTemporaryThreadDeadQueueOwners"];
   onItemsDiscarded?: Queue.TelegramQueueMutationControllerDeps<TestContext>["onItemsDiscarded"];
   queueAdmission?: Parameters<typeof Bindings.createTelegramQueueBindingRuntime<TestContext>>[0]["admission"];
   hasPendingMessages?: (ctx: TestContext) => boolean;
+  liveRebindCommandCompletionTimeoutMs?: number;
   liveRebindCleanupSchedule?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["liveRebindCleanupSchedule"];
   temporaryThreadCleanupDelayMs?: number;
   getSessionGeneration?: () => number;
@@ -198,11 +201,10 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
   const queueMutationRuntime = queueBinding?.mutation ?? Queue.createTelegramQueueMutationController({
     ...telegramQueueStore,
     hasPendingDispatch: bridgeRuntime.lifecycle.hasDispatchPending,
+    allocateLaneOrder: bridgeRuntime.queue.allocateItemOrder,
     onItemsDiscarded: options.onItemsDiscarded,
     updateStatus: () => events.push("status"),
   });
-  const pendingModelSwitchStore =
-    Model.createPendingModelSwitchStore<Model.ScopedTelegramModel<TestModel>>();
   const currentModelRuntime = Model.createCurrentModelRuntime<
     TestContext,
     TestModel
@@ -216,8 +218,6 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
       Model.ScopedTelegramModel<TestModel>
     >({
       isIdle: () => true,
-      getPendingModelSwitch: pendingModelSwitchStore.get,
-      setPendingModelSwitch: pendingModelSwitchStore.set,
       getActiveTurn: activeTurnRuntime.get,
       getAbortHandler: bridgeRuntime.abort.getHandler,
       hasAbortHandler: bridgeRuntime.abort.hasHandler,
@@ -255,9 +255,12 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     inspectRestoreQueuedReceipt: options.inspectRestoreQueuedReceipt,
     hasWorkspaceRestoreAuthority: options.hasWorkspaceRestoreAuthority,
     hasWorkspaceLiveRebindAuthority: options.hasWorkspaceLiveRebindAuthority,
+    canUsePreDispatchRebind: options.canUsePreDispatchRebind,
     inspectTemporaryThreadSources: options.inspectTemporaryThreadSources,
+    recoverTemporaryThreadDeadQueueOwners: options.recoverTemporaryThreadDeadQueueOwners,
     temporaryThreadCleanupDelayMs: options.temporaryThreadCleanupDelayMs,
     liveRebindCleanupSchedule: options.liveRebindCleanupSchedule,
+    liveRebindCommandCompletionTimeoutMs: options.liveRebindCommandCompletionTimeoutMs,
     getSessionGeneration: options.getSessionGeneration,
     foreignOwnedUpdateForwarder: options.foreignOwnedUpdateForwarder,
     getTargetOwnership: options.getTargetOwnership,

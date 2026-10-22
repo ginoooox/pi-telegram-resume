@@ -94,6 +94,7 @@ test("Voice reply planner retains legacy attribute compatibility", () => {
       '<!-- telegram_voice {"value":"JSON value voice."} -->',
       '<!-- telegram_voice value="Attribute value voice." -->',
       '<!-- telegram_voice {"value":"Fallback voice.","text":"Explicit voice."} -->',
+      '<!-- telegram_voice {Keep this voice.} [unrelated envelope text] -->',
     ].join("\n"),
   );
 
@@ -105,6 +106,7 @@ test("Voice reply planner retains legacy attribute compatibility", () => {
     { text: "JSON value voice." },
     { text: "Attribute value voice." },
     { text: "Explicit voice." },
+    { text: "Keep this voice." },
   ]);
 });
 

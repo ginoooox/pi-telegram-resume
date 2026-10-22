@@ -4,9 +4,11 @@
  * Owns mode-specific labels and serialized, authority-fenced title application.
  * Excludes routing, name allocation, profile mutation, and live-owner discovery.
  */
+import { homedir } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 
 import type { TelegramThreadDisplayMode } from "./config.ts";
+import { normalizeTelegramWorkspacePath } from "./workspace-identity.ts";
 import type { TelegramApiCallOptions } from "./telegram-api.ts";
 import type {
   TelegramTopicTargetStore,
@@ -34,8 +36,11 @@ function directorySegments(cwd: string): string[] {
 function distinguishingDirectorySegments(
   cwd: string,
   directories: readonly string[],
+  homeDirectory?: string,
 ): string[] {
-  const parts = directorySegments(cwd);
+  // Substitute only exact home identity; qualification must still distinguish ordinary folders named home.
+  const segments = (directory: string) => directory === homeDirectory ? ["home"] : directorySegments(directory);
+  const parts = segments(cwd);
   if (!parts.length) return [];
   for (let depth = 1; depth <= parts.length; depth++) {
     const candidate = labelText(parts.slice(-depth).join("/"));
@@ -43,7 +48,7 @@ function distinguishingDirectorySegments(
       (other) =>
         other !== cwd &&
         labelText(
-          directorySegments(other).slice(-depth).join("/"),
+          segments(other).slice(-depth).join("/"),
         ).toLowerCase() === candidate.toLowerCase(),
     );
     if (!collides) return parts.slice(-depth);
@@ -69,8 +74,9 @@ function formatDirectoryLabel(
   cwd: string,
   directories: readonly string[],
   mode: "directory-snake" | "directory-title",
+  homeDirectory?: string,
 ): string {
-  const segments = distinguishingDirectorySegments(cwd, directories);
+  const segments = distinguishingDirectorySegments(cwd, directories, homeDirectory);
   if (!segments.length) return "/";
   const formatted = segments
     .map((segment) => {
@@ -143,6 +149,11 @@ export function resolveTelegramWorkspaceDisplayNames(
   liveBindingKeys: ReadonlySet<string> = new Set(),
 ): Map<string, string> {
   const labels = new Map<string, string>();
+  const homeDirectory =
+    (mode === "directory-snake" || mode === "directory-title") &&
+    (process.platform === "linux" || process.platform === "darwin")
+      ? normalizeTelegramWorkspacePath(homedir())
+      : undefined;
   const directories = Array.from(
     new Set(bindings.map((binding) => binding.cwd)),
   );
@@ -172,7 +183,7 @@ export function resolveTelegramWorkspaceDisplayNames(
       const base =
         mode === "directories"
           ? directoryLabel(binding.cwd, directories)
-          : formatDirectoryLabel(binding.cwd, directories, mode);
+          : formatDirectoryLabel(binding.cwd, directories, mode, homeDirectory);
       bases.set(binding.bindingKey, base);
       const showSuffix =
         mode === "directories"

@@ -1,10 +1,14 @@
 /**
  * Regression tests for the pi SDK adapter boundary
  * Covers narrow bridge-facing helpers over concrete pi context contracts
+ * Zones: pi agent sdk boundary, shared adapters
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   canStartPollingInExtensionContext,
@@ -19,8 +23,10 @@ import {
   getExtensionContextModel,
   hasExtensionContextPendingMessages,
   isExtensionContextIdle,
+  isExtensionContextAbortRequested,
   isExtensionContextPassiveRunMode,
   normalizeSettingsManager,
+  listPiSessions,
 } from "../lib/pi.ts";
 
 type PiRuntimeApiHarness = Parameters<
@@ -55,6 +61,15 @@ test("Pi context mode helpers feature-detect passive run modes", () => {
     formatPollingStartBlockedByRunMode({ mode: "json" }),
     "Telegram polling is unavailable in Pi json mode. Use /telegram-connect from a long-lived Pi session.",
   );
+});
+
+test("Pi abort adapter reads the current public signal without inventing one", () => {
+  const abort = new AbortController();
+  const ctx = { signal: abort.signal } as ExtensionContext;
+  assert.equal(isExtensionContextAbortRequested(ctx), false);
+  abort.abort();
+  assert.equal(isExtensionContextAbortRequested(ctx), true);
+  assert.equal(isExtensionContextAbortRequested({} as ExtensionContext), false);
 });
 
 test("Pi session identity adapter is lifecycle-alias agnostic", () => {
@@ -227,4 +242,24 @@ test("Pi context helpers expose model, idle, pending-message, and compact adapte
   assert.equal(isExtensionContextIdle(ctx), true);
   assert.equal(hasExtensionContextPendingMessages(ctx), false);
   assert.deepEqual(events, ["compact", "complete"]);
+});
+
+test("/resume scans session metadata without retaining conversation text", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-resume-"));
+  try {
+    const path = join(dir, "saved.jsonl");
+    writeFileSync(path, [
+      JSON.stringify({ type: "session", id: "12345678-1234-1234-1234-123456789abc", cwd: "/repo" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "private transcript" } }),
+      JSON.stringify({ type: "session_info", name: "  Latest <name>  " }),
+      "",
+    ].join("\n"));
+    writeFileSync(join(dir, "other.jsonl"), JSON.stringify({ type: "session", id: "other", cwd: "/elsewhere" }));
+    const ctx = { cwd: "/repo", sessionManager: { getSessionDir: () => dir } } as ExtensionContext;
+    assert.deepEqual((await listPiSessions(ctx)).map(({ id, name, path: found }) => ({ id, name, found })), [
+      { id: "12345678-1234-1234-1234-123456789abc", name: "Latest <name>", found: path },
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

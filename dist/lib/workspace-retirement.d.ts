@@ -57,6 +57,8 @@ export declare function captureTelegramWorkspaceJournalProtectionSources(input: 
         complete: boolean;
         createResolver: (path: string) => () => TelegramWorkspaceJournalReader | undefined;
     };
+    /** Snapshot-scoped reuse of binding-independent (shared/discovered) source reads. */
+    sharedSourceReads?: Map<string, TelegramWorkspaceJournalProtectionSource>;
 }): TelegramWorkspaceJournalProtectionCapture;
 export type TelegramWorkspaceJournalProtectionSource = {
     kind: "available";
@@ -158,9 +160,11 @@ interface TelegramWorkspaceProtectionObserverDeps {
     getDeliveryAuthorityProtection?: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceProtectionState;
 }
 export interface TelegramWorkspaceProtectionObserver {
-    capture: (binding: TelegramWorkspaceThreadBinding, options?: {
+    capture: ((binding: TelegramWorkspaceThreadBinding, options?: {
         requireBindingProvenance?: boolean;
-    }) => TelegramWorkspaceExternalProtectionEvidence;
+    }) => TelegramWorkspaceExternalProtectionEvidence) & {
+        withSnapshot?: <T>(capture: () => T) => T;
+    };
     captureJournalSources: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceJournalProtectionCapture;
     getJournalWriterProtection: (journalBindingKey: string) => TelegramWorkspaceProtectionState;
 }

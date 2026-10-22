@@ -1,8 +1,9 @@
 /**
  * Telegram queue core contracts and pure planning helpers
  * Zones: telegram queue, pi agent lifecycle, scheduling
- * Owns queue item contracts, lane admission, pure queue mutations, and dispatch planning
+ * Owns queue item contracts, lane admission, mutations, dispatch planning, and protected Steer publication attempts
  */
+import { type TurnEndEvent, type TurnEndEventResult } from "./pi.ts";
 export interface QueuedAttachment {
     path: string;
     fileName: string;
@@ -18,7 +19,7 @@ export interface TelegramPromptImageContent {
 }
 export type TelegramPromptContent = TelegramPromptTextContent | TelegramPromptImageContent;
 export type TelegramQueueItemKind = "prompt" | "control";
-export type TelegramQueueLane = "control" | "priority" | "default";
+export type TelegramQueueLane = "control" | "steer" | "priority" | "default";
 export type TelegramQueueReactionDisposition = {
     kind: "default";
 } | {
@@ -33,6 +34,7 @@ export type TelegramQueueReactionDisposition = {
     suppressionEmoji: string;
 } | {
     kind: "reaction-transition";
+    promptLane?: Exclude<TelegramQueueLane, "control">;
     priorityEmoji?: string | null;
     suppressionEmoji?: string | null;
 };
@@ -42,7 +44,7 @@ export interface TelegramQueueAdmissionReceipt {
     sourceUpdateIds: readonly number[];
     journalBindingKey?: string;
 }
-export type TelegramQueueAdmissionMode = "control-queue" | "priority-queue" | "default-queue";
+export type TelegramQueueAdmissionMode = "control-queue" | "steer-queue" | "priority-queue" | "default-queue";
 export interface TelegramQueueLaneContract {
     lane: TelegramQueueLane;
     admissionMode: TelegramQueueAdmissionMode;
@@ -84,6 +86,11 @@ export interface PendingTelegramTurn extends TelegramQueueItemBase {
     historyText: string;
     priorityEmoji?: string;
     reactionSuppressionEmoji?: string;
+    /** Frozen before receipt mutation; failed/partial attempts must never become executable again. */
+    steerAttempted?: true;
+    /** Original tail objects of an issued idle packet; metadata only, not another waiting queue. */
+    steerPacketTail?: readonly PendingTelegramTurn[];
+    steerPacketSourceOrders?: readonly number[];
     /** Emit the explicit aborted-turn notice when /next settles this active turn. */
     announceNextAbortOnEnd?: boolean;
     /** Turn should preferably be delivered as voice (mirror mode + user sent voice) */
@@ -220,8 +227,11 @@ export declare function appendTelegramQueueItem<TContext = unknown, TItem extend
 export declare function createTelegramQueueHandoff<TContext>(input: {
     handoffToken: string;
     item: TelegramQueueItem<TContext>;
+    steerSupported?: boolean;
 }): TelegramQueueHandoff;
-export declare function createTelegramQueueHandoffPayload<TContext>(item: TelegramQueueItem<TContext>): TelegramQueueHandoffPayload;
+export declare function createTelegramQueueHandoffPayload<TContext>(item: TelegramQueueItem<TContext>, options?: {
+    steerSupported?: boolean;
+}): TelegramQueueHandoffPayload;
 export declare function restoreTelegramQueueHandoffPayload<TContext>(payload: TelegramQueueHandoffPayload, createControlExecution: (payload: TelegramControlQueueHandoffPayload) => PendingTelegramControlItem<TContext>["execute"]): TelegramQueueItem<TContext>;
 export declare function removeTelegramQueueItemByReceipt<TContext>(input: {
     receipt: TelegramQueueAdmissionReceipt;
@@ -258,7 +268,6 @@ export declare function consumeDispatchedTelegramPrompt<TContext = unknown>(item
     activeTurn?: PendingTelegramTurn;
     remainingItems: TelegramQueueItem<TContext>[];
 };
-export declare function formatQueuedTelegramItemsStatus<TContext = unknown>(items: TelegramQueueItem<TContext>[]): string;
 export declare function truncateTelegramQueueSummary(text: string, maxWords?: number, maxLength?: number): string;
 export declare function canDispatchTelegramTurnState(state: TelegramDispatchGuardState): boolean;
 export interface TelegramDispatchReadinessDeps<TContext> {
@@ -297,6 +306,11 @@ export type TelegramQueueDispatchAction<TContext = unknown> = {
     kind: "none";
     remainingItems: TelegramQueueItem<TContext>[];
 } | {
+    kind: "steer";
+    item: PendingTelegramTurn;
+    packet: readonly PendingTelegramTurn[];
+    remainingItems: TelegramQueueItem<TContext>[];
+} | {
     kind: "control";
     item: PendingTelegramControlItem<TContext>;
     remainingItems: TelegramQueueItem<TContext>[];
@@ -304,6 +318,38 @@ export type TelegramQueueDispatchAction<TContext = unknown> = {
     kind: "prompt";
     item: PendingTelegramTurn;
     remainingItems: TelegramQueueItem<TContext>[];
+};
+export type TelegramSteerPacketPlan = {
+    kind: "none";
+} | {
+    kind: "skip";
+    item: PendingTelegramTurn;
+} | {
+    kind: "packet";
+    items: readonly PendingTelegramTurn[];
+};
+/** Plan a fixed ready prefix; publication/settlement remain with the Queue effect shell. */
+export declare function planTelegramSteerPacket<TContext>(items: readonly TelegramQueueItem<TContext>[], options: {
+    blocked: boolean;
+    isItemReady: (item: TelegramQueueItem<TContext>) => boolean;
+    canAppend?: (packet: readonly PendingTelegramTurn[], item: PendingTelegramTurn) => boolean;
+}): TelegramSteerPacketPlan;
+export declare function isTelegramSteerItemWithinIdleCapacity(item: PendingTelegramTurn): boolean;
+export interface TelegramSteerBoundaryRuntimeDeps<TContext> extends TelegramQueueStore<TContext> {
+    isContextCurrent: (ctx: TContext) => boolean;
+    isBlocked: (ctx: TContext) => boolean;
+    getGeneration: () => number;
+    isItemReady: (item: TelegramQueueItem<TContext>, ctx: TContext) => boolean;
+    isItemCurrent: (item: PendingTelegramTurn, ctx: TContext) => boolean;
+    getActiveTurn: () => PendingTelegramTurn | undefined;
+    commitPacket: (items: readonly PendingTelegramTurn[], ctx: TContext) => boolean;
+    discardItem: (item: PendingTelegramTurn, ctx: TContext) => boolean;
+    updateStatus: (ctx: TContext) => void;
+    recordRuntimeEvent?: TelegramRuntimeEventRecorderPort["recordRuntimeEvent"];
+}
+/** One publication attempt; journal ACK is source disposition, never SDK/model-use confirmation. */
+export declare function createTelegramSteerBoundaryRuntime<TContext>(deps: TelegramSteerBoundaryRuntimeDeps<TContext>): {
+    onTurnEnd(event: Pick<TurnEndEvent, "turnIndex" | "outcome">, ctx: TContext): TurnEndEventResult | undefined;
 };
 export declare function planNextTelegramQueueAction<TContext = unknown>(items: TelegramQueueItem<TContext>[], canDispatch: boolean): TelegramQueueDispatchAction<TContext>;
 export declare function shouldDispatchAfterTelegramAgentEnd(options: {
@@ -460,10 +506,14 @@ export interface TelegramAgentEndRuntimeDeps<TTurn extends PendingTelegramTurn, 
     }) => Promise<void>;
     sendGuestReply?: (guestQueryId: string, markdown: string) => Promise<void>;
     /** Replaces the early guest ACK with the final text. */
-    editGuestReply?: (inlineMessageId: string, markdown: string) => Promise<void>;
+    editGuestReply?: (inlineMessageId: string, markdown: string, options?: {
+        assertAuthority?: () => void;
+    }) => Promise<void>;
     /** Cancels the animated guest placeholder before the final edit. */
     stopGuestPlaceholder?: (inlineMessageId: string) => Promise<void>;
-    sendGuestAttachment?: (turn: TTurn, attachment: QueuedAttachment, caption?: string) => Promise<void>;
+    sendGuestAttachment?: (turn: TTurn, attachment: QueuedAttachment, caption?: string, options?: {
+        isDeliveryActive?: () => boolean;
+    }) => Promise<void>;
     sendGuestVoiceReply?: (turn: TTurn, plan: TelegramAgentEndOutboundReplyPlan<TReplyMarkup>, caption?: string) => Promise<void>;
     planOutboundReply?: (markdown: string) => TelegramAgentEndOutboundReplyPlan<TReplyMarkup>;
     sendOutboundReplyArtifacts?: (turn: TTurn, plan: TelegramAgentEndOutboundReplyPlan, options?: {
@@ -726,7 +776,7 @@ export interface TelegramDispatchRuntimeDeps<TContext = unknown> {
     executeControlItem: (item: Extract<TelegramQueueDispatchAction<TContext>, {
         kind: "control";
     }>["item"]) => void;
-    onPromptDispatchStart: (chatId: number) => void;
+    onPromptDispatchStart: (chatId: number, target?: TelegramQueueTarget) => void;
     commitPromptDispatch?: (item: Extract<TelegramQueueDispatchAction<TContext>, {
         kind: "prompt";
     }>["item"]) => boolean;
@@ -745,13 +795,19 @@ export interface TelegramQueueDispatchControllerDeps<TContext = unknown> extends
     isDispatchGenerationActive?: (generation: number) => boolean;
     updateStatus: (ctx: TContext, error?: string) => void;
     sendTextReply: TelegramControlRuntimeDeps<TContext>["sendTextReply"];
-    onPromptDispatchStart: (ctx: TContext, chatId: number) => void;
+    onPromptDispatchStart: (ctx: TContext, chatId: number, target?: TelegramQueueTarget) => void;
     commitPromptDispatch?: (item: Extract<TelegramQueueDispatchAction<TContext>, {
         kind: "prompt";
     }>["item"], ctx: TContext) => boolean;
     sendUserMessage: TelegramDispatchRuntimeDeps<TContext>["sendUserMessage"];
     onPromptDispatchFailure: (ctx: TContext, message: string) => void;
     reconcileNextDispatchAnnouncementReplyOwnership?: (item: PendingTelegramTurn) => void;
+    steerDispatch?: {
+        commitPacket: (items: readonly PendingTelegramTurn[], ctx: TContext) => boolean;
+        isContextCurrent?: (ctx: TContext) => boolean;
+        /** Rechecks idle/native/abort guards without rejecting this packet's own pending flag. */
+        canSubmit?: (ctx: TContext) => boolean;
+    };
     isQueueItemTransportActive?: (item: TelegramQueueItem<TContext>) => boolean;
     hasPendingInboundQueueMutationForItem?: (item: TelegramQueueItem<TContext>) => boolean;
     isQueueItemAdmissionReady?: (item: TelegramQueueItem<TContext>) => boolean;

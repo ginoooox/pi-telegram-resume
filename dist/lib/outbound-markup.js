@@ -463,23 +463,33 @@ function parseTelegramAdaptiveActionPayloadRows(source, parseCompactPayload, opt
         }
         return undefined;
     };
-    const parseVerticalSequence = () => {
+    const parseTopLevelRows = () => {
         const rows = [];
         while (offset < source.length) {
             skipWhitespace();
-            if (source[offset] !== "{")
+            const character = source[offset];
+            if (character === "{") {
+                const cell = parseCell();
+                if (!cell)
+                    return undefined;
+                rows.push([cell]);
+            }
+            else if (character === "[" && options.allowMatrixGroups) {
+                const matrix = parseMatrix();
+                if (!matrix)
+                    return undefined;
+                rows.push(...matrix);
+            }
+            else {
                 break;
-            const cell = parseCell();
-            if (!cell)
-                return undefined;
-            rows.push([cell]);
+            }
             if (!consumeOptionalSeparator())
                 return undefined;
         }
         return rows.length > 0 ? rows : undefined;
     };
     skipWhitespace();
-    const rows = source[offset] === "{" ? parseVerticalSequence() : parseMatrix();
+    const rows = parseTopLevelRows();
     if (!rows)
         return undefined;
     skipWhitespace();
@@ -527,10 +537,10 @@ function isPlausibleTelegramMatrixStart(source, start) {
     return (source[offset] === "{" || source[offset] === "[" || source[offset] === "]");
 }
 export function parseTelegramButtonPayloadRows(source) {
-    return parseTelegramAdaptiveActionPayloadRows(source.trim(), parseTelegramButtonCompactActionPayload, { maxCompactAtoms: 4 })?.rows;
+    return parseTelegramAdaptiveActionPayloadRows(source.trim(), parseTelegramButtonCompactActionPayload, { maxCompactAtoms: 4, allowMatrixGroups: true })?.rows;
 }
 export function parseTelegramActionPayloadRows(comment, command) {
-    const scanned = scanTelegramActionComment(comment, command, (content, offset) => parseTelegramAdaptiveActionPayloadRows(content.slice(offset), parseTelegramButtonCompactActionPayload, { allowTrailing: true, maxCompactAtoms: 4 })?.rows);
+    const scanned = scanTelegramActionComment(comment, command, (content, offset) => parseTelegramAdaptiveActionPayloadRows(content.slice(offset), parseTelegramButtonCompactActionPayload, { allowTrailing: true, maxCompactAtoms: 4, allowMatrixGroups: true })?.rows);
     if (!scanned)
         return undefined;
     if ("payload" in scanned)

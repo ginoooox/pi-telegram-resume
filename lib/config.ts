@@ -146,12 +146,11 @@ const TELEGRAM_THREAD_DISPLAY_MODES: readonly TelegramThreadDisplayMode[] = [
 ];
 
 export function resolveTelegramThreadDisplayMode(
-  config: Pick<TelegramConfig, "threadDisplayMode">,
+  config: Pick<TelegramConfig, "threads">,
 ): TelegramThreadDisplayMode {
-  return TELEGRAM_THREAD_DISPLAY_MODES.includes(
-    config.threadDisplayMode as TelegramThreadDisplayMode,
-  )
-    ? (config.threadDisplayMode as TelegramThreadDisplayMode)
+  const mode = config.threads?.displayMode;
+  return TELEGRAM_THREAD_DISPLAY_MODES.includes(mode as TelegramThreadDisplayMode)
+    ? (mode as TelegramThreadDisplayMode)
     : "letters";
 }
 
@@ -173,8 +172,9 @@ export async function setTelegramThreadDisplayMode(
       "Telegram Thread display setting lost its configured profile.",
     );
   }
+  const latest = store.get();
   await store.persist(
-    { ...store.get(), threadDisplayMode: mode },
+    { ...latest, threads: { ...latest.threads, displayMode: mode } },
     { isCurrent: current },
   );
   if (!current())
@@ -196,8 +196,6 @@ export interface TelegramConfig {
   botId?: number;
   /** @deprecated persisted identity belongs in profiles.default; retained for effective/legacy views */
   allowedUserId?: number;
-  /** Effective view; persisted under profiles.<name>. */
-  threadDisplayMode?: TelegramThreadDisplayMode;
   inboundHandlers?: TelegramInboundHandlerConfig[];
   attachmentHandlers?: TelegramInboundHandlerConfig[];
   outboundHandlers?: TelegramOutboundHandlerConfig[];
@@ -223,23 +221,24 @@ export interface TelegramConfig {
   threads?: {
     /** Delete this instance's bound Telegram thread on graceful Pi quit. */
     automaticCleanup?: boolean;
+    /** Automatic Thread title strategy shared by every profile; absent or invalid resolves to `letters`. */
+    displayMode?: TelegramThreadDisplayMode;
   };
   /** Canonical bot/session profiles, including profiles.default. */
   profiles?: Record<string, TelegramBotProfile>;
 }
 
 /**
- * Per-profile bot/session identity and Thread display preference.
+ * Per-profile bot identity and paired owner only.
  * Stored under `profiles.<name>` in telegram.json.
- * Shared bridge settings (inboundHandlers, outboundHandlers, voice, time,
- * assistant) stay at the top level.
+ * Shared bridge settings (handlers, assistant, voice, time, threads) stay at
+ * the top level and never leak into profiles.
  */
 export interface TelegramBotProfile {
   botToken: string;
   botUsername?: string;
   botId?: number;
   allowedUserId?: number;
-  threadDisplayMode?: TelegramThreadDisplayMode;
 }
 
 interface TelegramLegacyCursorCarrier {
@@ -510,9 +509,6 @@ function pickTelegramRootProfileFields(
     ...(config.allowedUserId !== undefined
       ? { allowedUserId: config.allowedUserId }
       : {}),
-    ...(config.threadDisplayMode !== undefined
-      ? { threadDisplayMode: config.threadDisplayMode }
-      : {}),
     ...(legacyCursor !== undefined ? { lastUpdateId: legacyCursor } : {}),
   };
 }
@@ -523,7 +519,6 @@ function omitTelegramRootProfileFields(config: TelegramConfig): TelegramConfig {
     botUsername: _botUsername,
     botId: _botId,
     allowedUserId: _allowedUserId,
-    threadDisplayMode: _threadDisplayMode,
     lastUpdateId: _lastUpdateId,
     ...sharedConfig
   } = config as TelegramConfig & TelegramLegacyCursorCarrier;
@@ -561,7 +556,6 @@ export function normalizeTelegramDefaultProfileConfig(config: TelegramConfig): {
     "botUsername",
     "botId",
     "allowedUserId",
-    "threadDisplayMode",
     "lastUpdateId",
   ].some((field) => Object.hasOwn(config, field));
   if (!hasLegacyRootProfile) {

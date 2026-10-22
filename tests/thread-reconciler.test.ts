@@ -76,8 +76,9 @@ test("Restore cleanup cancels target reuse before close, between close/delete, a
   }
 });
 
-test("Every destructive cleanup origin preserves a target acquired before or during cleanup", async () => {
-  const target = { chatId: 100, threadId: 42 };
+for (const chatId of [-100100, 100]) {
+test(`Every destructive cleanup origin preserves a target acquired before or during cleanup (${chatId > 0 ? "private chat" : "forum"})`, async () => {
+  const target = { chatId, threadId: 42 };
   const actions: ThreadReconciliationAction[] = [
     { kind: "close-stale-replaced-topic", reason: "replaced-instance-binding", target },
     { kind: "close-delete-unbound-topic", reason: "unbound-user-message", target, observedAtMs: 1 },
@@ -103,11 +104,15 @@ test("Every destructive cleanup origin preserves a target acquired before or dur
         },
         markStaleByTarget: () => assert.fail("must not invalidate a replacement binding"),
       });
-      assert.deepEqual(calls, acquireBefore ? [] : ["closeForumTopic"], action.kind);
+      // A private-chat graceful cleanup has no close step, so its first call is the delete itself.
+      const firstCall = chatId > 0 && action.kind === "close-delete-graceful-shutdown-topic"
+        ? "deleteForumTopic" : "closeForumTopic";
+      assert.deepEqual(calls, acquireBefore ? [] : [firstCall], action.kind);
       assert.equal(records[0], replacement);
     }
   }
 });
+}
 
 test("Cleanup ownership survives equivalent record reconstruction but rejects changed binding identity", () => {
   const target = { chatId: 100, threadId: 42 };
@@ -613,14 +618,18 @@ test("Thread reconciler ignores stale-epoch cleanup observations", () => {
   assert.deepEqual(plan.actions, []);
 });
 
-test("Thread reconciler removes graceful cleanup intent only after confirmed deletion", async () => {
+for (const [chatId, expectedCalls] of [
+  [7, ["deleteForumTopic"]],
+  [-1007, ["closeForumTopic", "deleteForumTopic"]],
+] as const) {
+test(`Thread reconciler removes graceful cleanup intent only after confirmed deletion (${chatId > 0 ? "private chat skips unsupported close" : "forum closes first"})`, async () => {
   const calls: string[] = [];
   const removed: string[] = [];
   const staleTargets: unknown[] = [];
   let persisted = 0;
   const action = {
     kind: "close-delete-graceful-shutdown-topic" as const,
-    target: { chatId: 7, threadId: 95 },
+    target: { chatId, threadId: 95 },
     reason: "graceful-shutdown" as const,
     cleanupIntentId: "cleanup:inst-95:runtime-1:7:95",
     instanceId: "inst-95",
@@ -649,14 +658,15 @@ test("Thread reconciler removes graceful cleanup intent only after confirmed del
     },
   );
 
-  assert.deepEqual(calls, ["closeForumTopic", "deleteForumTopic"]);
+  assert.deepEqual(calls, expectedCalls);
   assert.deepEqual(staleTargets, [
-    { target: { chatId: 7, threadId: 95 }, syncStatus: "deleted" },
+    { target: { chatId, threadId: 95 }, syncStatus: "deleted" },
   ]);
   assert.deepEqual(removed, ["cleanup:inst-95:runtime-1:7:95"]);
   assert.equal(persisted, 1);
   assert.equal(result.changed, true);
 });
+}
 
 test("Thread reconciler preserves graceful cleanup intent after incomplete deletion", async () => {
   let removed = false;

@@ -26,7 +26,7 @@ import {
   recoverStaleTelegramTopicApiError,
   settleStaleTelegramTopicExecutionFailure,
 } from "../lib/sync.ts";
-import { TelegramApiStaleTargetError } from "../lib/telegram-api.ts";
+import { TelegramApiStaleTargetError, TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 import {
   createTelegramWorkspaceAdmissionLedger,
   runWithTelegramWorkspaceAdmissionsAsync,
@@ -424,6 +424,30 @@ test("Telegram sync slice state records suspect and fresh transitions", () => {
     updatedAtMs: 2000,
     lastReconcileAction: "startup-probe",
   });
+});
+
+test("Explicit leader connect resets unknown creation while automatic startup remains protective", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-leader-connect-recovery-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+  let creates = 0;
+  const deps = {
+    getAllowedUserId: () => 7, instanceId: "leader", cwd: "/repo", sessionId: "session",
+    getCurrentLeaderEpoch: () => "epoch", topicTargetStore: store, recordEvent() {},
+    async callApi<TResponse>(method: string) {
+      assert.equal(method, "createForumTopic", "Recovery does not delete or probe unknown targets");
+      if (++creates === 1) throw new TelegramApiCommitUnknownError(method, new Error("response lost"));
+      return { message_thread_id: 42 } as TResponse;
+    },
+  };
+  try {
+    await assert.rejects(ensureTelegramLeaderThreadBinding(deps), /may have committed/);
+    await assert.rejects(ensureTelegramLeaderThreadBinding(deps), /unfinished Thread|remains ambiguous/);
+    assert.equal(creates, 1);
+    const result = await ensureTelegramLeaderThreadBinding({ ...deps, forceFreshUnnamed: true });
+    assert.equal(result?.target.threadId, 42);
+    assert.equal(creates, 2);
+    assert.deepEqual(store.listPendingProvisions(), []);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("Leader thread sync creates a visible leader thread when no binding exists", async () => {
@@ -1809,6 +1833,7 @@ test("Manual disconnect stops the transport when Workspace admission reports cor
 });
 
 test("Manual disconnect fences cleanup and fallback stop across connection replacement", async () => {
+  // Forum chat id: its close step before delete is the race window this test injects into.
   for (const replaceAt of ["admission", "intent-persist", "api-reply"] as const) {
     let generation = 1;
     let captures = 0;
@@ -1832,7 +1857,7 @@ test("Manual disconnect fences cleanup and fallback stop across connection repla
       },
       getCurrentThreadRecord() {
         reads++;
-        return { owner: { kind: "leader" }, instanceId: "leader-runtime:1", target: { chatId: 7, threadId: 42 } };
+        return { owner: { kind: "leader" }, instanceId: "leader-runtime:1", target: { chatId: -1007, threadId: 42 } };
       },
       topicTargetStore: {
         list: () => [],
@@ -1847,7 +1872,7 @@ test("Manual disconnect fences cleanup and fallback stop across connection repla
         return { ok: true } as TResponse;
       },
       getCurrentLeaderEpoch: () => 1,
-      getLeaderTarget: () => ({ chatId: 7, threadId: 42 }),
+      getLeaderTarget: () => ({ chatId: -1007, threadId: 42 }),
       clearLeaderTarget: () => { mutations.push("clear-target"); },
       getSyncState: createUnknownTelegramSyncState,
       setSyncState: () => { mutations.push("sync"); },
@@ -2089,6 +2114,7 @@ test("Confirmed leader disconnect and restart cleanup preserve pressure-reclaima
 });
 
 test("Manual leader disconnect releases transport after cleanup loses epoch", async () => {
+  // Forum chat id: its close step before delete is the race window this test injects into.
   const trace: string[] = [];
   let currentEpoch: number | undefined = 1;
   let syncState = createUnknownTelegramSyncState();
@@ -2097,7 +2123,7 @@ test("Manual leader disconnect releases transport after cleanup loses epoch", as
     getCurrentThreadRecord: () => ({
       owner: { kind: "leader" },
       instanceId: "leader-runtime:1",
-      target: { chatId: 7, threadId: 42 },
+      target: { chatId: -1007, threadId: 42 },
     }),
     topicTargetStore: {
       markStaleByTarget: () => {
@@ -2124,7 +2150,7 @@ test("Manual leader disconnect releases transport after cleanup loses epoch", as
     getCurrentLeaderEpoch: () => currentEpoch,
     getLeaderTarget: () => {
       trace.push("get-leader-target");
-      return { chatId: 7, threadId: 42 };
+      return { chatId: -1007, threadId: 42 };
     },
     clearLeaderTarget: () => {
       trace.push("clear-leader-target");
@@ -2214,7 +2240,6 @@ test("Promoted leader deletes its inherited follower thread under owned epoch", 
   assert.deepEqual(trace, [
     "upsert-intent",
     "persist",
-    "closeForumTopic",
     "deleteForumTopic",
     "mark-stale",
     "remove-intent",
@@ -2285,7 +2310,6 @@ test("Promoted leader disconnect releases leadership when deletion is unconfirme
   assert.deepEqual(trace, [
     "upsert-intent",
     "persist",
-    "closeForumTopic",
     "deleteForumTopic",
     "clear-leader-target",
     "set-sync-state",

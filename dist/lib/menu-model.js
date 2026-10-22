@@ -204,7 +204,7 @@ export async function resolveCachedTelegramModelMenuInputs(cachedInputs, deps) {
     if (cachedInputs && cachedInputs.expiresAt > now)
         return cachedInputs;
     await deps.reloadSettings();
-    const availableModels = deps.refreshAvailableModels();
+    const availableModels = await deps.refreshAvailableModels();
     const cliScopedModelPatterns = deps.getCliScopedModelPatterns();
     const configuredScopedModelPatterns = cliScopedModelPatterns ?? deps.getConfiguredScopedModelPatterns() ?? [];
     return {
@@ -245,8 +245,8 @@ export async function buildTelegramModelMenuStateRuntime(options) {
     const cachedInputs = await resolveCachedTelegramModelMenuInputs(options.cachedInputs, {
         cacheTtlMs: options.cacheTtlMs,
         reloadSettings: options.reloadSettings,
-        refreshAvailableModels: () => {
-            options.ctx.modelRegistry.refresh();
+        refreshAvailableModels: async () => {
+            await options.ctx.modelRegistry.refresh();
             return options.ctx.modelRegistry.getAvailable();
         },
         getConfiguredScopedModelPatterns: options.getConfiguredScopedModelPatterns,

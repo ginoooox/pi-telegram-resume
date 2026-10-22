@@ -289,8 +289,6 @@ export function getTelegramSectionDiagnostics(): TelegramSectionDiagnostic[] {
   return registry ? registry.getDiagnostics() : [];
 }
 
-// --- Registry ---
-
 const BACK_NAV_ROW = {
   text: "⬆️ Back",
 } as const;

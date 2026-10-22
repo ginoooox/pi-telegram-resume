@@ -339,7 +339,11 @@ export async function applyThreadReconciliationPlan(plan, ports) {
             }
             let deleteConfirmed = false;
             let superseded = false;
-            for (const method of ports.skipCloseBeforeDelete
+            // Private-chat topics (positive chat ids) cannot be closed; Telegram only supports closeForumTopic in forums.
+            const skipClose = ports.skipCloseBeforeDelete ||
+                (action.kind === "close-delete-graceful-shutdown-topic" &&
+                    action.target.chatId > 0);
+            for (const method of skipClose
                 ? ["deleteForumTopic"]
                 : ["closeForumTopic", "deleteForumTopic"]) {
                 if (ports.isCleanupTargetProtected?.(action.target, action)) {

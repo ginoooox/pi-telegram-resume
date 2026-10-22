@@ -1,6 +1,7 @@
 /** Workspace display projection tests; no Telegram or TUI renderer is invoked. */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { homedir } from "node:os";
 import {
   createTelegramThreadDisplayReconciler,
   createTelegramThreadDisplaySettingsRuntime,
@@ -9,6 +10,7 @@ import {
   tokenizeTelegramDirectorySegment,
 } from "../lib/thread-display.ts";
 import { createTelegramTopicTargetStore, createTelegramWorkspaceBindingIdentity } from "../lib/threads.ts";
+import { normalizeTelegramWorkspacePath } from "../lib/workspace-identity.ts";
 import type { TelegramThreadDisplayMode } from "../lib/config.ts";
 import type { TelegramApiCallOptions } from "../lib/telegram-api.ts";
 
@@ -51,6 +53,53 @@ test("New directory modes share deterministic Unicode-aware tokenization and suf
   ).values()], ["Api PRD Server A", "Api PRD Server C"]);
 });
 
+for (const platform of ["linux", "darwin", "win32"] as const) {
+  for (const mode of ["directory-snake", "directory-title"] as const) {
+    test(`Home display is an exact current-user Unix projection (${platform}, ${mode})`, () => {
+      const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+      // Synchronous policy checks only; restore the host platform before any asynchronous/runtime work.
+      Object.defineProperty(process, "platform", { ...descriptor, value: platform });
+      try {
+        const home = normalizeTelegramWorkspacePath(homedir())!;
+        const owner = { ...bindings[0], cwd: home };
+        const expected = platform === "win32"
+          ? resolveTelegramWorkspaceDisplayNames([{ ...owner, cwd: `/unrelated/${home.split("/").at(-1)}` }], mode).get("one")!
+          : mode === "directory-title" ? "Home" : "home";
+        assert.equal(resolveTelegramWorkspaceDisplayNames([owner], mode).get("one"), expected);
+        assert.equal(resolveTelegramInitialWorkspaceDisplayName({ bindings: [], binding: owner, mode }), expected);
+        const suffix = mode === "directory-title" ? " A" : "_a";
+        const another = { ...bindings[2], cwd: home };
+        const peers = [owner, another];
+        const before = structuredClone(peers);
+        assert.equal(resolveTelegramWorkspaceDisplayNames(peers, mode, new Set(["one", "three"])).get("one"), `${expected}${suffix}`);
+        assert.equal(resolveTelegramWorkspaceDisplayNames(peers, mode, new Set(["one"])).get("one"), expected, "Dormant peers do not add suffixes");
+        assert.equal(resolveTelegramInitialWorkspaceDisplayName({ bindings: [owner], binding: another, mode, liveBindingKeys: new Set(["one"]) }),
+          `${expected}${mode === "directory-title" ? " C" : "_c"}`);
+        assert.deepEqual(peers, before, "Home is only a display projection, never binding/CWD mutation");
+        const manual = { ...owner, manualThreadName: "My Terminal" };
+        for (const strategy of ["letters", "names", "directories", "directory-snake", "directory-title"] as const)
+          assert.equal(resolveTelegramWorkspaceDisplayNames([manual], strategy).get("one"), "My Terminal");
+        assert.equal(resolveTelegramWorkspaceDisplayNames([owner], "letters").get("one"), "A");
+        assert.equal(resolveTelegramWorkspaceDisplayNames([owner], "names").get("one"), "Anchor");
+        assert.equal(resolveTelegramWorkspaceDisplayNames([owner], "directories").get("one"), home.split("/").filter(Boolean).at(-1) ?? "/");
+        for (const cwd of [`${home}/projects`, `${home}-other`, `/someone-else/${home.split("/").at(-1)}`]) {
+          const foreign = { ...owner, cwd };
+          const name = resolveTelegramWorkspaceDisplayNames([foreign], mode).get("one");
+          const basename = cwd.split("/").filter(Boolean).at(-1)!;
+          const normal = resolveTelegramWorkspaceDisplayNames([{ ...owner, cwd: `/display-reference/${basename}` }], mode).get("one");
+          assert.equal(name, normal, "Children, path prefixes and another user's basename keep ordinary directory formatting");
+        }
+        if (platform !== "win32") {
+          const live = new Set(["one", "two"]);
+          const collision = [owner, { ...bindings[1], cwd: "/work/home" }];
+          assert.deepEqual([...resolveTelegramWorkspaceDisplayNames(collision, mode, live).values()],
+            mode === "directory-title" ? ["Home", "Work / Home"] : ["home", "work_home"], "A real folder named home must remain distinguishable");
+        }
+      } finally { Object.defineProperty(process, "platform", descriptor); }
+    });
+  }
+}
+
 test("Manual names override every automatic display mode", () => {
   const overridden = { ...bindings[0], manualThreadName: "Navigator" };
   assert.equal(resolveTelegramWorkspaceDisplayNames(
@@ -62,6 +111,23 @@ test("Manual names override every automatic display mode", () => {
   assert.equal(resolveTelegramWorkspaceDisplayNames(
     [overridden], "directories",
   ).get("one"), "Navigator");
+});
+
+test("Home initial title and live reconciliation use the same projection without rebinding", async () => {
+  if (process.platform !== "linux" && process.platform !== "darwin") return;
+  const home = normalizeTelegramWorkspacePath(homedir())!;
+  const f = harness(home);
+  f.state.mode = "directory-title";
+  const before = structuredClone(f.store.listWorkspaceBindings());
+  assert.equal(resolveTelegramInitialWorkspaceDisplayName({ bindings: [], binding: before[0]!, mode: "directory-title" }), "Home");
+  assert.deepEqual(await f.reconcile(), { changed: 1 });
+  assert.deepEqual(f.state.calls, ["Home"]);
+  const changed = f.store.listWorkspaceBindings()[0]!;
+  assert.deepEqual(changed, { ...before[0], displayTitle: "Home" });
+  f.state.mode = "directory-snake";
+  assert.deepEqual(await f.reconcile(), { changed: 1 });
+  assert.deepEqual(f.state.calls, ["Home", "home"]);
+  assert.deepEqual(f.store.listWorkspaceBindings()[0], { ...before[0], displayTitle: "home" });
 });
 
 test("Initial titles project the candidate before Telegram creates the Thread", () => {
@@ -142,9 +208,9 @@ test("Missing slots and ambiguous names do not fabricate a routable display iden
   ], "names").get("one"), "A");
 });
 
-function harness() {
+function harness(cwd = "/repo/extensions") {
   const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
-  const identity = createTelegramWorkspaceBindingIdentity("/repo/extensions")!;
+  const identity = createTelegramWorkspaceBindingIdentity(cwd)!;
   store.upsertWorkspaceBinding({
     ...identity, target: { chatId: 7, threadId: 42 }, slot: "A",
     threadName: "Anchor", updatedAtMs: 1,

@@ -1120,6 +1120,45 @@ for (const scenario of ["queued", "pending", "delivery-protected", "corrupt", "e
   });
 }
 
+test("One occupancy snapshot reads binding-independent journal evidence once; separate snapshots stay fresh", () => {
+  const store = createTelegramTopicTargetStore({ path: join(tmpdir(), "pi-snapshot-reuse-unpersisted.json") });
+  for (let i = 0; i < 26; i++) addBinding(store, i, i + 1);
+  const discovered = ["/ns/a.json", "/ns/b.json"];
+  const reads = new Map<string, number>(), count = (key: string) => reads.set(key, (reads.get(key) ?? 0) + 1);
+  let inspections = 0, discoveredEntries: { update: unknown }[] = [];
+  const reader = (key: string, entries: () => { update: unknown }[]) =>
+    () => ({ journal: { read: () => { count(key); return { entries: entries(), exists: true }; } } });
+  const observer = createTelegramWorkspaceProtectionObserver({
+    listFollowers: () => [], getActiveTurnTarget: () => undefined, getQueuedItems: () => [],
+    resolveLeaderJournal: reader("leader", () => []),
+    createFollowerJournalResolver: () => () => undefined,
+    createJournalPathResolver: path => reader(path, () => discoveredEntries),
+    getJournalWriterProtection: () => "clear", getDeliveryAuthorityProtection: () => "clear",
+    inspectJournalNamespace() {
+      inspections++;
+      return { sources: [{ role: "polling", path: "/ns/inbox.json", evidence: { kind: "present" } },
+        ...discovered.map(path => ({ role: "session", path, evidence: { kind: "present" } }))],
+        accounting: { directoryEntries: 0, files: 0, bytes: 0, work: 0 } } as never;
+    },
+  });
+  const scoped = store.captureWorkspaceSlotOccupancy(observer.capture);
+  assert.equal(inspections, 1, "26 bindings share one namespace inspection");
+  assert.deepEqual(Object.fromEntries(reads), { leader: 1, "/ns/a.json": 1, "/ns/b.json": 1 });
+  inspections = 0; reads.clear();
+  const unscoped = store.captureWorkspaceSlotOccupancy(binding => observer.capture(binding));
+  assert.equal(inspections, 26, "a probe without a snapshot scope keeps per-binding reads");
+  assert.deepEqual(scoped, unscoped, "reuse never changes the protection verdict");
+  assert.equal(scoped.bindings[0]!.protection, "unknown");
+  inspections = 0; reads.clear();
+  discoveredEntries = [{ update: { update_id: 9, message: { message_thread_id: 40, chat: { id: 7 } } } }];
+  const fresh = store.captureWorkspaceSlotOccupancy(observer.capture);
+  assert.equal(inspections, 1, "each snapshot re-inspects; post-fence rechecks never see stale evidence");
+  assert.equal(fresh.bindings[0]!.protection, "protected", "new accepted work is visible to the next snapshot");
+  assert.equal(reads.get("/ns/a.json"), 1);
+  observer.capture(store.listWorkspaceBindings()[0]!); observer.capture(store.listWorkspaceBindings()[0]!);
+  assert.equal(inspections, 3, "direct probes outside a snapshot are never cached");
+});
+
 test("Dead-owner reclamation refuses replacement and partial custody, then resumes interrupted exact groups", async (t) => {
   const binding: TelegramWorkspaceThreadBinding = {
     ...createTelegramWorkspaceBindingIdentity("/repo/dead-owner")!,

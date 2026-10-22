@@ -6,7 +6,7 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import { getTelegramBusTransportRetryPolicy } from "./bus-transport.js";
-import { createTelegramBusLocalServer, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusEnvelopeTrafficClass, getTelegramBusFollowerSocketPath, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, } from "./bus.js";
+import { createTelegramBusLocalServer, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusEnvelopeTrafficClass, getTelegramBusFollowerSocketPath, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY, hasTelegramBusSteerQueueHandoffCapability, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, } from "./bus.js";
 import { escapeHtml } from "./rendering.js";
 import * as Sync from "./sync.js";
 import { parseTelegramIntegerId as asInteger, } from "./target.js";
@@ -223,12 +223,17 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
             });
         });
     };
+    /** Returns the stabilization this startup owns; a stop or a newer startup meanwhile makes it inert. */
     const beginStartupDisplayStabilization = () => {
         cancelStartupDisplayStabilization();
         startupDisplaySettled = false;
+        return startupDisplayGeneration;
     };
-    const armStartupDisplayReconciliation = () => {
-        const generation = startupDisplayGeneration;
+    const armStartupDisplayReconciliation = (generation) => {
+        if (startupDisplayGeneration !== generation)
+            return;
+        if (startupDisplayTimer)
+            clearTimeout(startupDisplayTimer);
         const delayMs = deps.runtime.followerStaleAfterMs ?? TELEGRAM_BUS_FOLLOWER_STALE_AFTER_MS;
         startupDisplayTimer = setTimeout(() => {
             if (startupDisplayGeneration !== generation)
@@ -299,6 +304,8 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
     });
     const provisionFollowerTarget = createTelegramBusFollowerTargetProvisioner({
         ...provisionerPorts,
+        getLiveFollowers: deps.runtime.followerRegistry.list,
+        isFollowerProcessAlive: deps.runtime.isFollowerProcessAlive,
     });
     const renameLeaderThreadAdmitted = async (threadName, expectedTarget, assertRecipientAuthority) => {
         const store = deps.topicTargetStore, callApi = deps.callApi;
@@ -802,17 +809,19 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
         resetThreadNameAdmitted,
         captureWorkspaceExternalProtection: deps.captureWorkspaceExternalProtection,
         async startPolling(ctx) {
-            if (display)
-                beginStartupDisplayStabilization();
+            const stabilization = display
+                ? beginStartupDisplayStabilization()
+                : undefined;
             try {
                 await runtime.startPolling(ctx);
             }
             catch (error) {
-                cancelStartupDisplayStabilization();
+                if (stabilization === startupDisplayGeneration)
+                    cancelStartupDisplayStabilization();
                 throw error;
             }
-            if (display)
-                armStartupDisplayReconciliation();
+            if (stabilization !== undefined)
+                armStartupDisplayReconciliation(stabilization);
         },
         async stopPolling() {
             cancelStartupDisplayStabilization();
@@ -872,11 +881,103 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
         if (typeof chatId !== "number")
             return registration.target;
         await deps.topicTargetStore.load();
+        if (options?.recoverConnection && !options.existingWorkspaceBindingOnly) {
+            const epoch = deps.getCurrentLeaderEpoch?.();
+            await Threads.resetTelegramConnectionProvisioning({
+                store: deps.topicTargetStore, owner: "manual-follower", instanceId: registration.instanceId,
+                profileKey: registration.profileKey ?? `manual:${registration.instanceId}`,
+                isCurrent: () => !deps.getCurrentLeaderEpoch ||
+                    (epoch !== undefined && deps.getCurrentLeaderEpoch() === epoch),
+                recordEvent: deps.recordRuntimeEvent,
+            });
+        }
+        let restoredPredecessor;
+        if (options?.existingWorkspaceBindingOnly && registration.cwd && registration.sessionId &&
+            !registration.previousInstanceId && deps.getLiveFollowers && deps.isFollowerProcessAlive) {
+            const identity = Threads.createTelegramWorkspaceBindingIdentity(registration.cwd, 0, registration.sessionId);
+            const records = deps.topicTargetStore.list(), liveFollowers = deps.getLiveFollowers();
+            const candidates = deps.topicTargetStore.listWorkspaceBindings()
+                .filter(binding => identity && binding.cwd === identity.cwd && binding.sessionId === identity.sessionId &&
+                (!registration.target || (binding.target.chatId === registration.target.chatId && binding.target.threadId === registration.target.threadId)))
+                .flatMap(binding => {
+                const matches = records.filter(record => record.status === "active" && record.owner?.kind === "manual-follower" &&
+                    record.target.chatId === binding.target.chatId && record.target.threadId === binding.target.threadId);
+                return matches.length === 1 ? matches : [];
+            })
+                .filter(record => {
+                if (liveFollowers.some(peer => peer.instanceId === record.instanceId ||
+                    (peer.target?.chatId === record.target.chatId && peer.target.threadId === record.target.threadId)))
+                    return false;
+                // A retained status is not current execution proof. Only an absent actual runtime PID grants this claim handoff.
+                const match = /^([1-9][0-9]*):[0-9]+$/.exec(record.instanceId ?? ""), pid = match ? Number(match[1]) : undefined;
+                if (pid === undefined || !Number.isSafeInteger(pid))
+                    return false;
+                try {
+                    return deps.isFollowerProcessAlive(pid) === false;
+                }
+                catch {
+                    return false;
+                }
+            });
+            if (candidates.length === 1)
+                restoredPredecessor = candidates[0];
+        }
+        // A new session in a folder whose previous session is gone takes over that Thread: the tab keeps a single
+        // owner and the retired binding is re-keyed instead of being left behind as an orphan.
+        if (!restoredPredecessor &&
+            registration.cwd &&
+            registration.sessionId &&
+            !registration.previousInstanceId &&
+            deps.getLiveFollowers &&
+            deps.isFollowerProcessAlive) {
+            const identity = Threads.createTelegramWorkspaceBindingIdentity(registration.cwd, 0, registration.sessionId);
+            const liveFollowers = deps.getLiveFollowers();
+            const candidates = deps.topicTargetStore
+                .listWorkspaceBindings()
+                .filter((binding) => !!(identity &&
+                binding.cwd === identity.cwd &&
+                binding.sessionId !== identity.sessionId))
+                .flatMap((binding) => {
+                const matches = deps.topicTargetStore
+                    .list()
+                    .filter((record) => record.status === "active" &&
+                    record.owner?.kind === "manual-follower" &&
+                    record.target.chatId === binding.target.chatId &&
+                    record.target.threadId === binding.target.threadId);
+                return matches.length === 1
+                    ? [{ binding, record: matches[0] }]
+                    : [];
+            })
+                .filter(({ record }) => {
+                if (liveFollowers.some((peer) => peer.instanceId === record.instanceId ||
+                    (peer.target?.chatId === record.target.chatId &&
+                        peer.target.threadId === record.target.threadId)))
+                    return false;
+                const match = /^([1-9][0-9]*):[0-9]+$/.exec(record.instanceId ?? ""), pid = match ? Number(match[1]) : undefined;
+                if (pid === undefined || !Number.isSafeInteger(pid))
+                    return false;
+                try {
+                    return deps.isFollowerProcessAlive(pid) === false;
+                }
+                catch {
+                    return false;
+                }
+            });
+            // Ambiguity keeps ordinary provisioning: never guess which retained tab a new session inherits.
+            if (candidates.length === 1 && identity?.sessionId) {
+                const candidate = candidates[0];
+                if (candidate.binding.sessionId &&
+                    deps.topicTargetStore.adoptWorkspaceThreadBindingForSession(candidate.binding.cwd, candidate.binding.sessionId, identity.sessionId, candidate.binding.target))
+                    restoredPredecessor = candidate.record;
+            }
+        }
         let capacityUnavailable = false;
         const workspaceIdentity = registration.cwd
-            ? deps.topicTargetStore.claimWorkspaceIdentity(registration.cwd, registration.instanceId, registration.previousInstanceId, {
+            ? deps.topicTargetStore.claimWorkspaceIdentity(registration.cwd, registration.instanceId, registration.previousInstanceId ?? restoredPredecessor?.instanceId, {
                 existingBindingOnly: options?.existingWorkspaceBindingOnly === true,
                 sessionId: registration.sessionId,
+                sessionHandoff: registration.previousInstanceId !== undefined,
+                provisionProfileKey: registration.profileKey ?? `manual:${registration.instanceId}`,
                 onCapacityUnavailable() {
                     capacityUnavailable = true;
                 },
@@ -925,6 +1026,7 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
             return (record.owner?.kind === "manual-follower" &&
                 ((matchesCurrentIdentity && matchesRequestedTarget) ||
                     matchesSessionHandoff ||
+                    (record.instanceId === restoredPredecessor?.instanceId && matchesRequestedTarget) ||
                     matchesWorkspaceRecovery));
         });
         const followerOwner = Threads.getTelegramThreadOwnerFromProfileKey(followerProfileKey);
@@ -1088,22 +1190,50 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
                 };
             }
             const probeRequiredRecord = reconnectRecord?.status === "probe-required";
-            const exactSessionHandoff = crossSessionReuse &&
-                !!requestedTarget &&
-                registration.previousInstanceId === reconnectRecord?.instanceId &&
-                requestedTarget.chatId === reconnectRecord.target.chatId &&
-                requestedTarget.threadId === reconnectRecord.target.threadId;
-            const requiresVisibilityProbe = crossSessionReuse ||
+            // Pi /new or /fork inside one live process keeps its Thread; that process already proves the tab.
+            const sameProcessSessionHandoff = crossSessionReuse &&
+                reconnectRecord?.status === "active" &&
+                registration.previousInstanceId === reconnectRecord.instanceId &&
+                recoverableTarget === undefined &&
+                Threads.isSameTelegramProcessInstance(reconnectRecord.instanceId, registration.instanceId);
+            const requiresVisibilityProbe = (crossSessionReuse && !sameProcessSessionHandoff) ||
                 probeRequiredRecord ||
                 recoverableTarget !== undefined;
+            const transferSessionHandoffRecord = async () => {
+                const nowMs = getNowMs();
+                const transferredRecord = deps.topicTargetStore.upsert({
+                    ...result.record,
+                    profileKey: followerProfileKey,
+                    owner: followerOwner.kind === "manual-follower"
+                        ? followerOwner
+                        : {
+                            kind: "manual-follower",
+                            instanceId: registration.instanceId,
+                        },
+                    instanceId: registration.instanceId,
+                    updatedAtMs: nowMs,
+                    lastSyncObservedAtMs: nowMs,
+                    lastReconcileAction: "follower-session-handoff",
+                });
+                await deps.topicTargetStore.persist();
+                result = {
+                    target: transferredRecord.target,
+                    reused: true,
+                    record: transferredRecord,
+                };
+            };
+            if (sameProcessSessionHandoff) {
+                assertRestoreRegistration();
+                await transferSessionHandoffRecord();
+            }
+            // A session handoff still owns the predecessor session's binding until the Workspace commit re-keys it.
+            const retainedDisplayBinding = deps.topicTargetStore.getWorkspaceBindingByTarget(result.target, registration.sessionId) ??
+                deps.topicTargetStore.getWorkspaceBindingByTarget(result.target);
             let connectedAnnouncement = !result.reused || requiresVisibilityProbe
                 ? createTelegramBusInstanceLifecycleAnnouncement({
                     target: result.target,
                     threadName: result.displayTitle ??
-                        (workspaceBinding?.target.chatId === result.target.chatId &&
-                            workspaceBinding.target.threadId === result.target.threadId
-                            ? workspaceBinding.displayTitle
-                            : undefined) ??
+                        (retainedDisplayBinding?.cwd === workspaceIdentity?.cwd ? retainedDisplayBinding?.displayTitle : undefined) ??
                         result.record.threadName,
                     slot: result.record.slot,
                     state: "connected",
@@ -1112,18 +1242,16 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
             if (requiresVisibilityProbe && connectedAnnouncement) {
                 try {
                     assertRestoreRegistration();
-                    await deps.callApi(exactSessionHandoff ? "sendChatAction" : "sendMessage", exactSessionHandoff
-                        ? {
-                            chat_id: connectedAnnouncement.target.chatId,
-                            message_thread_id: connectedAnnouncement.target.threadId,
-                            action: "typing",
-                        }
-                        : {
-                            chat_id: connectedAnnouncement.target.chatId,
-                            message_thread_id: connectedAnnouncement.target.threadId,
-                            text: connectedAnnouncement.text,
-                            parse_mode: connectedAnnouncement.parseMode,
-                        });
+                    await deps.callApi(
+                    // Typing is presence, not evidence that a retained Thread still accepts messages.
+                    "sendMessage", {
+                        chat_id: connectedAnnouncement.target.chatId,
+                        message_thread_id: connectedAnnouncement.target.threadId,
+                        text: connectedAnnouncement.text,
+                        parse_mode: connectedAnnouncement.parseMode,
+                    }, 
+                    // A deleted Thread is this probe's expected answer; the recovery below records it.
+                    { isExpectedError: Threads.isTelegramTopicTargetStaleError });
                     assertRestoreRegistration();
                     if (recoverableTarget || probeRequiredRecord) {
                         const activatedRecord = deps.topicTargetStore.upsert({
@@ -1153,27 +1281,7 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
                         };
                     }
                     else if (crossSessionReuse && reconnectRecord) {
-                        const nowMs = getNowMs();
-                        const transferredRecord = deps.topicTargetStore.upsert({
-                            ...result.record,
-                            profileKey: followerProfileKey,
-                            owner: followerOwner.kind === "manual-follower"
-                                ? followerOwner
-                                : {
-                                    kind: "manual-follower",
-                                    instanceId: registration.instanceId,
-                                },
-                            instanceId: registration.instanceId,
-                            updatedAtMs: nowMs,
-                            lastSyncObservedAtMs: nowMs,
-                            lastReconcileAction: "follower-session-handoff",
-                        });
-                        await deps.topicTargetStore.persist();
-                        result = {
-                            target: transferredRecord.target,
-                            reused: true,
-                            record: transferredRecord,
-                        };
+                        await transferSessionHandoffRecord();
                     }
                     connectedAnnouncement = undefined;
                 }
@@ -1183,7 +1291,15 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
                     if (Threads.isTelegramTopicTargetStaleError(error)) {
                         deps.topicTargetStore.markStaleByTarget(result.target, "deleted", error instanceof Error ? error.message : String(error));
                         await deps.topicTargetStore.persist();
+                        const staleTarget = result.target;
                         result = await provisionTarget();
+                        deps.recordRuntimeEvent("telegram", "Telegram follower restore probe found its Thread deleted; re-created it.", {
+                            phase: "topic-lifecycle-restore-probe-recreated",
+                            instanceId: registration.instanceId,
+                            chatId: staleTarget.chatId,
+                            staleThreadId: staleTarget.threadId,
+                            threadId: result.target.threadId,
+                        });
                         connectedAnnouncement =
                             createTelegramBusInstanceLifecycleAnnouncement({
                                 target: result.target,
@@ -1242,6 +1358,16 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
                         updatedAtMs: getNowMs(),
                     },
                 });
+                // Same-target reuse can retain a different slot than the initial claim.
+                if (result.record.slot !== workspaceCommit.slot) {
+                    result = {
+                        ...result,
+                        record: deps.topicTargetStore.upsert({
+                            ...result.record,
+                            slot: workspaceCommit.slot,
+                        }),
+                    };
+                }
                 if (connectedAnnouncement && workspaceCommit.displayTitle) {
                     connectedAnnouncement =
                         createTelegramBusInstanceLifecycleAnnouncement({
@@ -1712,8 +1838,7 @@ export function createTelegramBusSelectedMenuDeliveryHandler(deps) {
                 .listLiveRebindings()
                 .find((value) => value.request.operationId === expected.operationId);
             if (!retained ||
-                retained.phase !== "released" ||
-                retained.cleanup ||
+                !Threads.isTelegramLiveRebindInputAuthorized(retained) ||
                 retained.request.source.updateIds.length !== 1 ||
                 retained.recipient.kind !== "follower" ||
                 !isDeepStrictEqual(retained.executor, executor) ||
@@ -1792,8 +1917,13 @@ export function createTelegramBusSelectedMenuDeliveryHandler(deps) {
                     live.target.threadId !== recipient.target.threadId ||
                     resolveJournal.call(workspace, live) !== recipient.journalBindingKey)
                     throw new Error("Selected-menu authority changed.");
+                const latest = store.listLiveRebindings().find(value => value.request.operationId === intent.request.operationId);
+                if (!latest || !Threads.isTelegramLiveRebindInputAuthorized(latest) ||
+                    !isDeepStrictEqual({ ...latest, ...(intent.inputRelease ? { inputRelease: intent.inputRelease } : {}), revision: intent.revision, updatedAtMs: intent.updatedAtMs }, intent) ||
+                    (latest.inputRelease !== intent.inputRelease && !(intent.inputRelease === "issued" && latest.inputRelease === "accepted")))
+                    throw new Error("Selected-menu input grant changed.");
                 let confirmed = false;
-                snapshot.call(threads, intent, (view) => {
+                snapshot.call(threads, latest, (view) => {
                     const bindings = (view.workspaceBindings ?? []).filter((value) => value.bindingKey === intent.request.binding.bindingKey);
                     const owners = view.threads.filter((value) => value.status === "active" &&
                         (value.slot === intent.request.binding.slot ||
@@ -2067,6 +2197,10 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
             !hasTelegramBusCapability(recipient?.protocol, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF)) {
             return rejectTelegramBusRequest(envelope.requestId, "Telegram queue handoff capability was not negotiated.");
         }
+        if (envelope.payload.queueLane === "steer" &&
+            ![deps.protocolIdentity, donor.protocol, recipient?.protocol].every(hasTelegramBusSteerQueueHandoffCapability)) {
+            return rejectTelegramBusRequest(envelope.requestId, "Steer queue handoff capability was not negotiated.");
+        }
         if (!recipient?.registrationGeneration ||
             envelope.recipientRegistrationGeneration !==
                 recipient.registrationGeneration) {
@@ -2198,17 +2332,24 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
                     local: deps.protocolIdentity,
                     remote: envelope.registration.protocol,
                 });
+                const readerCompatible = () => deps.requiresPreDispatchRebindReader?.() !== true ||
+                    hasTelegramBusCapability(envelope.registration.protocol, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND);
                 const displayCompatible = () => (deps.getThreadDisplayMode?.() ?? "names") === "names" ||
                     (hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE) &&
                         hasTelegramBusCapability(envelope.registration.protocol, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE));
                 const restoringWorkspace = envelope.kind === "follower.restoreWorkspace";
+                const recoverConnection = envelope.kind === "follower.register" && envelope.recoverConnection === true;
+                const supportsConnectionRecovery = [deps.protocolIdentity, envelope.registration.protocol]
+                    .every(identity => hasTelegramBusCapability(identity, TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY));
                 const supportsWorkspaceAutoConnect = hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT) &&
                     hasTelegramBusCapability(envelope.registration.protocol, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT);
                 if (!compatibility.compatible ||
                     !displayCompatible() ||
+                    !readerCompatible() ||
                     (envelope.registration.cwd !== undefined &&
                         envelope.registration.sessionId === undefined) ||
-                    (restoringWorkspace && !supportsWorkspaceAutoConnect)) {
+                    (restoringWorkspace && !supportsWorkspaceAutoConnect) ||
+                    (recoverConnection && !supportsConnectionRecovery)) {
                     return {
                         kind: "bus.ack",
                         requestId: envelope.requestId,
@@ -2236,8 +2377,9 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
                         const leaderEpoch = deps.getCurrentLeaderEpoch?.();
                         const telegramProfile = deps.getTelegramProfile?.();
                         const operatorUserId = deps.getAllowedUserId?.();
-                        const registrationCurrent = () => (!deps.getCurrentLeaderEpoch ||
-                            deps.getCurrentLeaderEpoch() === leaderEpoch) &&
+                        const registrationCurrent = () => readerCompatible() &&
+                            (!deps.getCurrentLeaderEpoch ||
+                                deps.getCurrentLeaderEpoch() === leaderEpoch) &&
                             (!deps.getTelegramProfile ||
                                 deps.getTelegramProfile() === telegramProfile) &&
                             (!deps.getAllowedUserId ||
@@ -2248,7 +2390,7 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
                         if (hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE) &&
                             !deps.commitFollowerRegistration)
                             throw new Error("Workspace Restore registration publication protection is unavailable.");
-                        const target = await deps.provisionFollowerTarget?.(envelope.registration, { existingWorkspaceBindingOnly: restoringWorkspace });
+                        const target = await deps.provisionFollowerTarget?.(envelope.registration, { existingWorkspaceBindingOnly: restoringWorkspace, ...(recoverConnection ? { recoverConnection: true } : {}) });
                         if (restoringWorkspace && !target) {
                             return {
                                 kind: "bus.ack",
@@ -2955,6 +3097,7 @@ export function createTelegramBusLeaderRuntime(deps) {
         recordRuntimeEvent: deps.recordRuntimeEvent,
         applyThreadDisplayMode: deps.applyThreadDisplayMode,
         getThreadDisplayMode: deps.getThreadDisplayMode,
+        requiresPreDispatchRebindReader: deps.requiresPreDispatchRebindReader,
         getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
         getTelegramProfile: deps.getTelegramProfile,
         getAllowedUserId: deps.getAllowedUserId,
@@ -2967,6 +3110,10 @@ export function createTelegramBusLeaderRuntime(deps) {
         if (!hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF) ||
             !hasTelegramBusCapability(recipient?.protocol, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF)) {
             return rejectTelegramBusRequest(input.requestId, "Telegram queue handoff capability was not negotiated.");
+        }
+        if (input.payload.queueLane === "steer" &&
+            ![deps.protocolIdentity, recipient?.protocol].every(hasTelegramBusSteerQueueHandoffCapability)) {
+            return rejectTelegramBusRequest(input.requestId, "Steer queue handoff capability was not negotiated.");
         }
         if (!recipient?.registrationGeneration ||
             input.recipientRegistrationGeneration !== recipient.registrationGeneration) {
@@ -3027,24 +3174,47 @@ export function createTelegramBusLeaderRuntime(deps) {
         },
         handleEnvelope,
     });
+    // The start that owns the endpoint and pruning. A stop clears it; a start that loses it mid-await undoes only what
+    // nobody newer owns, so a stop during startup never leaves a stopped leader's endpoint listening.
+    let activeStart;
+    const releaseSupersededStart = async () => {
+        if (activeStart !== undefined)
+            return;
+        stopPruning();
+        await localServer
+            .stop()
+            .catch((error) => deps.recordRuntimeEvent?.("bus", error, { phase: "stop" }));
+    };
     return {
         routeQueueHandoff: (envelope) => routeQueueHandoffEnvelope(envelope),
         startPolling: async (ctx) => {
+            const start = {};
+            activeStart = start;
             // Replay durable cleanup before publishing the follower endpoint so a
             // replacement registration cannot reclaim a target while it is deleted.
             await deps.provisionLeaderTarget?.(ctx);
+            if (activeStart !== start)
+                return;
             await localServer.start();
+            if (activeStart !== start)
+                return releaseSupersededStart();
             startPruning();
             try {
                 await deps.startPolling(ctx);
             }
             catch (error) {
+                if (activeStart !== start)
+                    return releaseSupersededStart();
+                activeStart = undefined;
                 stopPruning();
                 await localServer.stop();
                 throw error;
             }
+            if (activeStart !== start)
+                return releaseSupersededStart();
         },
         stopPolling: async () => {
+            activeStart = undefined;
             stopPruning();
             try {
                 await deps.stopPolling();

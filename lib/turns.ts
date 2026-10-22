@@ -44,6 +44,20 @@ import {
 
 export const TELEGRAM_PREFIX = "[telegram]";
 
+const REPLY_ANCHOR_SUPPRESSED = Symbol.for("@llblab/pi-telegram:reply-anchor-suppressed");
+
+/** A routed source keeps its unique message/file/group identity, but cannot quote an anchor in its former tab. */
+export function withoutTelegramTurnReplyAnchor<TMessage extends object>(message: TMessage): TMessage {
+  return { ...message, [REPLY_ANCHOR_SUPPRESSED]: true };
+}
+
+/** A confirmed same-target copy may replace the former-tab suppression on a warm input projection. */
+export function withTelegramTurnReplyAnchor<TMessage extends { message_id: number }>(message: TMessage): TMessage {
+  if (!Number.isSafeInteger(message.message_id) || message.message_id <= 0)
+    throw new Error("Telegram reply anchor requires a positive message ID.");
+  return { ...message, [REPLY_ANCHOR_SUPPRESSED]: false };
+}
+
 export const TELEGRAM_GUEST_TURN_NOTE =
   "[guest] delivery: answer quickly with one concise, self-contained reply";
 
@@ -733,7 +747,7 @@ function buildPreparedTelegramPromptTurn(
     kind: "prompt",
     chatId: firstMessage.chat.id,
     target: getTelegramTurnTarget(firstMessage),
-    replyToMessageId: firstMessage.message_id,
+    replyToMessageId: Reflect.get(firstMessage, REPLY_ANCHOR_SUPPRESSED) === true ? 0 : firstMessage.message_id,
     sourceMessageIds: collectTelegramMessageIds(options.messages),
     queueOrder: options.queueOrder,
     queueLane: "default",

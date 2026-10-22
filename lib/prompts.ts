@@ -150,10 +150,13 @@ export function createTelegramModelContextAvailabilityRuntime(deps: {
 
 export type TelegramSystemPrompt = string | string[];
 
+// Pi 1.0 user events lack messageType; Pi 1.2 custom starts carry no user prompt.
 type TelegramBeforeAgentStartEvent = Omit<
   BeforeAgentStartEvent,
-  "systemPrompt"
+  "systemPrompt" | "prompt" | "messageType"
 > & {
+  messageType?: "user" | "custom";
+  prompt?: string;
   systemPrompt?: TelegramSystemPrompt | null;
 };
 
@@ -166,7 +169,7 @@ type TelegramBeforeAgentStartHook = (
 ) => TelegramBeforeAgentStartResult;
 
 export function buildTelegramBridgeSystemPrompt(options: {
-  prompt: string;
+  prompt?: string;
   systemPrompt?: TelegramSystemPrompt | null;
   telegramPrefix?: string;
   localSystemPromptSuffix: string;
@@ -177,7 +180,7 @@ export function buildTelegramBridgeSystemPrompt(options: {
   const telegramHead = telegramPrefix.endsWith("]")
     ? telegramPrefix.slice(0, -1)
     : telegramPrefix;
-  const trimmedPrompt = options.prompt.trimStart();
+  const trimmedPrompt = options.prompt?.trimStart() ?? "";
   const telegramTurn =
     trimmedPrompt.startsWith(`${telegramHead}]`) ||
     trimmedPrompt.startsWith(`${telegramHead}|`);
@@ -200,7 +203,7 @@ export function createTelegramBeforeAgentStartHook(
 ): TelegramBeforeAgentStartHook {
   return (event) =>
     buildTelegramBridgeSystemPrompt({
-      prompt: event.prompt,
+      prompt: event.messageType === "custom" ? undefined : event.prompt,
       systemPrompt: event.systemPrompt,
       telegramPrefix: options.telegramPrefix,
       localSystemPromptSuffix:

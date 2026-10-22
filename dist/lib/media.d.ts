@@ -3,6 +3,7 @@
  * Zones: telegram inbound, media groups, filesystem paths
  * Normalizes inbound Telegram messages into reusable file, text, id, history, and media-group metadata
  */
+import * as Machine from "./machine.ts";
 export interface TelegramPhotoSize {
     file_id: string;
     file_size?: number;
@@ -96,16 +97,6 @@ export interface TelegramMediaGroupMessage {
     message_thread_id?: number;
     media_group_id?: string;
 }
-export interface TelegramMediaGroupState<TMessage, TContext = unknown> {
-    messages: TMessage[];
-    context?: TContext;
-    flushTimer?: ReturnType<typeof setTimeout>;
-    dispatching?: boolean;
-    dispatchPromise?: Promise<void>;
-    dispatchNow?: () => Promise<void>;
-    suspended?: boolean;
-    reschedule?: () => void;
-}
 export interface TelegramMediaGroupController<TMessage extends TelegramMediaGroupMessage, TContext = unknown> {
     queueMessage: (options: {
         message: TMessage;
@@ -186,35 +177,130 @@ export declare function extractFirstTelegramMessageText(messages: TelegramMediaM
 export declare function hasTelegramMessagesPromptContent(messages: TelegramMediaMessage[]): boolean;
 export declare function collectTelegramMessageIds(messages: TelegramMediaMessage[]): number[];
 export declare function getTelegramMediaGroupKey(message: TelegramMediaGroupMessage): string | undefined;
-export declare function removePendingTelegramMediaGroupMessages<TMessage extends TelegramMediaGroupMessage>(groups: Map<string, TelegramMediaGroupState<TMessage, unknown>>, messageIds: number[], clearTimer: (timer: ReturnType<typeof setTimeout>) => void): number;
-export declare function queueTelegramMediaGroupMessage<TMessage extends TelegramMediaGroupMessage, TContext = unknown>(options: {
+/** One pending input group; only `transitionTelegramPendingGroups` produces a new one. */
+export interface TelegramPendingGroup<TMessage, TContext, TMeta = undefined> {
+    readonly messages: readonly TMessage[];
+    readonly context?: TContext;
+    /** Domain data carried with the group, such as a text group's forward-comment pairing side. */
+    readonly meta?: TMeta;
+    readonly timerId: number | null;
+    /** The batch in flight; its messages leave the group only once that exact dispatch succeeds. */
+    readonly dispatch: {
+        readonly id: number;
+        readonly messageIds: readonly number[];
+    } | null;
+    readonly suspended: boolean;
+    /** The next batch ends at this message, so later messages wait for the batch after it, whatever is in flight. */
+    readonly boundaryId?: number;
+}
+export interface TelegramPendingGroupsState<TMessage, TContext, TMeta> {
+    readonly groups: ReadonlyMap<string, TelegramPendingGroup<TMessage, TContext, TMeta>>;
+    readonly nextTimerId: number;
+    readonly nextDispatchId: number;
+}
+export interface TelegramPendingGroupsConfig {
+    debounceMs: number;
+    /** A group without a context waits (text) instead of dispatching without one (media). */
+    requireContext: boolean;
+}
+export type TelegramPendingGroupsEvent<TMessage, TContext, TMeta> = {
+    type: "queued";
+    key: string;
     message: TMessage;
     context?: TContext;
-    groups: Map<string, TelegramMediaGroupState<TMessage, TContext>>;
-    debounceMs: number;
-    setTimer: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
-    clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
-    dispatchMessages: (messages: TMessage[], ctx?: TContext) => unknown | Promise<unknown>;
-}): boolean;
-/** Timer and dispatch lifecycle shared by delayed media-group and text-group coalescing. */
-export interface TelegramPendingGroupState<TMessage, TContext> {
+    meta?: TMeta;
+    delayMs: number;
+    /** `always` restarts the debounce; `ifIdle` arms it only when no timer, dispatch or suspension holds it. */
+    rearm: "always" | "ifIdle";
+}
+/** Ends the next batch at the group's current last message; later messages wait for the batch after it. */
+ | {
+    type: "batchClosed";
+    key: string;
+} | {
+    type: "timerFired";
+    key: string;
+    timerId: number;
+} | {
+    type: "dispatchSettled";
+    key: string;
+    dispatchId: number;
+    ok: boolean;
+} | {
+    type: "flushRequested";
+    key: string;
+} | {
+    type: "suspended";
+} | {
+    type: "resumed";
+    context: TContext;
+} | {
+    type: "removed";
+    messageIds: readonly number[];
+} | {
+    type: "keyCleared";
+    key: string;
+} | {
+    type: "cleared";
+};
+export type TelegramPendingGroupsEffect<TMessage, TContext> = {
+    type: "armTimer";
+    key: string;
+    timerId: number;
+    delayMs: number;
+} | {
+    type: "cancelTimer";
+    timerId: number;
+} | {
+    type: "dispatch";
+    key: string;
+    dispatchId: number;
     messages: TMessage[];
     context?: TContext;
-    flushTimer?: ReturnType<typeof setTimeout>;
-    dispatching?: boolean;
-    suspended?: boolean;
-    reschedule?: () => void;
-    dispatchNow?: () => Promise<void>;
+};
+export interface TelegramPendingGroupsStep<TMessage, TContext, TMeta> extends Machine.TelegramMachineStep<TelegramPendingGroupsState<TMessage, TContext, TMeta>, TelegramPendingGroupsEffect<TMessage, TContext>> {
+    /** `removed`: how many groups were dropped. */
+    result: number;
 }
-export interface TelegramPendingGroupLifecycle<TContext> {
+export declare function createTelegramPendingGroupsState<TMessage, TContext, TMeta = undefined>(): TelegramPendingGroupsState<TMessage, TContext, TMeta>;
+/**
+ * Pure transition for delayed input groups shared by media albums and split text. A group dispatches one batch at a
+ * time; messages that arrive meanwhile wait for the next batch, a failure keeps the batch for a retry, and suspension
+ * keeps every admitted message for the replacement context.
+ */
+export declare function transitionTelegramPendingGroups<TMessage extends {
+    message_id: number;
+}, TContext, TMeta>(state: TelegramPendingGroupsState<TMessage, TContext, TMeta>, event: TelegramPendingGroupsEvent<TMessage, TContext, TMeta>, config: TelegramPendingGroupsConfig): TelegramPendingGroupsStep<TMessage, TContext, TMeta>;
+export interface TelegramPendingGroups<TMessage, TContext, TMeta> {
+    /** Read-only view of one group; it never grants mutation. */
+    get: (key: string) => TelegramPendingGroup<TMessage, TContext, TMeta> | undefined;
+    queue: (event: Omit<Extract<TelegramPendingGroupsEvent<TMessage, TContext, TMeta>, {
+        type: "queued";
+    }>, "type"> & {
+        dispatchMessages: (messages: TMessage[], ctx?: TContext) => unknown | Promise<unknown>;
+    }) => void;
+    clearKey: (key: string) => void;
+    closeBatch: (key: string) => void;
+    removeMessages: (messageIds: number[]) => number;
+    /** Dispatches the group holding this message now; resolves once its batch settles, rejecting if it failed. */
     flushMessage: (messageId: number) => Promise<boolean>;
     suspend: () => void;
     resume: (context: TContext) => void;
     clear: () => void;
 }
-export declare function createTelegramPendingGroupLifecycle<TMessage extends {
+/**
+ * The shell around `transitionTelegramPendingGroups`: it owns timer handles and each key's latest dispatcher, turns
+ * every dispatch outcome, including a synchronous throw, into `dispatchSettled`, and keeps each batch's promise for
+ * flush callers.
+ */
+export declare function createTelegramPendingGroups<TMessage extends {
     message_id: number;
-}, TContext>(groups: Map<string, TelegramPendingGroupState<TMessage, TContext>>, clearTimer: (timer: ReturnType<typeof setTimeout>) => void): TelegramPendingGroupLifecycle<TContext>;
+}, TContext, TMeta = undefined>(options: {
+    debounceMs: number;
+    requireContext: boolean;
+    setTimer: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
+    clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
+}): TelegramPendingGroups<TMessage, TContext, TMeta>;
 export declare function createTelegramMediaGroupController<TMessage extends TelegramMediaGroupMessage, TContext = unknown>(options?: TelegramMediaGroupControllerOptions): TelegramMediaGroupController<TMessage, TContext>;
 export declare function createTelegramMediaGroupDispatchRuntime<TMessage extends TelegramMediaGroupMessage, TContext>(deps: TelegramMediaGroupDispatchRuntimeDeps<TMessage, TContext>): TelegramMediaGroupDispatchRuntime<TMessage, TContext>;
 /** Pure `[title]` bullet section appended after a blank line; empty items leave text unchanged. */

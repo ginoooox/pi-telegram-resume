@@ -61,6 +61,8 @@ The connected Pi instance owns Telegram polling. Use `/telegram-connect <profile
 
 `/telegram-connect` keeps working when the shared runtime `state.json` is damaged. If it is malformed, foreign or contains invalid evidence, the connecting leader replaces it with a fresh empty state and continues. Every profile then forgets old Thread bindings, slots, unfinished Restore/temporary work and polling continuity; `telegram.json`, Pi history and the released `tmp/telegram` are untouched. Permission errors still stop connection. See [Damaged-State Reset](./docs/architecture.md#damaged-state-reset-operator-approved).
 
+If Thread creation was interrupted, an explicit `/telegram-connect` can reset that unfinished attempt and try a fresh connection without clearing queued prompts or taking over a live leader. A lost Telegram response may leave an extra tab behind; known tabs are reused rather than blindly recreated. Both peers need connection-recovery support. See [Connection Recovery](./docs/architecture.md#explicit-connection-recovery).
+
 The prompt queue is session-local. Before a reload or restart, let it drain or knowingly accept losing waiting work and re-send what still matters afterwards; nothing is replayed automatically.
 
 Ordinary network or admission failures use exponential retry pauses capped at 30 seconds, without permanently stopping after an arbitrary attempt count. The poller recovers when the outage clears. Explicit `/telegram-disconnect` still attempts to stop its captured local transport if Thread cleanup is unavailable; it reports unconfirmed cleanup rather than successful deletion, and an old disconnect cannot stop a new connection. Incomplete stop/release remains visible; check `/telegram-status --debug` and keep Pi open.
@@ -143,7 +145,7 @@ Enable the optional capabilities the bridge needs in the [@BotFather](https://t.
 | Generative Apps | Install or explicitly replace a reviewed `.mjs` application whose generated JSON button view may mix direct `app::method` actions with ordinary model prompts. | Repeated games, controls, tutors, and adapters compile routine interaction without losing selective model interpretation, explanation, or adaptation. |
 | Callback routing | Route known callbacks to the owner extension and unknown callbacks back into Pi. | Companion extensions can build UI without polling Telegram themselves. |
 | Threaded Mode | Run one leader plus visible follower Pi instances through named private-chat threads. | One bot can host a local multi-instance Pi organism without hidden process spawning. |
-| Reroute and restore | Give unknown and command-created temporary threads explicit forward and replace/restore choices. | Forward removes the temporary tab; restore rebinds it and may remove only the replaced old tab after positive cleanup proofs. Blocked cleanup preserves the relocation and protected work. |
+| Reroute and restore | Give text, voice, files and albums sent from `All`, plus unknown threads, explicit reroute and replace/restore choices. | Reroute from a routing tab forwards the prompt into the selected Thread before agent admission and anchors replies there; cleanup still requires source ACKs. Restore rebinds the tab and may remove only the replaced old tab after positive cleanup proofs. Blocked cleanup preserves the relocation and protected work. |
 | Extension sections | Add menu sections, commands, status rows, settings, callbacks, and delivery helpers from companion extensions. | `pi-telegram` becomes a platform surface for other Pi extensions. |
 | Runtime diagnostics | Use `/telegram-status` and recent runtime events for connection, role, negotiated bus protocol/build/capabilities, separate polling and inbound-worker progress, journal depth, local/foreign queue ownership, automatic retry waits, transport, and failures. | Compatible build skew, foreign semantic authority, a healthy poller, durable backoff and an infrastructure-blocked worker remain distinguishable without hidden logs. |
 | Safety and ownership | Pair one owner, lock transport, scope targets, and reject fake terminal behavior. | Remote access remains explicit, bounded, and understandable. |
@@ -198,6 +200,8 @@ Named profile identifiers contain only lowercase ASCII letters and digits (maxim
 
 ## Main Surfaces
 
+In Threaded Mode, `All` is input-only: messages enter temporary routing tabs, and Pi replies stay in bound Threads. Missing routing or delivery targets fail closed instead of sending fallback messages to All. There is no automatic cleanup of old All output. Classic DM behavior is unchanged.
+
 ### Operator Menu
 
 `/start` opens the Telegram-native control panel: status, prompt-template commands, model selection, thinking level, settings, queue controls, and extension sections. It is the primary Telegram UI; reaction shortcuts are secondary queue affordances.
@@ -206,24 +210,33 @@ Named profile identifiers contain only lowercase ASCII letters and digits (maxim
 
 Messages sent while Pi is busy become queued turns. Queue controls let you inspect, prioritize, keep or skip, and dispatch work without touching the terminal.
 
+Use reactions or the queue menu to control waiting prompts. Only `👍`, `👎`, and `🔥` have queue semantics; all other reactions are ignored.
+
+Priority — when the prompt runs:
+- **Normal — no dedicated reaction emoji.** The default lane for ordinary queued work.
+- **Priority — `👍`.** Moves waiting input ahead of Normal work, without interrupting the active task.
+- **Steer — `🔥`.** Inserts ready input at a model-step boundary, or starts one ordinary task when idle. Fire takes precedence over Priority reactions; removing it falls back to remaining Priority intent or Normal.
+
+Disposition — whether the prompt runs:
+- **Keep — no dedicated reaction emoji.** The default disposition: the prompt remains eligible to run in its selected lane.
+- **Skip — `👎`.** Suppresses the prompt without changing its lane or position. Priority and Skip can coexist—for example `👍 + 👎`; Skip wins at dispatch.
+
+Queued commands and control actions use a separate **Control** lane ahead of Steer, Priority and Normal. They are marked with `⚡️`; this is a label, not a reaction shortcut.
+
 Queue policy:
+- Changing a prompt's lane moves it to the end of that lane; switching back does not restore its former position.
+- Keep/Skip preserves position. Skip stays reversible until the prompt reaches dispatch, then drops it without a model turn. Skipped prompts remain visible with a struck-through number.
+- One yellow terminal counter shows waiting work across all lanes, excluding current or already-dispatched work, Skip and frozen attempts.
+- Dispatched or frozen prompts are inspection-only. An uncertain Steer attempt is not automatically retried.
+- The bot cannot remove your Telegram reactions; changing a menu choice may leave the original reaction visible.
+- A `👎` reaction to your waiting standalone `/continue` cancels it immediately rather than marking it for reversible Skip. Already-running work is unaffected.
+- The queue is session-local. Let it drain before reload or shutdown, or accept losing waiting work.
 
-- One prompt is one queue object with exactly one current lane and one current position; it never reserves a shadow place in the other lane. The terminal's yellow `+N` suffix counts only executable prompts still waiting, never the current run; a dispatched Telegram prompt stops contributing before that run settles.
-- Priority and Normal are separate FIFO lanes; Priority dispatches first.
-- Moving `Normal → Priority` removes the prompt from Normal and places it at the Priority tail. Moving `Priority → Normal` removes it from Priority and places it at the Normal tail; no former position is restored.
-- Keep/Skip never changes lane position. Skip preserves durable authority while waiting so Keep remains reversible, then settles that authority and drops the prompt without a model turn when dispatch reaches it. Skipped prompts stay visible at their physical queue position with a struck-through ordinal, but are excluded immediately from the executable queue count shown in both the Pi status bar and Telegram main menu. Graceful session shutdown discards all remaining queued authority, so a new session starts empty.
-- For ordinary prompts, reactions control two independent dimensions; changing one category preserves the other:
-  - `Positive`: `👍`, `⚡️`, `❤️`, `🕊`, `🔥` — controls Priority.
-  - `Negative`: `👎`, `👻`, `💔`, `💩`, `🗑` — controls Skip.
-- Priority and Skip can coexist—for example `👍 + 💩`. Skip wins at dispatch, regardless of which negative emoji is selected.
-- Menu selectors and reactions share queue state, but the bot cannot remove a user's reaction; Keep may clear internal Skip while the user's emoji remains visible until they remove it.
-- A negative reaction to your original standalone `/continue` immediately cancels its exact waiting continuation, even while other work is active. This is irreversible cancellation, not reversible Skip. Positive reactions do not change its control lane; already-dispatched or running work and synthetic model-switch continuations are untouched.
-
-The detailed contract lives in [Priority, Reactions, Keep, and Skip](./docs/architecture.md#priority-reactions-keep-and-skip). If Pi automatically retries a transient provider failure, the active Telegram turn stays bound until the successful reply arrives or Pi confirms that the run has settled.
+See [Queue Behavior and Safety](./docs/architecture.md#priority-reactions-keep-and-skip) for reaction precedence, dispatch rules and recovery details.
 
 ### Native Rich Markdown
 
-Rich Markdown is the default model-answer membrane. Complete assistant and guest model replies use Telegram's native Rich Message APIs; valid bot commands and URLs retain Telegram's native clickable affordances. Activity thinking uses persistent headerless expandable HTML, while each completed tool uses one iconless native Rich root details node whose arguments open with the root while secondary JSON evidence stays collapsed; `thinking`, `tools`, and `verbose` select the visible classes, while menus, status rows, queue controls, settings, diagnostics, and other operational UI retain explicit Telegram HTML/plain rendering. Three Settings controls keep the layers separate: `Draft previews` toggles streamed answer drafts, `Activity` chooses `quiet` or `verbose` technical activity, and `Assistant rendering` chooses final-answer delivery (`rich` Native Rich Markdown or `html` legacy Markdown-to-HTML).
+Answers use Telegram-native Rich Markdown, with clickable commands and links. In Settings, use **Draft previews** to control streaming previews, **Activity** to choose the amount of thinking and tool detail, and **Assistant rendering** to switch between Rich Markdown and HTML compatibility mode. See [Rendering and Delivery](./docs/architecture.md#rendering-and-delivery) and [Activity](./docs/activity.md).
 
 ### Files And Artifacts
 
@@ -250,14 +263,14 @@ Classic private DM mode is the base product mode. When Telegram private-chat Thr
 - When all `A`–`Z` slots are reserved, a new connection may reclaim the oldest inactive, unprotected Thread. **This deletes that Thread and all its messages**, not Pi session history or project files. Active or protected work blocks reclamation; restoring a remembered session does not evict another binding.
 - Telegram never launches hidden Pi processes.
 
-In Threaded Mode, open Settings → **🧵 Thread display** to choose `letters` (default), `names`, `directory-title`, or `directory-snake` for this bot profile; a retained **directories** value remains available as an unchanged legacy presentation. Fresh tabs are created with the active mode's title instead of being visibly renamed afterward. Telegram tab titles, Pi terminal status, live Thread choosers/notices, prompt attribution, and named `telegram_message` targeting use the same acknowledged display name; target IDs and live registrations still own routing. Names shows the generated dictionary name chosen for the slot, such as `Anchor` for slot `A`; the directory formats produce `api_tools` or `Api Tools` and append `_a` or ` A` only while two or more authenticated live instances share that exact directory. Dormant retained bindings do not keep those suffixes visible. After leader election, automatic title contraction waits one follower-staleness window for live registrations to settle, avoiding a temporary suffix removal and restoration during startup. `/name` sets a manual Thread display name; **Reset to automatic** restores the selected automatic projection. Switching preserves Thread IDs, slots, generated recovery identity, and queue ownership. Partial application reports an error and can be retried without recreating Threads.
+In Settings → **🧵 Thread display**, choose Letters (default), Names, Directory Title or Directory Snake. The choice is shared across all profiles through `threads.displayMode`; profiles contain only bot identity and the paired owner. Use `/name` for a custom Thread name and **Reset to automatic** to restore the selected naming style. Renaming preserves the Thread and its queued work. See [Thread Display](./docs/architecture.md#threaded-mode-multi-instance-bus) for naming details.
 
 | Mode | Best for | Runtime shape |
 | --- | --- | --- |
 | Classic DM | One running Pi instance and its active session controlled from one private bot chat | One polling owner, one queue/runtime surface |
 | Threaded Mode | Several visible Pi sessions sharing one bot | One leader owns transport; each private-chat Thread retains one session-qualified Workspace binding |
 
-**Live rebinding (0.53.0):** Restore uses one same-session save/apply/release channel for prompts and supported commands/templates, with separately fenced best-effort old-Thread cleanup. Existing work and exact source/receipt custody remain protected; legacy Restore readers/receivers retain continuity with older instances. Windows runs the same paths, and CI covers it. See [Multi-Instance Bus](./docs/multi-instance-bus.md#live-rebind-channel).
+**Restore** binds the selected live Pi session to the current Thread and releases the waiting input there. It may delete the session's former Thread and its messages; unfinished work can defer cleanup. An unconfirmed deletion is not automatically retried. See [Restore Behavior and Safety](./docs/multi-instance-bus.md#live-rebind-channel).
 
 ## Environment Configuration
 
@@ -292,9 +305,9 @@ Stable public entrypoints are documented in [Public API](./docs/public-api.md), 
 
 ## Safety Boundaries
 
-Durable inbound admission is a **process-crash recovery** guarantee. Atomic private-file replacement preserves acknowledged journal authority and its journal-owned `acceptedThroughUpdateId` polling cursor across ordinary process exit, crash, kill, and replacement, but the extension does not flush files or parent directories for host/kernel/filesystem/device/power-loss durability. `telegram.json` contains configuration only. Keep `~/.pi/agent` on appropriately managed storage and backups if that stronger operational guarantee is required. Downgrading below `0.37.0` is unsafe: an older runtime cannot recover the journal's polling cursor and could repoll admitted updates. See [Durable Admission And Recovery](./docs/architecture.md#durable-admission-and-recovery).
+Inbound recovery protects against **process crashes**, not power loss or storage failure. Keep `~/.pi/agent` on reliable storage with appropriate backups. Do not downgrade to a runtime that cannot read the current journal format: it could process already admitted input again. See [Durable Admission and Recovery](./docs/architecture.md#durable-admission-and-recovery).
 
-Runtime files use `tmp/pi-telegram` with only `state.json` and `logs.jsonl` at its root; pre-0.52.0 `tmp/telegram` is left untouched and never migrated. The transport section of `state.json` names a polling journal hosted in a session folder; successor leaders continue it rather than moving its cursor. Follower journals are session-owned. Unbound session families are disposable under the approved sweep policy; in-process `/new` adopts eligible pending input, while cold startup does not. See [Session-Owned Journal Storage](./docs/multi-instance-bus.md#session-owned-journal-storage) for compatibility fallbacks, loss boundaries and pending acceptance.
+Configuration lives in `telegram.json`; runtime data lives under `<agent-dir>/tmp/pi-telegram`. Pending-input retention and cleanup rules are documented in [Session-Owned Journal Storage](./docs/multi-instance-bus.md#session-owned-journal-storage).
 
 `pi-telegram` intentionally does not:
 

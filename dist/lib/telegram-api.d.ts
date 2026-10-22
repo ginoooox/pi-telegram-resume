@@ -299,6 +299,8 @@ export interface TelegramApiCallOptions {
     sleep?: (ms: number) => Promise<void>;
     /** Observability hook fired before a 429 retry wait, never for 5xx waits. */
     onRetryWait?: (wait: TelegramApiRetryWait) => void;
+    /** Caller-owned expected failure: still thrown, but the caller records the outcome instead of the API log. */
+    isExpectedError?: (error: unknown) => boolean;
 }
 export declare class TelegramApiAuthorityError extends Error {
     readonly requestIssued: boolean;
@@ -343,6 +345,12 @@ export interface TelegramAnswerGuestQueryOptions {
     result?: TelegramGuestCachedMediaResult;
 }
 export interface TelegramEditGuestInlineMessageContent {
+    /** Cached media only: inline edits cannot upload a new local file. */
+    media?: {
+        type: "photo" | "document" | "audio";
+        media: string;
+        caption?: string;
+    };
     text?: string;
     richMessage?: TelegramInputRichMessage;
     parseMode?: "HTML";
@@ -369,7 +377,9 @@ export interface TelegramApiTargetActivityRuntime {
     }[];
     listPendingChats: () => number[];
 }
-export declare function createTelegramApiTargetActivityRuntime(): TelegramApiTargetActivityRuntime;
+export declare function createTelegramApiTargetActivityRuntime(deps?: {
+    captureDrain?: () => (() => void) | undefined;
+}): TelegramApiTargetActivityRuntime;
 export declare function createTelegramApiTargetTrackingClient(client: TelegramApiClient, activity: TelegramApiTargetActivityRuntime): TelegramApiClient;
 export type TelegramApiWorkspaceAdmissionScopeLike = {
     kind: "target";
@@ -431,6 +441,10 @@ export interface TelegramBridgeApiRuntimeDeps {
     chatActionMinIntervalMs?: number;
     chatActionMaxGates?: number;
 }
+/** Typing issuance guard is local authority, never Bot API body or IPC data. */
+export interface TelegramTypingActionOptions extends Pick<TelegramApiCallOptions, "assertAuthority"> {
+    message_thread_id?: number;
+}
 export interface TelegramBridgeApiRuntime extends Pick<TelegramApiClient, "call" | "callMultipart"> {
     downloadFile: (fileId: string, suggestedName: string, source?: TelegramAttachmentSource) => Promise<string>;
     deleteWebhook: (signal?: AbortSignal) => Promise<boolean>;
@@ -442,9 +456,7 @@ export interface TelegramBridgeApiRuntime extends Pick<TelegramApiClient, "call"
     sendChatAction: (chatId: number, action: string, options?: {
         message_thread_id?: number;
     }) => Promise<boolean>;
-    sendTypingAction: (chatId: number, options?: {
-        message_thread_id?: number;
-    }) => Promise<unknown>;
+    sendTypingAction: (chatId: number, options?: TelegramTypingActionOptions) => Promise<unknown>;
     sendRecordVoiceAction: (chatId: number, options?: {
         message_thread_id?: number;
     }) => Promise<unknown>;
@@ -461,13 +473,12 @@ export interface TelegramBridgeApiRuntime extends Pick<TelegramApiClient, "call"
     answerCallbackQuery: (callbackQueryId: string, text?: string, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
     answerGuestQuery: (guestQueryId: string, text?: string, options?: TelegramAnswerGuestQueryOptions) => Promise<void>;
     /**
-     * Temporary Guest Mode ACK experiment: answers the guest query and returns
-     * the sent inline message id so the final answer can edit that early reply.
-     * Requires direct transport ownership; Telegram does not document editing
-     * guest answers, so this exists only to falsify that behavior live.
+     * Answers the guest query and retains the sent inline message id for final
+     * text or cached-media replacement. Requires direct transport ownership;
+     * actual guest-media rendering remains live-client gated.
      */
     answerGuestQueryForInlineMessage: (guestQueryId: string, text?: string, options?: TelegramAnswerGuestQueryOptions) => Promise<string | undefined>;
-    editGuestInlineMessage: (inlineMessageId: string, content: TelegramEditGuestInlineMessageContent) => Promise<void>;
+    editGuestInlineMessage: (inlineMessageId: string, content: TelegramEditGuestInlineMessageContent, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
     deleteMessage: (chatId: number, messageId: number) => Promise<void>;
     prepareTempDir: () => Promise<number>;
 }
@@ -522,11 +533,7 @@ export declare function fetchTelegramBotIdentity(botToken: string, fetchImpl?: t
 export declare function callTelegramMultipart<TResponse>(botToken: string | undefined, method: string, fields: Record<string, string>, fileField: string, filePath: string, fileName: string, options?: TelegramApiCallOptions): Promise<TResponse>;
 export declare function downloadTelegramFile(botToken: string | undefined, fileId: string, suggestedName: string, tempDir: string, options?: TelegramFileDownloadOptions): Promise<string>;
 export declare function answerTelegramCallbackQuery(botToken: string | undefined, callbackQueryId: string, text?: string, options?: TelegramAnswerCallbackQueryOptions): Promise<void>;
-export declare function createTelegramChatActionSender<TAction extends string>(sendChatAction: (chatId: number, action: TAction, options?: {
-    message_thread_id?: number;
-}) => Promise<unknown>, action: TAction): (chatId: number, options?: {
-    message_thread_id?: number;
-}) => Promise<unknown>;
+export declare function createTelegramChatActionSender<TAction extends string>(sendChatAction: (chatId: number, action: TAction, options?: TelegramTypingActionOptions) => Promise<unknown>, action: TAction): (chatId: number, options?: TelegramTypingActionOptions) => Promise<unknown>;
 export declare function createTelegramNativeMarkdownDraftSender(deps: {
     sendMessageDraft: TelegramBridgeApiRuntime["sendMessageDraft"];
     sendRichMessageDraft: TelegramBridgeApiRuntime["sendRichMessageDraft"];
@@ -545,6 +552,7 @@ export type TelegramWorkspaceThreadDeletionTransport = (authorize: () => {
 export declare function createDefaultTelegramBridgeApiRuntime(deps: {
     getBotToken: () => string | undefined;
     getBotScope?: () => string | undefined;
+    isThreadedMode?: () => boolean;
     recordRuntimeEvent: TelegramBridgeApiRuntimeDeps["recordRuntimeEvent"];
     captureRequestErrorHandler?: TelegramBridgeApiRuntimeDeps["captureRequestErrorHandler"];
     targetActivity?: TelegramApiTargetActivityRuntime;
@@ -560,5 +568,6 @@ export declare function createTelegramBridgeApiRuntime(deps: TelegramBridgeApiRu
  */
 export declare function createTelegramApiClient(getBotToken: () => string | undefined, options?: TelegramAnswerCallbackQueryOptions & {
     now?: () => number;
+    isThreadedMode?: () => boolean;
 }): TelegramApiClient;
 export {};

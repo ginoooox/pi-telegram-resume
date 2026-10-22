@@ -86,8 +86,9 @@ const TELEGRAM_THREAD_DISPLAY_MODES = [
     "directory-title",
 ];
 export function resolveTelegramThreadDisplayMode(config) {
-    return TELEGRAM_THREAD_DISPLAY_MODES.includes(config.threadDisplayMode)
-        ? config.threadDisplayMode
+    const mode = config.threads?.displayMode;
+    return TELEGRAM_THREAD_DISPLAY_MODES.includes(mode)
+        ? mode
         : "letters";
 }
 export async function setTelegramThreadDisplayMode(store, mode, isCurrent) {
@@ -102,7 +103,8 @@ export async function setTelegramThreadDisplayMode(store, mode, isCurrent) {
     if (!current() || !store.hasBotToken()) {
         throw new Error("Telegram Thread display setting lost its configured profile.");
     }
-    await store.persist({ ...store.get(), threadDisplayMode: mode }, { isCurrent: current });
+    const latest = store.get();
+    await store.persist({ ...latest, threads: { ...latest.threads, displayMode: mode } }, { isCurrent: current });
     if (!current())
         throw new Error("Telegram Thread display setting changed during persistence.");
 }
@@ -253,14 +255,11 @@ function pickTelegramRootProfileFields(config) {
         ...(config.allowedUserId !== undefined
             ? { allowedUserId: config.allowedUserId }
             : {}),
-        ...(config.threadDisplayMode !== undefined
-            ? { threadDisplayMode: config.threadDisplayMode }
-            : {}),
         ...(legacyCursor !== undefined ? { lastUpdateId: legacyCursor } : {}),
     };
 }
 function omitTelegramRootProfileFields(config) {
-    const { botToken: _botToken, botUsername: _botUsername, botId: _botId, allowedUserId: _allowedUserId, threadDisplayMode: _threadDisplayMode, lastUpdateId: _lastUpdateId, ...sharedConfig } = config;
+    const { botToken: _botToken, botUsername: _botUsername, botId: _botId, allowedUserId: _allowedUserId, lastUpdateId: _lastUpdateId, ...sharedConfig } = config;
     return sharedConfig;
 }
 function omitRetiredProactivePush(config) {
@@ -286,7 +285,6 @@ export function normalizeTelegramDefaultProfileConfig(config) {
         "botUsername",
         "botId",
         "allowedUserId",
-        "threadDisplayMode",
         "lastUpdateId",
     ].some((field) => Object.hasOwn(config, field));
     if (!hasLegacyRootProfile) {

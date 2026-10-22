@@ -79,7 +79,7 @@ export interface TelegramModelMenuInputCacheDeps<
   cacheTtlMs: number;
   now?: number;
   reloadSettings: () => Promise<void>;
-  refreshAvailableModels: () => TModel[];
+  refreshAvailableModels: () => TModel[] | Promise<TModel[]>;
   getConfiguredScopedModelPatterns: () => string[] | undefined;
   getCliScopedModelPatterns: () => string[] | undefined;
 }
@@ -88,7 +88,7 @@ export interface TelegramModelMenuRuntimeContext<
   TModel extends MenuModel = MenuModel,
 > {
   modelRegistry: {
-    refresh: () => void;
+    refresh: () => void | Promise<unknown>;
     getAvailable: () => TModel[];
   };
 }
@@ -590,7 +590,7 @@ export async function resolveCachedTelegramModelMenuInputs<
   const now = deps.now ?? Date.now();
   if (cachedInputs && cachedInputs.expiresAt > now) return cachedInputs;
   await deps.reloadSettings();
-  const availableModels = deps.refreshAvailableModels();
+  const availableModels = await deps.refreshAvailableModels();
   const cliScopedModelPatterns = deps.getCliScopedModelPatterns();
   const configuredScopedModelPatterns =
     cliScopedModelPatterns ?? deps.getConfiguredScopedModelPatterns() ?? [];
@@ -660,8 +660,8 @@ export async function buildTelegramModelMenuStateRuntime<
     {
       cacheTtlMs: options.cacheTtlMs,
       reloadSettings: options.reloadSettings,
-      refreshAvailableModels: () => {
-        options.ctx.modelRegistry.refresh();
+      refreshAvailableModels: async () => {
+        await options.ctx.modelRegistry.refresh();
         return options.ctx.modelRegistry.getAvailable();
       },
       getConfiguredScopedModelPatterns:

@@ -6,6 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import * as BusFollower from "./bus-follower.js";
+import * as Machine from "./machine.js";
 import * as Queue from "./queue.js";
 import { formatTelegramConnectionFailure } from "./status.js";
 import * as TextGroups from "./text-groups.js";
@@ -195,6 +196,31 @@ export function createTelegramSessionContextStore(options = {}) {
         },
     };
 }
+/** Capture drain hints at work admission; late completion never borrows a replacement session or transport. */
+export function createTelegramSessionDrainObserver(deps) {
+    return () => {
+        try {
+            const ctx = deps.context.get(), generation = deps.context.getGeneration(), authority = deps.captureAuthority();
+            if (ctx === undefined || authority === undefined)
+                return undefined;
+            return () => {
+                queueMicrotask(() => {
+                    try {
+                        if (!deps.context.isCurrent(ctx, generation) || !deps.isAuthorityActive(authority))
+                            return;
+                        const emitted = deps.onDrained(ctx);
+                        if (emitted)
+                            void Promise.resolve(emitted).catch(() => undefined);
+                    }
+                    catch { /* A drain hint is observational, not execution authority. */ }
+                });
+            };
+        }
+        catch {
+            return undefined;
+        }
+    };
+}
 export function createTelegramSessionGenerationFence(store, hooks) {
     return {
         async onSessionStart(event, ctx) {
@@ -239,36 +265,47 @@ export function createTelegramBridgeSessionLifecycleDeps(ports) {
     };
 }
 export function createTelegramBridgeSessionLifecycleAssembly(deps) {
-    const isSessionActive = deps.contextStore.isCurrent;
     const suspendForReplacement = BusFollower.createTelegramBusFollowerSessionReplacementSuspender({
         registrationState: deps.follower.registrationState,
         instanceId: deps.follower.instanceId,
         suspendPolling: deps.follower.suspendPolling,
         recordRuntimeEvent: deps.follower.recordRuntimeEvent,
     });
-    let preserveTarget = true;
-    const queueLifecycle = Queue.createTelegramSessionLifecycleRuntime({
+    // A reused context can be current for a successor; inner awaits need this invocation's generation too.
+    const queueLifecycle = (ctx, generation, preserveTarget = true) => Queue.createTelegramSessionLifecycleRuntime({
         ...deps.queue,
-        isSessionActive,
+        isSessionActive: () => deps.contextStore.isCurrent(ctx, generation),
         stopPolling: () => suspendForReplacement(preserveTarget),
         clearPendingMediaGroups: deps.services.suspendGroupedInput,
     });
     const servicesLifecycle = {
         async onSessionStart(event, ctx) {
+            const generation = deps.contextStore.getGeneration();
+            const isCurrent = () => deps.contextStore.isCurrent(ctx, generation);
             const resumeConnection = deps.services.connection?.prepare(event, ctx);
-            await queueLifecycle.onSessionStart(event, ctx);
-            if (!isSessionActive(ctx))
+            await queueLifecycle(ctx, generation).onSessionStart(event, ctx);
+            if (!isCurrent())
                 return;
             deps.services.resumeGroupedInput(ctx);
             await deps.services.delivery.onSessionStart();
-            if (!isSessionActive(ctx))
+            if (!isCurrent())
                 return;
             if (resumeConnection)
                 resumeConnection();
             else
                 await deps.services.polling.onSessionStart(event, ctx);
+            if (!isCurrent())
+                return;
             deps.services.capabilityMonitor.start(ctx);
             deps.services.queueWatchdog.start(ctx);
+            await BusFollower.createTelegramBusFollowerSessionRefreshHook({
+                registrationState: deps.follower.registrationState,
+                registrationRuntime: deps.follower.registrationRuntime,
+                getLeaderState: deps.follower.getLeaderState,
+                isSessionActive: isCurrent,
+                updateStatus: deps.follower.updateStatus,
+                recordRuntimeEvent: deps.follower.recordRuntimeEvent,
+            })(event, ctx);
         },
         async onSessionShutdown(event, ctx) {
             const generation = deps.contextStore.getGeneration();
@@ -276,7 +313,7 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
             if (!isCurrent())
                 return;
             deps.services.connection?.onSessionShutdown(event, ctx);
-            preserveTarget = event.reason !== "resume";
+            const preserveTarget = event.reason !== "resume";
             let preserveThread;
             if (event.reason === "quit") {
                 try {
@@ -295,7 +332,7 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
                 return;
             deps.services.queueWatchdog.stop();
             deps.services.capabilityMonitor.stop();
-            await queueLifecycle.onSessionShutdown(event, ctx);
+            await queueLifecycle(ctx, generation, preserveTarget).onSessionShutdown(event, ctx);
             if (!isCurrent())
                 return;
             await deps.services.inboundWorker.onSessionShutdown();
@@ -311,17 +348,7 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
             }
         },
     };
-    const followerLifecycle = appendTelegramLifecycleHooks(servicesLifecycle, {
-        onSessionStart: BusFollower.createTelegramBusFollowerSessionRefreshHook({
-            registrationState: deps.follower.registrationState,
-            registrationRuntime: deps.follower.registrationRuntime,
-            getLeaderState: deps.follower.getLeaderState,
-            isSessionActive,
-            updateStatus: deps.follower.updateStatus,
-            recordRuntimeEvent: deps.follower.recordRuntimeEvent,
-        }),
-    }, isSessionActive);
-    return createTelegramSessionGenerationFence(deps.contextStore, followerLifecycle);
+    return createTelegramSessionGenerationFence(deps.contextStore, servicesLifecycle);
 }
 function unrefTelegramLifecycleTimer(timer) {
     if (!timer || typeof timer !== "object")
@@ -329,76 +356,165 @@ function unrefTelegramLifecycleTimer(timer) {
     if (typeof timer.unref === "function")
         timer.unref();
 }
+export function createTelegramCompactionObserverState() {
+    return { observation: null, typingOwned: false, nextObservation: 0 };
+}
+/**
+ * Pure compaction-observer transition. A completion or failure always releases presence; the timeout releases only its
+ * own observation. Typing ownership is sticky: a repeated start while the observer's own loop runs reports `false`
+ * from the shared loop, and must not hand that loop to nobody.
+ */
+export function transitionTelegramCompactionObserver(state, event) {
+    const cancel = state.observation === null ? [] : [{ type: "cancelTimer" }];
+    const release = (...tail) => [
+        { type: "setInProgress", inProgress: false },
+        ...(state.typingOwned ? [{ type: "stopTyping" }] : []),
+        { type: "updateStatus" },
+        ...tail,
+    ];
+    switch (event.type) {
+        case "beforeCompact": {
+            const observation = state.nextObservation + 1;
+            return {
+                state: { ...state, observation, nextObservation: observation },
+                effects: [
+                    { type: "setInProgress", inProgress: true },
+                    { type: "startTyping" },
+                    { type: "updateStatus" },
+                    ...cancel,
+                    { type: "armTimer", observation },
+                ],
+            };
+        }
+        case "typingStarted":
+            return {
+                state: { ...state, typingOwned: state.typingOwned || event.started },
+                effects: [],
+            };
+        case "compacted":
+            return {
+                state: { ...state, observation: null, typingOwned: false },
+                effects: [...cancel, ...release({ type: "requestDispatch" })],
+            };
+        case "compactFailed":
+            return {
+                state: { ...state, observation: null, typingOwned: false },
+                effects: [
+                    ...cancel,
+                    ...release({ type: "abandoned" }, { type: "requestDispatch" }),
+                ],
+            };
+        case "timerFired":
+            if (state.observation !== event.observation)
+                return { state, effects: [] };
+            // A replaced context consumes its observation without releasing the replacement's presence.
+            if (!event.contextActive)
+                return { state: { ...state, observation: null }, effects: [] };
+            return {
+                state: { ...state, observation: null, typingOwned: false },
+                effects: release({ type: "recordTimeout" }, { type: "requestDispatch" }),
+            };
+        case "shutdown":
+            return {
+                state: { ...state, observation: null, typingOwned: false },
+                effects: [
+                    ...cancel,
+                    ...(state.typingOwned ? [{ type: "stopTyping" }] : []),
+                ],
+            };
+    }
+}
+/**
+ * The shell around `transitionTelegramCompactionObserver`: it fences inactive contexts, runs effects with the calling
+ * context, reports the typing start back and owns the fallback timer, which keeps the context it was armed under.
+ */
 export function createTelegramCompactionObserverRuntime(deps) {
     const timeoutMs = deps.timeoutMs ?? 300_000;
     const setTimer = deps.setTimer ?? setTimeout;
     const clearTimer = deps.clearTimer ?? clearTimeout;
     let fallbackTimer;
-    let observationGeneration = 0;
-    let typingStartedByObserver = false;
-    const clearFallbackTimer = () => {
-        observationGeneration += 1;
-        if (!fallbackTimer)
-            return;
-        clearTimer(fallbackTimer);
-        fallbackTimer = undefined;
+    // The context of the event being dispatched; effects run synchronously inside that dispatch.
+    let call;
+    const machine = Machine.createTelegramMachineRunner({
+        initial: createTelegramCompactionObserverState(),
+        transition: transitionTelegramCompactionObserver,
+        run(effect) {
+            const ctx = call;
+            switch (effect.type) {
+                case "setInProgress":
+                    deps.setCompactionInProgress(effect.inProgress);
+                    return;
+                case "startTyping": {
+                    const result = deps.startTypingLoop?.(ctx);
+                    machine.dispatch({
+                        type: "typingStarted",
+                        started: !!deps.startTypingLoop && result !== false,
+                    });
+                    return;
+                }
+                case "stopTyping":
+                    deps.stopTypingLoop?.();
+                    return;
+                case "updateStatus":
+                    deps.updateStatus(ctx);
+                    return;
+                case "armTimer": {
+                    const armedCtx = ctx;
+                    fallbackTimer = setTimer(() => {
+                        fallbackTimer = undefined;
+                        dispatchFor(armedCtx, {
+                            type: "timerFired",
+                            observation: effect.observation,
+                            contextActive: !deps.isContextActive || deps.isContextActive(armedCtx),
+                        });
+                    }, timeoutMs);
+                    unrefTelegramLifecycleTimer(fallbackTimer);
+                    return;
+                }
+                case "cancelTimer":
+                    if (fallbackTimer !== undefined)
+                        clearTimer(fallbackTimer);
+                    fallbackTimer = undefined;
+                    return;
+                case "recordTimeout":
+                    deps.recordRuntimeEvent?.("compact", new Error("Compaction observer timed out"));
+                    return;
+                case "abandoned":
+                    deps.onCompactionAbandoned?.();
+                    return;
+                case "requestDispatch":
+                    // Observer expiry releases local presence, not Pi's eventual terminal result.
+                    deps.requestDeferredDispatchNextQueuedTelegramTurn(deps.dispatchNextQueuedTelegramTurn);
+                    return;
+            }
+        },
+    });
+    const dispatchFor = (ctx, event) => {
+        const previous = call;
+        call = ctx;
+        try {
+            machine.dispatch(event);
+        }
+        finally {
+            call = previous;
+        }
     };
-    // Stop only a typing loop this observer started; a pre-existing agent-owned loop is preserved.
-    const releaseCompactionPresence = (ctx) => {
-        deps.setCompactionInProgress(false);
-        if (typingStartedByObserver)
-            deps.stopTypingLoop?.();
-        typingStartedByObserver = false;
-        deps.updateStatus(ctx);
-    };
-    const requestDispatch = () => {
-        deps.requestDeferredDispatchNextQueuedTelegramTurn(deps.dispatchNextQueuedTelegramTurn);
-    };
+    const isActive = (ctx) => !deps.isContextActive || deps.isContextActive(ctx);
     return {
         onSessionBeforeCompact: (_event, ctx) => {
-            if (deps.isContextActive && !deps.isContextActive(ctx))
-                return;
-            deps.setCompactionInProgress(true);
-            const typingStartResult = deps.startTypingLoop?.(ctx);
-            typingStartedByObserver =
-                !!deps.startTypingLoop && typingStartResult !== false;
-            deps.updateStatus(ctx);
-            clearFallbackTimer();
-            const admittedGeneration = observationGeneration;
-            fallbackTimer = setTimer(() => {
-                if (observationGeneration !== admittedGeneration)
-                    return;
-                observationGeneration += 1;
-                fallbackTimer = undefined;
-                if (deps.isContextActive && !deps.isContextActive(ctx))
-                    return;
-                releaseCompactionPresence(ctx);
-                deps.recordRuntimeEvent?.("compact", new Error("Compaction observer timed out"));
-                // Observer expiry releases local presence, not Pi's eventual terminal result.
-                requestDispatch();
-            }, timeoutMs);
-            unrefTelegramLifecycleTimer(fallbackTimer);
+            if (isActive(ctx))
+                dispatchFor(ctx, { type: "beforeCompact" });
         },
         onSessionCompact: (_event, ctx) => {
-            if (deps.isContextActive && !deps.isContextActive(ctx))
-                return;
-            clearFallbackTimer();
-            releaseCompactionPresence(ctx);
-            requestDispatch();
+            if (isActive(ctx))
+                dispatchFor(ctx, { type: "compacted" });
         },
         onSessionCompactFailed: (_event, ctx) => {
-            if (deps.isContextActive && !deps.isContextActive(ctx))
-                return;
-            clearFallbackTimer();
-            releaseCompactionPresence(ctx);
-            deps.onCompactionAbandoned?.();
-            requestDispatch();
+            if (isActive(ctx))
+                dispatchFor(ctx, { type: "compactFailed" });
         },
         onSessionShutdown: () => {
-            clearFallbackTimer();
-            if (typingStartedByObserver)
-                deps.stopTypingLoop?.();
-            typingStartedByObserver = false;
+            dispatchFor(undefined, { type: "shutdown" });
         },
     };
 }
@@ -409,7 +525,11 @@ export function createTelegramMessageActivityTypingHooks(deps) {
     };
     const handleMessageActivity = async (phase, event, ctx, inner) => {
         const typedCtx = ctx;
-        ensureTyping(typedCtx);
+        const generation = deps.getSessionGeneration?.();
+        const isCurrent = () => deps.isContextActive?.(typedCtx) !== false &&
+            (!deps.getSessionGeneration || Object.is(deps.getSessionGeneration(), generation));
+        if (isCurrent())
+            ensureTyping(typedCtx);
         try {
             await inner(event, ctx);
         }
@@ -417,7 +537,8 @@ export function createTelegramMessageActivityTypingHooks(deps) {
             deps.recordRuntimeEvent?.("message-activity", error, { phase });
         }
         finally {
-            ensureTyping(typedCtx);
+            if (isCurrent())
+                ensureTyping(typedCtx);
         }
     };
     return {
@@ -485,6 +606,13 @@ export function registerTelegramLifecycleHooks(pi, deps) {
             return;
         await deps.onAgentStart(event, ctx);
     });
+    if (deps.onTurnEnd) {
+        pi.on("turn_end", (event, ctx) => {
+            if (!isActive(ctx))
+                return;
+            return deps.onTurnEnd?.(event, ctx);
+        });
+    }
     pi.on("tool_execution_start", async (event, ctx) => {
         if (!isActive(ctx))
             return;

@@ -43,7 +43,8 @@ export declare function resolveLegacyTelegramOwnersPath(agentDir?: string): stri
 export declare function resolveTelegramOwnersPath(): string;
 export declare function getTelegramProfilePathSuffix(profileName?: string): string;
 export declare function resolveTelegramProfileTempFilePath(baseName: string, extension: string, agentDir?: string, profileName?: string): string;
-export declare function getTelegramDiagnosticsDisplayPaths(_profileName?: string): {
+/** Shared state/log paths for every profile, under the resolved agent dir (honors `PI_CODING_AGENT_DIR`). */
+export declare function getTelegramDiagnosticsDisplayPaths(_profileName?: string, agentDir?: string): {
     state: string;
     logs: string;
 };

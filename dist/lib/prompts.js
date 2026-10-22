@@ -113,7 +113,7 @@ export function buildTelegramBridgeSystemPrompt(options) {
     const telegramHead = telegramPrefix.endsWith("]")
         ? telegramPrefix.slice(0, -1)
         : telegramPrefix;
-    const trimmedPrompt = options.prompt.trimStart();
+    const trimmedPrompt = options.prompt?.trimStart() ?? "";
     const telegramTurn = trimmedPrompt.startsWith(`${telegramHead}]`) ||
         trimmedPrompt.startsWith(`${telegramHead}|`);
     const telegramSuffix = telegramTurn
@@ -127,7 +127,7 @@ export function buildTelegramBridgeSystemPrompt(options) {
 }
 export function createTelegramBeforeAgentStartHook(options = {}) {
     return (event) => buildTelegramBridgeSystemPrompt({
-        prompt: event.prompt,
+        prompt: event.messageType === "custom" ? undefined : event.prompt,
         systemPrompt: event.systemPrompt,
         telegramPrefix: options.telegramPrefix,
         localSystemPromptSuffix: options.localSystemPromptSuffix ?? LOCAL_SYSTEM_PROMPT_SUFFIX,

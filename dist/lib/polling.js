@@ -471,6 +471,7 @@ export function createTelegramThreadCapabilityOrchestration(deps) {
         isTopicModeUnavailableError: deps.isTopicModeUnavailableError,
         updateStatus: deps.updateStatus,
         recordEvent: deps.recordEvent,
+        failureLog: deps.failureLog,
     };
     return {
         monitor: createTelegramThreadCapabilityMonitor(capabilityDeps),
@@ -752,10 +753,10 @@ export function createTelegramThreadAwarePollingPorts(deps) {
         }
         return deps.topicTargetStore.getBotState().threadMode === "enabled";
     };
-    const registerFollowerWithOwner = async (ctx, owner) => {
+    const registerFollowerWithOwner = async (ctx, owner, options) => {
         if (!(await refreshFollowerState()))
             return undefined;
-        return deps.registerFollowerWithLeader(ctx, owner);
+        return deps.registerFollowerWithLeader(ctx, owner, options);
     };
     const restoreFollowerWithOwner = async (ctx, owner) => {
         if (!(await refreshFollowerState())) {
@@ -813,8 +814,37 @@ export function createTelegramThreadCapabilityMonitor(deps) {
     let generation = 0;
     let transitionPromise;
     let consecutiveDisabledProbes = 0;
+    // An absent leader endpoint repeats one identical probe failure every interval; the port collapses the run.
+    // Running it through one guard keeps a faulty diagnostics port from breaking probes or the interval callback.
+    const capabilityFailureLog = {
+        record(error, details) {
+            try {
+                deps.failureLog.record(error, details);
+            }
+            catch {
+                // Monitor diagnostics cannot create an uncaught interval exception.
+            }
+        },
+        settled() {
+            try {
+                deps.failureLog.settled();
+            }
+            catch {
+                // Monitor diagnostics cannot fail a completed probe.
+            }
+        },
+        reset() {
+            try {
+                deps.failureLog.reset();
+            }
+            catch {
+                // Monitor diagnostics cannot fail a monitor stop.
+            }
+        },
+    };
     const stop = () => {
         generation += 1;
+        capabilityFailureLog.reset();
         if (interval)
             clearInterval(interval);
         interval = undefined;
@@ -832,6 +862,7 @@ export function createTelegramThreadCapabilityMonitor(deps) {
             .then(async (threadModeEnabled) => {
             if (!isCurrent())
                 return;
+            capabilityFailureLog.settled();
             if (threadModeEnabled === undefined) {
                 if (deps.topicTargetStore.getBotState().threadMode !== "enabled" &&
                     !deps.getPollingStartedWithTelegramBus() &&
@@ -844,7 +875,9 @@ export function createTelegramThreadCapabilityMonitor(deps) {
                 consecutiveDisabledProbes = 0;
             const botState = deps.topicTargetStore.getBotState();
             const current = botState.threadMode;
-            if (threadModeEnabled && current === "enabled")
+            // Persisted capability is not proof that this owner started its local bus.
+            if (threadModeEnabled && current === "enabled" &&
+                (deps.getPollingStartedWithTelegramBus() || !deps.ownsLock(ctx)))
                 return;
             if (!threadModeEnabled && current === "disabled") {
                 if (!deps.ownsLock(ctx) ||
@@ -877,12 +910,7 @@ export function createTelegramThreadCapabilityMonitor(deps) {
             .catch((error) => {
             if (!isCurrent())
                 return;
-            try {
-                deps.recordEvent("bus", error, { phase: "capability-monitor" });
-            }
-            catch {
-                // Monitor diagnostics cannot create an unhandled interval rejection.
-            }
+            capabilityFailureLog.record(error);
         })
             .finally(() => {
             if (transitionPromise === tracked)
@@ -893,6 +921,8 @@ export function createTelegramThreadCapabilityMonitor(deps) {
     return {
         start(ctx) {
             stop();
+            // Disabled-mode confirmation counts consecutive probes of one run, never observations from before a restart.
+            consecutiveDisabledProbes = 0;
             const expectedGeneration = generation;
             interval = setInterval(() => {
                 if (generation !== expectedGeneration)
@@ -907,12 +937,7 @@ export function createTelegramThreadCapabilityMonitor(deps) {
                     catch {
                         /* Timer shutdown must not escape the callback. */
                     }
-                    try {
-                        deps.recordEvent("bus", error, { phase: "capability-monitor" });
-                    }
-                    catch {
-                        // Monitor diagnostics cannot create an uncaught interval exception.
-                    }
+                    capabilityFailureLog.record(error);
                 }
             }, intervalMs);
             interval.unref?.();

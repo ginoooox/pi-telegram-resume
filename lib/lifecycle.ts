@@ -26,9 +26,12 @@ import type {
   ToolExecutionEndEvent,
   ToolExecutionStartEvent,
   ToolExecutionUpdateEvent,
+  TurnEndEvent,
+  TurnEndEventResult,
   UIPromptEndEvent,
   UIPromptStartEvent,
 } from "./pi.ts";
+import * as Machine from "./machine.ts";
 import * as Queue from "./queue.ts";
 import { formatTelegramConnectionFailure } from "./status.ts";
 import * as TextGroups from "./text-groups.ts";
@@ -99,6 +102,7 @@ export interface TelegramLifecycleRegistrationDeps {
     event: { model: TelegramLifecycleModel },
     ctx: ExtensionContext,
   ) => Promise<void> | void;
+  onTurnEnd?: (event: TurnEndEvent, ctx: ExtensionContext) => TurnEndEventResult | undefined;
   onAgentStart: (
     event: AgentStartEvent,
     ctx: ExtensionContext,
@@ -411,6 +415,30 @@ export function createTelegramSessionContextStore<TContext>(
   };
 }
 
+/** Capture drain hints at work admission; late completion never borrows a replacement session or transport. */
+export function createTelegramSessionDrainObserver<TContext, TAuthority>(deps: {
+  context: Pick<TelegramSessionContextStore<TContext>, "get" | "getGeneration" | "isCurrent">;
+  captureAuthority: () => TAuthority | undefined;
+  isAuthorityActive: (authority: TAuthority) => boolean;
+  onDrained: (ctx: TContext) => void;
+}): () => (() => void) | undefined {
+  return () => {
+    try {
+      const ctx = deps.context.get(), generation = deps.context.getGeneration(), authority = deps.captureAuthority();
+      if (ctx === undefined || authority === undefined) return undefined;
+      return () => {
+        queueMicrotask(() => {
+          try {
+            if (!deps.context.isCurrent(ctx, generation) || !deps.isAuthorityActive(authority)) return;
+            const emitted: unknown = deps.onDrained(ctx);
+            if (emitted) void Promise.resolve(emitted).catch(() => undefined);
+          } catch { /* A drain hint is observational, not execution authority. */ }
+        });
+      };
+    } catch { return undefined; }
+  };
+}
+
 export function createTelegramSessionGenerationFence(
   store: TelegramSessionContextStore<ExtensionContext>,
   hooks: TelegramSessionLifecycleHooks,
@@ -550,7 +578,6 @@ export function createTelegramBridgeSessionLifecycleAssembly<
 >(
   deps: TelegramBridgeSessionLifecycleAssemblyDeps<TQueueItem, TModel>,
 ): TelegramSessionLifecycleHooks {
-  const isSessionActive = deps.contextStore.isCurrent;
   const suspendForReplacement =
     BusFollower.createTelegramBusFollowerSessionReplacementSuspender({
       registrationState: deps.follower.registrationState,
@@ -558,32 +585,44 @@ export function createTelegramBridgeSessionLifecycleAssembly<
       suspendPolling: deps.follower.suspendPolling,
       recordRuntimeEvent: deps.follower.recordRuntimeEvent,
     });
-  let preserveTarget = true;
-  const queueLifecycle = Queue.createTelegramSessionLifecycleRuntime({
-    ...deps.queue,
-    isSessionActive,
-    stopPolling: () => suspendForReplacement(preserveTarget),
-    clearPendingMediaGroups: deps.services.suspendGroupedInput,
-  });
+  // A reused context can be current for a successor; inner awaits need this invocation's generation too.
+  const queueLifecycle = (ctx: ExtensionContext, generation: number, preserveTarget = true) =>
+    Queue.createTelegramSessionLifecycleRuntime({
+      ...deps.queue,
+      isSessionActive: () => deps.contextStore.isCurrent(ctx, generation),
+      stopPolling: () => suspendForReplacement(preserveTarget),
+      clearPendingMediaGroups: deps.services.suspendGroupedInput,
+    });
   const servicesLifecycle: TelegramSessionLifecycleHooks = {
     async onSessionStart(event, ctx) {
+      const generation = deps.contextStore.getGeneration();
+      const isCurrent = () => deps.contextStore.isCurrent(ctx, generation);
       const resumeConnection = deps.services.connection?.prepare(event, ctx);
-      await queueLifecycle.onSessionStart(event, ctx);
-      if (!isSessionActive(ctx)) return;
+      await queueLifecycle(ctx, generation).onSessionStart(event, ctx);
+      if (!isCurrent()) return;
       deps.services.resumeGroupedInput(ctx);
       await deps.services.delivery.onSessionStart();
-      if (!isSessionActive(ctx)) return;
+      if (!isCurrent()) return;
       if (resumeConnection) resumeConnection();
       else await deps.services.polling.onSessionStart(event, ctx);
+      if (!isCurrent()) return;
       deps.services.capabilityMonitor.start(ctx);
       deps.services.queueWatchdog.start(ctx);
+      await BusFollower.createTelegramBusFollowerSessionRefreshHook({
+        registrationState: deps.follower.registrationState,
+        registrationRuntime: deps.follower.registrationRuntime,
+        getLeaderState: deps.follower.getLeaderState,
+        isSessionActive: isCurrent,
+        updateStatus: deps.follower.updateStatus,
+        recordRuntimeEvent: deps.follower.recordRuntimeEvent,
+      })(event, ctx);
     },
     async onSessionShutdown(event, ctx) {
       const generation = deps.contextStore.getGeneration();
       const isCurrent = () => deps.contextStore.isCurrent(ctx, generation);
       if (!isCurrent()) return;
       deps.services.connection?.onSessionShutdown(event, ctx);
-      preserveTarget = event.reason !== "resume";
+      const preserveTarget = event.reason !== "resume";
       let preserveThread: (() => Promise<void>) | undefined;
       if (event.reason === "quit") {
         try {
@@ -600,7 +639,7 @@ export function createTelegramBridgeSessionLifecycleAssembly<
       if (!isCurrent()) return;
       deps.services.queueWatchdog.stop();
       deps.services.capabilityMonitor.stop();
-      await queueLifecycle.onSessionShutdown(event, ctx);
+      await queueLifecycle(ctx, generation, preserveTarget).onSessionShutdown(event, ctx);
       if (!isCurrent()) return;
       await deps.services.inboundWorker.onSessionShutdown();
       if (!isCurrent()) return;
@@ -613,23 +652,9 @@ export function createTelegramBridgeSessionLifecycleAssembly<
       }
     },
   };
-  const followerLifecycle = appendTelegramLifecycleHooks(
-    servicesLifecycle,
-    {
-      onSessionStart: BusFollower.createTelegramBusFollowerSessionRefreshHook({
-        registrationState: deps.follower.registrationState,
-        registrationRuntime: deps.follower.registrationRuntime,
-        getLeaderState: deps.follower.getLeaderState,
-        isSessionActive,
-        updateStatus: deps.follower.updateStatus,
-        recordRuntimeEvent: deps.follower.recordRuntimeEvent,
-      }),
-    },
-    isSessionActive,
-  );
   return createTelegramSessionGenerationFence(
     deps.contextStore,
-    followerLifecycle,
+    servicesLifecycle,
   );
 }
 
@@ -670,6 +695,121 @@ export interface TelegramCompactionObserverRuntime<TContext> {
   onSessionShutdown: () => void;
 }
 
+/** The whole compaction-observer state; only `transitionTelegramCompactionObserver` produces a new one. */
+export interface TelegramCompactionObserverState {
+  /** The fallback timer's observation; a timer from any other one is inert. */
+  readonly observation: number | null;
+  /** The typing loop is the observer's to stop; a loop the agent already ran is never stopped by compaction. */
+  readonly typingOwned: boolean;
+  readonly nextObservation: number;
+}
+
+export type TelegramCompactionObserverEvent =
+  | { type: "beforeCompact" }
+  /** The outcome of the observer's own typing start, reported back by the shell. */
+  | { type: "typingStarted"; started: boolean }
+  | { type: "compacted" }
+  | { type: "compactFailed" }
+  | { type: "timerFired"; observation: number; contextActive: boolean }
+  | { type: "shutdown" };
+
+export type TelegramCompactionObserverEffect =
+  | { type: "setInProgress"; inProgress: boolean }
+  | { type: "startTyping" }
+  | { type: "stopTyping" }
+  | { type: "updateStatus" }
+  | { type: "armTimer"; observation: number }
+  | { type: "cancelTimer" }
+  | { type: "recordTimeout" }
+  | { type: "abandoned" }
+  | { type: "requestDispatch" };
+
+export function createTelegramCompactionObserverState(): TelegramCompactionObserverState {
+  return { observation: null, typingOwned: false, nextObservation: 0 };
+}
+
+/**
+ * Pure compaction-observer transition. A completion or failure always releases presence; the timeout releases only its
+ * own observation. Typing ownership is sticky: a repeated start while the observer's own loop runs reports `false`
+ * from the shared loop, and must not hand that loop to nobody.
+ */
+export function transitionTelegramCompactionObserver(
+  state: TelegramCompactionObserverState,
+  event: TelegramCompactionObserverEvent,
+): Machine.TelegramMachineStep<
+  TelegramCompactionObserverState,
+  TelegramCompactionObserverEffect
+> {
+  const cancel: TelegramCompactionObserverEffect[] =
+    state.observation === null ? [] : [{ type: "cancelTimer" }];
+  const release = (
+    ...tail: TelegramCompactionObserverEffect[]
+  ): TelegramCompactionObserverEffect[] => [
+    { type: "setInProgress", inProgress: false },
+    ...(state.typingOwned ? [{ type: "stopTyping" } as const] : []),
+    { type: "updateStatus" },
+    ...tail,
+  ];
+  switch (event.type) {
+    case "beforeCompact": {
+      const observation = state.nextObservation + 1;
+      return {
+        state: { ...state, observation, nextObservation: observation },
+        effects: [
+          { type: "setInProgress", inProgress: true },
+          { type: "startTyping" },
+          { type: "updateStatus" },
+          ...cancel,
+          { type: "armTimer", observation },
+        ],
+      };
+    }
+    case "typingStarted":
+      return {
+        state: { ...state, typingOwned: state.typingOwned || event.started },
+        effects: [],
+      };
+    case "compacted":
+      return {
+        state: { ...state, observation: null, typingOwned: false },
+        effects: [...cancel, ...release({ type: "requestDispatch" })],
+      };
+    case "compactFailed":
+      return {
+        state: { ...state, observation: null, typingOwned: false },
+        effects: [
+          ...cancel,
+          ...release({ type: "abandoned" }, { type: "requestDispatch" }),
+        ],
+      };
+    case "timerFired":
+      if (state.observation !== event.observation)
+        return { state, effects: [] };
+      // A replaced context consumes its observation without releasing the replacement's presence.
+      if (!event.contextActive)
+        return { state: { ...state, observation: null }, effects: [] };
+      return {
+        state: { ...state, observation: null, typingOwned: false },
+        effects: release(
+          { type: "recordTimeout" },
+          { type: "requestDispatch" },
+        ),
+      };
+    case "shutdown":
+      return {
+        state: { ...state, observation: null, typingOwned: false },
+        effects: [
+          ...cancel,
+          ...(state.typingOwned ? [{ type: "stopTyping" } as const] : []),
+        ],
+      };
+  }
+}
+
+/**
+ * The shell around `transitionTelegramCompactionObserver`: it fences inactive contexts, runs effects with the calling
+ * context, reports the typing start back and owns the fallback timer, which keeps the context it was armed under.
+ */
 export function createTelegramCompactionObserverRuntime<TContext>(
   deps: TelegramCompactionObserverRuntimeDeps<TContext>,
 ): TelegramCompactionObserverRuntime<TContext> {
@@ -677,74 +817,105 @@ export function createTelegramCompactionObserverRuntime<TContext>(
   const setTimer = deps.setTimer ?? setTimeout;
   const clearTimer = deps.clearTimer ?? clearTimeout;
   let fallbackTimer: TelegramLifecycleTimer | undefined;
-  let observationGeneration = 0;
-  let typingStartedByObserver = false;
-  const clearFallbackTimer = (): void => {
-    observationGeneration += 1;
-    if (!fallbackTimer) return;
-    clearTimer(fallbackTimer);
-    fallbackTimer = undefined;
+  // The context of the event being dispatched; effects run synchronously inside that dispatch.
+  let call: TContext | undefined;
+  const machine = Machine.createTelegramMachineRunner<
+    TelegramCompactionObserverState,
+    TelegramCompactionObserverEvent,
+    TelegramCompactionObserverEffect
+  >({
+    initial: createTelegramCompactionObserverState(),
+    transition: transitionTelegramCompactionObserver,
+    run(effect) {
+      const ctx = call as TContext;
+      switch (effect.type) {
+        case "setInProgress":
+          deps.setCompactionInProgress(effect.inProgress);
+          return;
+        case "startTyping": {
+          const result = deps.startTypingLoop?.(ctx);
+          machine.dispatch({
+            type: "typingStarted",
+            started: !!deps.startTypingLoop && result !== false,
+          });
+          return;
+        }
+        case "stopTyping":
+          deps.stopTypingLoop?.();
+          return;
+        case "updateStatus":
+          deps.updateStatus(ctx);
+          return;
+        case "armTimer": {
+          const armedCtx = ctx;
+          fallbackTimer = setTimer(() => {
+            fallbackTimer = undefined;
+            dispatchFor(armedCtx, {
+              type: "timerFired",
+              observation: effect.observation,
+              contextActive:
+                !deps.isContextActive || deps.isContextActive(armedCtx),
+            });
+          }, timeoutMs);
+          unrefTelegramLifecycleTimer(fallbackTimer);
+          return;
+        }
+        case "cancelTimer":
+          if (fallbackTimer !== undefined) clearTimer(fallbackTimer);
+          fallbackTimer = undefined;
+          return;
+        case "recordTimeout":
+          deps.recordRuntimeEvent?.(
+            "compact",
+            new Error("Compaction observer timed out"),
+          );
+          return;
+        case "abandoned":
+          deps.onCompactionAbandoned?.();
+          return;
+        case "requestDispatch":
+          // Observer expiry releases local presence, not Pi's eventual terminal result.
+          deps.requestDeferredDispatchNextQueuedTelegramTurn(
+            deps.dispatchNextQueuedTelegramTurn,
+          );
+          return;
+      }
+    },
+  });
+  const dispatchFor = (
+    ctx: TContext | undefined,
+    event: TelegramCompactionObserverEvent,
+  ): void => {
+    const previous = call;
+    call = ctx;
+    try {
+      machine.dispatch(event);
+    } finally {
+      call = previous;
+    }
   };
-  // Stop only a typing loop this observer started; a pre-existing agent-owned loop is preserved.
-  const releaseCompactionPresence = (ctx: TContext): void => {
-    deps.setCompactionInProgress(false);
-    if (typingStartedByObserver) deps.stopTypingLoop?.();
-    typingStartedByObserver = false;
-    deps.updateStatus(ctx);
-  };
-  const requestDispatch = (): void => {
-    deps.requestDeferredDispatchNextQueuedTelegramTurn(
-      deps.dispatchNextQueuedTelegramTurn,
-    );
-  };
+  const isActive = (ctx: TContext): boolean =>
+    !deps.isContextActive || deps.isContextActive(ctx);
   return {
     onSessionBeforeCompact: (_event, ctx) => {
-      if (deps.isContextActive && !deps.isContextActive(ctx)) return;
-      deps.setCompactionInProgress(true);
-      const typingStartResult = deps.startTypingLoop?.(ctx);
-      typingStartedByObserver =
-        !!deps.startTypingLoop && typingStartResult !== false;
-      deps.updateStatus(ctx);
-      clearFallbackTimer();
-      const admittedGeneration = observationGeneration;
-      fallbackTimer = setTimer(() => {
-        if (observationGeneration !== admittedGeneration) return;
-        observationGeneration += 1;
-        fallbackTimer = undefined;
-        if (deps.isContextActive && !deps.isContextActive(ctx)) return;
-        releaseCompactionPresence(ctx);
-        deps.recordRuntimeEvent?.(
-          "compact",
-          new Error("Compaction observer timed out"),
-        );
-        // Observer expiry releases local presence, not Pi's eventual terminal result.
-        requestDispatch();
-      }, timeoutMs);
-      unrefTelegramLifecycleTimer(fallbackTimer);
+      if (isActive(ctx)) dispatchFor(ctx, { type: "beforeCompact" });
     },
     onSessionCompact: (_event, ctx) => {
-      if (deps.isContextActive && !deps.isContextActive(ctx)) return;
-      clearFallbackTimer();
-      releaseCompactionPresence(ctx);
-      requestDispatch();
+      if (isActive(ctx)) dispatchFor(ctx, { type: "compacted" });
     },
     onSessionCompactFailed: (_event, ctx) => {
-      if (deps.isContextActive && !deps.isContextActive(ctx)) return;
-      clearFallbackTimer();
-      releaseCompactionPresence(ctx);
-      deps.onCompactionAbandoned?.();
-      requestDispatch();
+      if (isActive(ctx)) dispatchFor(ctx, { type: "compactFailed" });
     },
     onSessionShutdown: () => {
-      clearFallbackTimer();
-      if (typingStartedByObserver) deps.stopTypingLoop?.();
-      typingStartedByObserver = false;
+      dispatchFor(undefined, { type: "shutdown" });
     },
   };
 }
 
 export interface TelegramMessageActivityTypingDeps<TContext> {
   hasActiveTurn: () => boolean;
+  isContextActive?: (ctx: TContext) => boolean;
+  getSessionGeneration?: () => number;
   startTypingLoop: (ctx: TContext) => void;
   onMessageStart: TelegramLifecycleRegistrationDeps["onMessageStart"];
   onMessageUpdate: TelegramLifecycleRegistrationDeps["onMessageUpdate"];
@@ -773,13 +944,16 @@ export function createTelegramMessageActivityTypingHooks<
     inner: (event: TEvent, ctx: ExtensionContext) => Promise<void>,
   ): Promise<void> => {
     const typedCtx = ctx as TContext;
-    ensureTyping(typedCtx);
+    const generation = deps.getSessionGeneration?.();
+    const isCurrent = () => deps.isContextActive?.(typedCtx) !== false &&
+      (!deps.getSessionGeneration || Object.is(deps.getSessionGeneration(), generation));
+    if (isCurrent()) ensureTyping(typedCtx);
     try {
       await inner(event, ctx);
     } catch (error) {
       deps.recordRuntimeEvent?.("message-activity", error, { phase });
     } finally {
-      ensureTyping(typedCtx);
+      if (isCurrent()) ensureTyping(typedCtx);
     }
   };
   return {
@@ -868,6 +1042,12 @@ export function registerTelegramLifecycleHooks(
     if (!isActive(ctx)) return;
     await deps.onAgentStart(event, ctx);
   });
+  if (deps.onTurnEnd) {
+    pi.on("turn_end", (event, ctx) => {
+      if (!isActive(ctx)) return;
+      return deps.onTurnEnd?.(event, ctx);
+    });
+  }
   pi.on("tool_execution_start", async (event, ctx) => {
     if (!isActive(ctx)) return;
     await deps.onToolExecutionStart(event, ctx);

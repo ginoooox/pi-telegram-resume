@@ -1,6 +1,7 @@
 /**
  * Regression tests for the Telegram extension entrypoint wiring
  * Covers composition-root binding of tools, commands, lifecycle hooks, and prompt injection
+ * Zones: telegram, pi agent, orchestration
  */
 
 import assert from "node:assert/strict";
@@ -101,6 +102,7 @@ test("Extension entrypoint wires domain bindings into the pi API", () => {
       "before_agent_start",
       "model_select",
       "agent_start",
+      "turn_end",
       "tool_execution_start",
       "tool_execution_update",
       "tool_execution_end",
@@ -113,6 +115,15 @@ test("Extension entrypoint wires domain bindings into the pi API", () => {
       "agent_settled",
     ],
   );
+});
+
+test("Extension model-step hook declines unbound contexts without SDK or queue effects", async () => {
+  const harness = createIndexApiHarness();
+  telegramExtension(harness.api);
+  const result = await getRequiredIndexHandler(harness.handlers, "turn_end")(
+    { entries: [], outcome: "completed", turnIndex: 1 }, createIndexExtensionContext(),
+  );
+  assert.equal(result, undefined);
 });
 
 test("Extension before-agent-start hook skips Telegram guidance when unconfigured", async () => {

@@ -1,6 +1,7 @@
 /**
  * Cross-domain integration tests for the Telegram extension
  * Exercises extension-level polling, queue/lifecycle wiring, previews, reactions, compaction, and model switching
+ * Zones: telegram, pi agent, shared utils
  */
 
 import assert from "node:assert/strict";
@@ -58,9 +59,12 @@ import * as Sync from "../lib/sync.ts";
 import * as Updates from "../lib/updates.ts";
 import {
   createTelegramBridgeApiRuntime,
+  createTelegramApiClient,
   type TelegramApiClient,
   type TelegramBridgeApiRuntime,
 } from "../lib/telegram-api.ts";
+import { createPassthroughFailureLog } from "./fixtures/failure-log.ts";
+import { createTelegramFailureRunLog } from "../lib/logging.ts";
 
 // Production timers are unref'd so they never hold Pi open; a live Pi process keeps the loop alive. Mirror that so
 // Node 22's runner does not abort runtime tests that await those timers.
@@ -1141,7 +1145,7 @@ for (const scenario of [
       },
     });
     let requests = 0;
-    const attempts: Bus.TelegramBusForwardOwnership[] = [];
+    const ownershipChecks: Bus.TelegramBusForwardOwnership[] = [];
     const rejectedDeliveryIds: string[] = [];
     const validate = Bus.createTelegramBusForwardOwnershipValidator(registry);
     const forwarder = Bus.createTelegramBusForeignOwnedUpdateForwarder<
@@ -1153,7 +1157,7 @@ for (const scenario of [
         if (typeof details?.deliveryId === "string") rejectedDeliveryIds.push(details.deliveryId);
       },
       validateForwardOwnership(snapshot) {
-        attempts.push(snapshot);
+        ownershipChecks.push(snapshot);
         return validate(snapshot);
       },
     });
@@ -1211,10 +1215,11 @@ for (const scenario of [
       }
       await worker.waitForDrain();
       assert.deepEqual(leaderJournal.read().entries, []);
-      assert.equal(attempts.length, 3);
-      assert.deepEqual(attempts.map((attempt) => attempt.ownerGeneration),
-        scenario.replace ? ["g1", "g2", "g2"] : ["g1", "g1", "g1"]);
-      assert.equal(attempts.every((attempt) =>
+      assert.equal(requests, 3, "Three semantic forwarding attempts retain the existing durable retry contract");
+      assert.equal(ownershipChecks.length, 15, "Each attempt validates ownership before send, connect, encoding/write and ACK");
+      assert.deepEqual(ownershipChecks.map((snapshot) => snapshot.ownerGeneration),
+        (scenario.replace ? ["g1", "g2", "g2"] : ["g1", "g1", "g1"]).flatMap(generation => Array(5).fill(generation)));
+      assert.equal(ownershipChecks.every((attempt) =>
         JSON.stringify(attempt.protocolIdentity) === JSON.stringify(registration.protocol)), true);
       const admitted = followerJournal.read().entries;
       assert.deepEqual(admitted.map((entry) => entry.updateId), [source.update_id]);
@@ -1261,6 +1266,14 @@ async function waitForEventLoopCondition(
     await new Promise((resolve) => setImmediate(resolve));
   }
   throw new Error("Timed out waiting for event-loop condition");
+}
+
+// Runtime integration checks are semantic, not latency benchmarks. Share the test's deadline and always drain teardown.
+async function waitForRuntimeState(context: TestContext, description: string, predicate: () => boolean): Promise<void> {
+  while (!predicate()) {
+    if (context.signal.aborted) throw new Error(`Runtime test ended while waiting for ${description}`);
+    await waitForTimeout(10, undefined, { signal: context.signal });
+  }
 }
 
 async function waitForCondition(
@@ -2392,11 +2405,8 @@ test("Graceful follower disconnect persists intent and deletes through its live 
     );
     assert.equal(await follower.disconnectFromLeader?.(), true);
 
+    // Private-chat topics cannot be closed, so graceful cleanup deletes directly.
     assert.deepEqual(calls, [
-      {
-        method: "closeForumTopic",
-        body: { chat_id: 77, message_thread_id: 43 },
-      },
       {
         method: "deleteForumTopic",
         body: { chat_id: 77, message_thread_id: 43 },
@@ -2451,6 +2461,9 @@ test("Public activity delivery reaches the classic instance without blocking age
       lastUpdateId: 0,
     });
     await writeRuntimeTelegramLocks({});
+    const classicSeed = await createRuntimeSeedWorkspaceStore();
+    classicSeed.threads.setBotState({ threadMode: "disabled", updatedAtMs: Date.now() });
+    await classicSeed.threads.persist(); await classicSeed.release();
     (await getRuntimeTelegramExtension())(pi);
     const ctx = createRuntimeExtensionContext();
     await handlers.get("session_start")?.({}, ctx);
@@ -2547,6 +2560,9 @@ test("Verbose activity reaches classic transport before the final assistant answ
     });
     await writeRuntimeTelegramLocks({});
     (await getRuntimeTelegramExtension())(pi);
+    const classicSeed = await createRuntimeSeedWorkspaceStore();
+    classicSeed.threads.setBotState({ threadMode: "disabled", updatedAtMs: Date.now() });
+    await classicSeed.threads.persist(); await classicSeed.release();
     const ctx = createRuntimeExtensionContext({
       cwd: "/repo/verbose-classic",
     });
@@ -2806,7 +2822,43 @@ test("Verbose activity uses follower transport and loses stale registration auth
   runtime.stop();
 });
 
-test("Follower aggregate delivery crosses the authorized leader transport", async () => {
+for (const mode of ["thread", "classic", "thread-unavailable"] as const) {
+  test(`Queue dispatch preserves typing destination through native runtime and API fences (${mode})`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const Runtime = await import("../lib/runtime.ts");
+    const runtime = Runtime.createTelegramBridgeRuntime(), ctx = { id: "session" };
+    const threaded = mode !== "classic", target = mode === "thread" ? { chatId: 7, threadId: 42 } : { chatId: 7 };
+    let authority: string | undefined = "current", apiCalls = 0, injections = 0;
+    const bodies: Array<Record<string, unknown>> = [], failures: unknown[] = [];
+    const restoreFetch = setRuntimeTestFetch(async (_input, init) => { bodies.push(parseJsonRequestBody(init) ?? {}); return createRuntimeTelegramApiResponse(true); });
+    const client = createTelegramApiClient(() => "123:fixture", { isThreadedMode: () => threaded });
+    const prompt = Runtime.createTelegramPromptDispatchRuntime({
+      failureLog: createPassthroughFailureLog(error => failures.push(error)),
+      lifecycle: runtime.lifecycle, typing: runtime.typing,
+      getDefaultChatId: () => 7, isThreadedMode: () => threaded, getTransportAuthority: () => authority,
+      isContextActive: value => value === ctx, updateStatus() {}, recordRuntimeEvent(_category, error) { failures.push(error); },
+      async sendTypingAction(chatId, options) { apiCalls++; return client.call("sendChatAction", { chat_id: chatId, action: "typing",
+        ...(options?.message_thread_id !== undefined ? { message_thread_id: options.message_thread_id } : {}) }, { assertAuthority: options?.assertAuthority }); } });
+    const turn: Queue.PendingTelegramTurn = { kind: "prompt", chatId: 7, target, replyToMessageId: 0, sourceMessageIds: [12],
+      queueOrder: 1, queueLane: "default", laneOrder: 1, queuedAttachments: [], content: [{ type: "text", text: "retained All input" }], historyText: "input", statusSummary: "input" };
+    let items: Queue.TelegramQueueItem<typeof ctx>[] = [turn];
+    const dispatch = Queue.createTelegramQueueDispatchController<typeof ctx>({ getQueuedItems: () => items, setQueuedItems(next) { items = next; },
+      canDispatch: () => !runtime.lifecycle.hasDispatchPending(), updateStatus() {}, sendTextReply: async () => undefined,
+      onPromptDispatchStart: prompt.onPromptDispatchStart, sendUserMessage() { injections++; }, onPromptDispatchFailure: prompt.onPromptDispatchFailure });
+    try {
+      dispatch.dispatchNext(ctx); await flushMicrotasks(20);
+      assert.equal(injections, 1); assert.equal(runtime.lifecycle.hasDispatchPending(), true);
+      assert.equal(items[0], turn, "Typing cannot consume the pending Pi-owned head");
+      assert.equal(apiCalls, mode === "thread-unavailable" ? 0 : 1);
+      assert.deepEqual(bodies, mode === "thread-unavailable" ? [] : [{ chat_id: 7, action: "typing", ...(mode === "thread" ? { message_thread_id: 42 } : {}) }]);
+      assert.deepEqual(failures, [], "Missing Thread is an upstream refusal, not an API-fence diagnostic");
+      authority = undefined; t.mock.timers.tick(6000); await flushMicrotasks(20);
+      assert.equal(apiCalls, mode === "thread-unavailable" ? 0 : 1, "Authority loss cannot refresh or reroute activity");
+    } finally { runtime.typing.stop(); restoreFetch(); }
+  });
+}
+
+test("Follower All output is refused by delivery policy and leader authorization", async () => {
   const follower = {
     instanceId: "follower-one",
     connectedAtMs: 1,
@@ -2832,10 +2884,7 @@ test("Follower aggregate delivery crosses the authorized leader transport", asyn
     ownsDirect: () => false,
     getDefaultTarget: () => follower.target,
     async callFollowerApi(method, args) {
-      assert.equal(
-        Bus.isTelegramFollowerApiCallAllowed({ follower, method, args }),
-        true,
-      );
+      if (!Bus.isTelegramFollowerApiCallAllowed({ follower, method, args })) throw new Error("Follower All output is denied");
       return leaderProxy(method, args);
     },
   });
@@ -2857,10 +2906,9 @@ test("Follower aggregate delivery crosses the authorized leader transport", asyn
     { scope: { kind: "aggregate" } },
   );
 
-  assert.equal(result.ok, true);
-  assert.deepEqual(directBodies, [
-    { chat_id: 77, text: "Aggregate activity" },
-  ]);
+  assert.equal(result.ok, false);
+  await assert.rejects(busAwareApi.call("sendMessage", { chat_id: 77, text: "Legacy All", __piTelegramAggregateDelivery: true }), /All output is denied/);
+  assert.deepEqual(directBodies, []);
 });
 
 test("Leader transport coalesces matching direct and follower chat actions", async () => {
@@ -3488,6 +3536,7 @@ for (const peer of ["legacy", "capable", "status", "abort", "stop", "next", "con
   const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-live-ports-")));
   const protocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "prepared-peer", capabilities: [
     Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, Bus.TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+    Bus.TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY,
     ...(peer !== "legacy" ? [Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE, Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY,
       Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE, Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET,
       Bus.TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY] : [])] });
@@ -3501,7 +3550,10 @@ for (const peer of ["legacy", "capable", "status", "abort", "stop", "next", "con
   const target = { chatId: 77, threadId: 43 };
   const server = Bus.createTelegramBusLocalServer({ socketPath: leaderSocket,
     handleEnvelope: BusLeader.createTelegramBusLeaderEnvelopeHandler({ followerRegistry: registry, protocolIdentity: protocol,
-      authSecret: "fixture-secret", provisionFollowerTarget: () => ({ ...target, slot: "A" }),
+      authSecret: "fixture-secret", provisionFollowerTarget: (_registration, options) => {
+        assert.equal(options?.recoverConnection, true, "The public connect command carries explicit recovery intent");
+        return { ...target, slot: "A" };
+      },
       callApi(method) { return method === "getMe" ? { id: 123, has_topics_enabled: true } : true; },
     }) });
   const restoreFetch = setRuntimeTestFetch(async input => {
@@ -3951,7 +4003,19 @@ for (const boundary of ["current", "context", "canonical", "local", "follower", 
         if (boundary === "follower" || boundary === "classic") {
           assert.equal(captured.routingDeps.captureThreadNameRecipientAuthority(boundary === "classic" ? { chatId: 77 } : target, ctx), undefined);
         } else {
-          const statePath = Paths.resolveTelegramStatePath(dir);
+          // Pi creates a fresh context object per event and command; Thread-name authority follows the session.
+          const sameSessionCtx = createRuntimeExtensionContext({ cwd: "/root-dialog", sessionManager: ctx.sessionManager });
+          const sameSessionAuthority = captured.routingDeps.captureThreadNameRecipientAuthority({ ...target }, sameSessionCtx);
+          assert.equal(typeof sameSessionAuthority, "function");
+          assert.doesNotThrow(sameSessionAuthority, "A fresh context object of the same session keeps Thread-name authority");
+          // A replaced session cannot even capture the authority: the session, not the context object, is authoritative.
+          assert.throws(
+            () => captured.routingDeps.captureThreadNameRecipientAuthority(
+              { ...target },
+              createRuntimeExtensionContext({ cwd: "/root-dialog" }),
+            ),
+            /context|authority/,
+          );          const statePath = Paths.resolveTelegramStatePath(dir);
           Locks.mutateTelegramRuntimeStateSection(statePath, "other", "runtime", () => ({ value: { sentinel: "unrelated-profile" }, result: true }), { isCurrent: () => true });
           const other = Locks.readTelegramRuntimeState(statePath).profiles.other;
           const textBoundary = boundary.startsWith("text-"), callbackBoundary = boundary.startsWith("callback-");
@@ -4320,7 +4384,16 @@ for (const fault of ["current", "session-held", "response-session", "lost-ack", 
         assert.equal(journal.read().entries.some(row => row.updateId === 100), !reported);
         await click();
         assert.equal(answers.some(text => text?.includes("Command source disposal confirmed")), ack);
-        if (ack) assert.ok(answers.some(text => text?.includes(commandName === "compact" ? "confirmation delivery and actual compaction" : "confirmation delivery and actual session replacement")));
+        if (ack) {
+          const restore = Locks.readTelegramRuntimeState(statePath).profiles.default.workspace.workspaceRestore.liveRebindings[0];
+          assert.equal(restore.inputRelease, "accepted", "Native producer admission is distinct from its exact source ACK");
+          const cleanupText = restore.cleanup === "confirmed" ? "old-Thread removal confirmed"
+            : restore.cleanup === "unknown" ? "old-Thread removal unconfirmed; deletion will not repeat"
+            : restore.cleanup === "failed" ? "old-Thread removal failed"
+            : restore.cleanup === "not-issued" ? "old-Thread removal was not issued"
+            : commandName === "compact" ? "confirmation delivery and actual compaction" : "confirmation delivery and actual session replacement";
+          assert.ok(answers.some(text => text?.includes(cleanupText)), "Confirmation copy must reflect the retained cleanup outcome, not claim scheduled cleanup after completion");
+        }
         if (reported) {
           assert.equal(typeof captured.effectGuard, "function"); assert.doesNotThrow(captured.effectGuard);
           originals.get(100).text = "changed after handled completion";
@@ -4806,10 +4879,14 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
   }
 });
 
-for (const outcome of ["unchanged", "offered", "transferred", "discarded", "cancelled",
-  "offered-without-wake", "observation-failed", "prompt-unchanged", "prompt-race",
-  "prompt-completion-lost-ack", "discard-completion-lost-ack"] as const) {
-strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome})`, async () => {
+for (const delivery of ["ordinary", "idle-steer", "active-steer"] as const) {
+const outcomes = delivery === "ordinary"
+  ? ["unchanged", "offered", "transferred", "discarded", "cancelled", "offered-without-wake",
+    "observation-failed", "prompt-unchanged", "prompt-race", "prompt-completion-lost-ack", "discard-completion-lost-ack"] as const
+  : ["prompt-unchanged", "offered-without-wake", "transferred", "cancelled", "discarded",
+    "prompt-completion-lost-ack", "prompt-generation-loss"] as const;
+for (const outcome of outcomes) {
+strictFileTest(`Prepared donor receipt projection gates Queue issuance (${delivery}/${outcome})`, async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-donor-projection-")));
   const configPath = join(dir, "telegram.json");
   const botToken = "123:fixture-donor-projection";
@@ -4837,7 +4914,7 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
       getInputContext: () => ({ owner, recipientBindingKey: "workspace:donor" }),
     };
     const source = Journal.createTelegramInputJournalStore(options);
-    const isPrompt = outcome.startsWith("prompt-");
+    const isPrompt = delivery !== "ordinary" || outcome.startsWith("prompt-");
     source.appendBatch([{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }], 3);
     const input = source.acquireInput({ updateId: 1, recipientBindingKey: "workspace:donor" });
     source.startInput(input.receipt);
@@ -4859,6 +4936,7 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
       },
       completeQueued(receipts) {
         const result = source.completeQueued(receipts);
+        if (outcome === "prompt-generation-loss") deferredDispatch.bind("ctx");
         if (outcome.endsWith("completion-lost-ack")) throw new Error("fixture completion ACK lost");
         return result;
       },
@@ -4889,7 +4967,8 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
     const binding = Bindings.createTelegramQueueBindingRuntime({ store, admission, deferredDispatch,
       queue: { allocateItemOrder: () => 1 }, activeTurn: { has: () => false },
       lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => false },
-      transportStamp: { isActive: () => true }, isIdle: () => true, hasPendingMessages: () => false,
+      transportStamp: { isActive: () => true }, isIdle: () => delivery !== "active-steer", hasPendingMessages: () => false,
+      isContextCurrent: ctx => ctx === "ctx", isContextAborted: () => false,
       updateStatus: () => {}, sendTextReply: async () => undefined,
       sendUserMessage: () => { effects.push("prompt"); },
       promptDispatch: { startTypingLoop: () => {}, onPromptDispatchFailure: () => {},
@@ -4900,7 +4979,7 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
     const base = { chatId: 7, replyToMessageId: 1, queueOrder: 1, laneOrder: 1,
       statusSummary: "retained work", admissionReceipts: [{ ...queued, journalBindingKey }] };
     const item: Queue.TelegramQueueItem<string> = isPrompt
-      ? { ...base, kind: "prompt", queueLane: "default", sourceMessageIds: [1], queuedAttachments: [],
+      ? { ...base, kind: "prompt", queueLane: delivery === "ordinary" ? "default" : "steer", sourceMessageIds: [1, 3], queuedAttachments: [],
         content: [{ type: "text", text: "retained prompt" }], historyText: "" }
       : { ...base, kind: "control", controlType: "status", queueLane: "control",
         async execute() { effects.push("control"); } };
@@ -4941,29 +5020,45 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
       assert.equal(settlement.isItemReady(item), true);
     }
     const before = source.read();
+    const issue = () => {
+      if (delivery !== "active-steer") return binding.dispatchNext("ctx");
+      const proposal = binding.onTurnEnd({ turnIndex: 1, outcome: "completed" }, "ctx");
+      if (proposal) {
+        assert.equal(proposal.continue, true);
+        assert.equal(proposal.entries?.length, 1);
+        effects.push("proposal");
+      }
+    };
     if (outcome === "discard-completion-lost-ack") {
       assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
-    } else binding.dispatchNext("ctx");
+    } else issue();
     await new Promise<void>(done => setImmediate(done));
     const executable = outcome === "unchanged" || outcome === "cancelled" ||
       outcome === "observation-failed" || outcome === "prompt-unchanged";
-    assert.deepEqual(effects, executable ? [isPrompt ? "prompt" : "control"] : [],
+    const promptEffect = delivery === "active-steer" ? "proposal" : "prompt";
+    assert.deepEqual(effects, executable ? [isPrompt ? promptEffect : "control"] : [],
       "Durable revocation or missing completion ACK must precede effects");
     if (!executable) {
       assert.equal(store.getQueuedItems().length, 1);
       assert.equal(settlement.isItemReady(item), false);
       assert.equal(settlement.getQueueReceiptOwner(item.admissionReceipts![0]!), undefined);
       if (outcome === "prompt-race") assert.ok(source.read().entries[0]!.queueHandoff);
-      else if (outcome.endsWith("completion-lost-ack")) {
+      else if (outcome.endsWith("completion-lost-ack") || outcome === "prompt-generation-loss") {
         assert.deepEqual(source.read().entries.map(entry => entry.updateId), [2]);
       } else assert.deepEqual(source.read(), before);
       const retained = source.read();
-      assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
-      assert.equal(store.getQueuedItems().length, 1);
+      issue();
+      assert.deepEqual(effects, [], "Protected attempts or revoked/offered receipts cannot replay");
+      if (outcome === "prompt-generation-loss") {
+        assert.equal(binding.mutation.clear("ctx"), 1, "Exact ACK permits disposal only, never publication into the reused context");
+      } else {
+        assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
+        assert.equal(store.getQueuedItems().length, 1);
+      }
       assert.deepEqual(source.read(), retained);
     } else assert.deepEqual(source.read().entries.map(entry => entry.updateId), [2]);
     assert.equal(settlement.isItemReady({ admissionReceipts: [{ ...unrelated, journalBindingKey }] }), true);
-    if (outcome === "prompt-unchanged") {
+    if (outcome === "prompt-unchanged" && delivery !== "active-steer") {
       const receipt = item.admissionReceipts![0]!;
       const ids = receipt.sourceUpdateIds;
       receipt.sourceUpdateIds = [1];
@@ -4976,14 +5071,15 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
       const retained = source.read();
       await assembly.leader.onTransportChanged("ctx");
       await new Promise<void>(done => setImmediate(done));
-      binding.dispatchNext("ctx");
-      assert.deepEqual(effects, ["prompt"]);
+      issue();
+      assert.deepEqual(effects, [promptEffect]);
       assert.equal(binding.mutation.clear("ctx"), 1);
       assert.deepEqual(source.read(), retained);
     }
     assert.deepEqual(ledger.read().leases, []);
   } finally { await shutdown?.(); await rm(dir, { recursive: true, force: true }); }
 });
+}
 }
 
 for (const outcome of ["accepted", "rejected", "lost-ack"] as const) {
@@ -5331,6 +5427,13 @@ strictFileTest(`Telegram new gateway composes follower suspension, session regis
   const leader = Bus.createTelegramBusLocalServer({ socketPath: leaderPath,
     handleEnvelope: leaderHandler });
   const assembly = BusFollower.createTelegramBusFollowerRuntimeAssembly({ instanceId: "fixture-follower", registrationState,
+    failureLog: createTelegramFailureRunLog({
+      category: "bus",
+      failurePhase: "follower-heartbeat",
+      outcomePhase: "follower-heartbeat-recovered",
+      label: "follower heartbeat",
+      record: () => {},
+    }),
     recordRuntimeEvent: () => {}, receiver: { socketPath: followerPath, getAuthSecret: () => "fixture", getContext: () => contexts.get(),
       getRecipientBindingKey: () => recipientKey,
       durableAdmission: BusFollower.createTelegramBusFollowerDurableAdmissionRuntime({ journal: workers, signalWorker: workers.signal }) },
@@ -5471,6 +5574,13 @@ strictFileTest(`Follower registration fences native binding readiness (${outcome
   let contextActive = true;
   let failRefresh = false;
   const assembly = BusFollower.createTelegramBusFollowerRuntimeAssembly({ instanceId: "fixture-follower", registrationState,
+    failureLog: createTelegramFailureRunLog({
+      category: "bus",
+      failurePhase: "follower-heartbeat",
+      outcomePhase: "follower-heartbeat-recovered",
+      label: "follower heartbeat",
+      record: () => {},
+    }),
     recordRuntimeEvent: () => {},
     receiver: { socketPath: followerPath, getAuthSecret: () => "fixture", getContext: () => activeCtx,
       getRecipientBindingKey: () => "fixture:recipient",
@@ -8279,6 +8389,7 @@ test("Extension runtime sends proactive checkpoints and final once in source ord
       },
       ctx,
     );
+    await waitForEventLoopCondition(() => sentBodies.length >= 2);
     await flushMicrotasks(20);
     assert.equal(sentBodies.length, 2);
     assert.deepEqual(
@@ -8473,13 +8584,14 @@ test("Extension runtime skips proactive local result without Telegram lock owner
   }
 });
 
-for (const draftPreviews of [false, true]) {
-test(`Extension runtime delivers anchored Telegram commentary once before final with preview ${draftPreviews ? "on" : "off"}`, async () => {
+for (const [draftPreviews, activity] of [[false, "quiet"], [true, "quiet"], [false, "thinking"], [true, "verbose"]] as const) {
+test(`Extension runtime delivers anchored Telegram commentary once before final with preview ${draftPreviews ? "on" : "off"} (${activity})`, async (t) => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
   const deliveredMarkdown: string[] = [];
   const replyAnchors: unknown[] = [];
   let dispatched = false;
+  let shutdownContext: ReturnType<typeof createRuntimeExtensionContext> | undefined;
   const { handlers, commands, pi } = createRuntimePiHarness({
     sendUserMessage: (content) => {
       sentMessages.push(content);
@@ -8518,7 +8630,8 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
     if (method === "sendChatAction") {
       return createRuntimeTelegramApiResponse(true);
     }
-    if (method === "sendRichMessageDraft") return createRuntimeTelegramApiResponse(true);
+    if (method === "sendRichMessageDraft" || method === "sendMessageDraft" || method === "editMessageText") return createRuntimeTelegramApiResponse(true);
+    if (method === "sendRichMessage" && !String((body.rich_message as { markdown?: string } | undefined)?.markdown ?? "").includes("Checkpoint") && !String((body.rich_message as { markdown?: string } | undefined)?.markdown ?? "").includes("Final")) return createRuntimeTelegramApiResponse({ message_id: 300 });
     if (method === "sendRichMessage") {
       replyAnchors.push(body.reply_parameters);
       deliveredMarkdown.push(
@@ -8541,18 +8654,19 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       botToken: "123:abc",
       allowedUserId: 77,
       lastUpdateId: 0,
-      assistant: { activity: "quiet", proactivePush: true, draftPreviews },
+      assistant: { activity, proactivePush: true, draftPreviews, rendering: "rich" },
     });
     await writeRuntimeTelegramLocks({});
     (await getRuntimeTelegramExtension())(pi);
     const idleCtx = createRuntimeExtensionContext();
+    shutdownContext = idleCtx;
     const activeCtx = createRuntimeExtensionContext({
       sessionManager: idleCtx.sessionManager,
       isIdle: () => false,
     });
     await handlers.get("session_start")?.({}, idleCtx);
     await commands.get("telegram-connect")?.handler("", idleCtx);
-    await waitForCondition(() => dispatched);
+    await waitForRuntimeState(t, "initial prompt dispatch", () => dispatched);
     assert.match(
       getRuntimeHarnessTextBlock(sentMessages[0]).text ?? "",
       /^\[telegram\] show checkpoints/,
@@ -8563,6 +8677,10 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       content: [{ type: "text", text: "Checkpoint **visible**" }],
     };
     await handlers.get("message_start")?.({ message: checkpointMessage }, activeCtx);
+    await handlers.get("message_update")?.({ message: checkpointMessage, assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "planning the tool call", partial: checkpointMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: checkpointMessage, assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "planning the tool call", partial: checkpointMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: checkpointMessage, assistantMessageEvent: { type: "text_start", contentIndex: 1, partial: checkpointMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: checkpointMessage, assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "Checkpoint **visible**", partial: checkpointMessage } }, activeCtx);
     await handlers.get("message_update")?.(
       {
         message: checkpointMessage,
@@ -8587,7 +8705,9 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       activeCtx,
     );
     await handlers.get("message_end")?.({ message: { ...checkpointMessage, stopReason: "toolUse" } }, activeCtx);
-    await waitForCondition(() => deliveredMarkdown.length === 1);
+    await handlers.get("tool_execution_start")?.({ toolCallId: "probe", toolName: "bash", args: { command: "sleep 30" } }, activeCtx);
+    await waitForRuntimeState(t, "anchored commentary before tool end", () => deliveredMarkdown.length === 1);
+    await handlers.get("tool_execution_end")?.({ toolCallId: "probe", toolName: "bash", result: { content: [] }, isError: false }, activeCtx);
     const finalMessage = {
       role: "assistant",
       content: [{ type: "text", text: "Final **answer**" }],
@@ -8616,12 +8736,12 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       },
       activeCtx,
     );
-    await waitForCondition(() => deliveredMarkdown.length === 2);
+    await waitForRuntimeState(t, "final Markdown delivery", () => deliveredMarkdown.length === 2);
     await Promise.all([
       handlers.get("agent_end")?.({ messages: [finalMessage] }, activeCtx),
       handlers.get("agent_end")?.({ messages: [finalMessage] }, activeCtx),
     ]);
-    await waitForCondition(() => deliveredMarkdown.length >= 2);
+    await waitForRuntimeState(t, "settled final delivery", () => deliveredMarkdown.length >= 2);
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(deliveredMarkdown.length, 2, "One active Telegram turn may publish its final answer only once");
     assert.deepEqual(deliveredMarkdown, [
@@ -8633,21 +8753,90 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       { message_id: 10, allow_sending_without_reply: true },
       undefined,
     ]);
-    await handlers.get("session_shutdown")?.({}, idleCtx);
   } finally {
-    restoreFetch();
-    await telegramConfig.restore();
+    try {
+      if (shutdownContext) await handlers.get("session_shutdown")?.({}, shutdownContext);
+    } finally {
+      restoreFetch();
+      await telegramConfig.restore();
+    }
   }
-});
+}, 20_000);
 
 }
 
-test("Extension runtime preserves both busy Next notices through follower queue admission", async () => {
+for (const [draftPreviews, activity] of [[false, "thinking"], [true, "quiet"]] as const) {
+test(`Extension runtime delivers the final answer before automatic compaction completes (${activity}, preview ${draftPreviews ? "on" : "off"})`, async (t) => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const deliveredMarkdown: string[] = [];
+  let dispatched = false;
+  let shutdownContext: ReturnType<typeof createRuntimeExtensionContext> | undefined;
+  const { handlers, commands, pi } = createRuntimePiHarness({ sendUserMessage: () => { dispatched = true; } });
+  let getUpdatesCalls = 0;
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    const body = parseJsonRequestBody(init) ?? {};
+    if (method === "deleteWebhook" || method === "setMyCommands" || method === "sendChatAction") return createRuntimeTelegramApiResponse(true);
+    if (method === "sendRichMessageDraft" || method === "sendMessageDraft" || method === "editMessageText") return createRuntimeTelegramApiResponse(true);
+    if (method === "getUpdates") {
+      getUpdatesCalls += 1;
+      if (getUpdatesCalls === 1) return createRuntimeTelegramApiResponse([{ _: "other", update_id: 1, message: { message_id: 10,
+        chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false, first_name: "Test" }, text: "finish then compact" } }]);
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("stop", "AbortError")));
+      });
+    }
+    if (method === "sendRichMessage" || method === "sendMessage") {
+      deliveredMarkdown.push(String((body.rich_message as { markdown?: string } | undefined)?.markdown ?? body.text ?? ""));
+      return createRuntimeTelegramApiResponse({ message_id: 100 + deliveredMarkdown.length });
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({ botToken: "123:abc", allowedUserId: 77, lastUpdateId: 0,
+      assistant: { activity, proactivePush: true, draftPreviews, rendering: "rich" } });
+    await writeRuntimeTelegramLocks({});
+    (await getRuntimeTelegramExtension())(pi);
+    const idleCtx = createRuntimeExtensionContext();
+    shutdownContext = idleCtx;
+    const activeCtx = createRuntimeExtensionContext({ sessionManager: idleCtx.sessionManager, isIdle: () => false });
+    await handlers.get("session_start")?.({}, idleCtx);
+    await commands.get("telegram-connect")?.handler("", idleCtx);
+    await waitForRuntimeState(t, "initial prompt dispatch", () => dispatched);
+    await handlers.get("agent_start")?.({}, activeCtx);
+    const finalMessage = { role: "assistant", content: [{ type: "text", text: "Final **before compaction**" }] };
+    await handlers.get("message_start")?.({ message: finalMessage }, activeCtx);
+    await handlers.get("message_update")?.({ message: finalMessage, assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: finalMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: finalMessage, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Final **before compaction**", partial: finalMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: finalMessage, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "Final **before compaction**", partial: finalMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: finalMessage, assistantMessageEvent: { type: "done", reason: "stop", message: finalMessage } }, activeCtx);
+    await handlers.get("message_end")?.({ message: { ...finalMessage, stopReason: "stop" } }, activeCtx);
+    await handlers.get("agent_end")?.({ messages: [{ ...finalMessage, stopReason: "stop" }] }, activeCtx);
+    // Pi runs automatic compaction after agent_end and before agent_settled.
+    await handlers.get("session_before_compact")?.({ reason: "threshold", signal: new AbortController().signal }, activeCtx);
+    await waitForRuntimeState(t, "final answer while compaction is still running",
+      () => deliveredMarkdown.includes("Final **before compaction**"));
+    await handlers.get("session_compact")?.({ reason: "threshold" }, activeCtx);
+    await handlers.get("agent_settled")?.({ aborted: false }, activeCtx);
+  } finally {
+    try {
+      if (shutdownContext) await handlers.get("session_shutdown")?.({}, shutdownContext);
+    } finally {
+      restoreFetch();
+      await telegramConfig.restore();
+    }
+  }
+}, 20_000);
+}
+
+test("Extension runtime preserves both busy Next notices through follower queue admission", async (t) => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
   const secondUpdates = createRuntimeDeferredResponse();
   const thirdUpdates = createRuntimeDeferredResponse();
   const fourthUpdates = createRuntimeDeferredResponse();
+  let shutdownContext: ReturnType<typeof createRuntimeExtensionContext> | undefined;
+  let waitingQueue = "";
   let idle = true;
   let abortCount = 0;
   const { handlers, commands, pi } = createRuntimePiHarness({
@@ -8707,13 +8896,17 @@ test("Extension runtime preserves both busy Next notices through follower queue 
     (await getRuntimeTelegramExtension())(pi);
     const ctx = createRuntimeExtensionContext({
       isIdle: () => idle,
-      abort: () => {
-        abortCount += 1;
+      abort: () => { abortCount += 1; },
+      ui: {
+        theme: { fg: (_token: string, text: string) => text },
+        setStatus: (_key: string, text: string) => { waitingQueue = text; },
+        notify: () => {},
       },
     });
+    shutdownContext = ctx;
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
-    await waitForCondition(() => sentMessages.length === 1);
+    await waitForRuntimeState(t, "initial prompt dispatch", () => sentMessages.length === 1);
     idle = false;
     await handlers.get("agent_start")?.({}, ctx);
     secondUpdates.resolve(
@@ -8730,8 +8923,7 @@ test("Extension runtime preserves both busy Next notices through follower queue 
         },
       ]),
     );
-    await waitForCondition(() => getUpdatesCalls >= 3);
-    await waitForTimeout(1_200);
+    await waitForRuntimeState(t, "follow-up poll and queue admission", () => getUpdatesCalls >= 3 && /\+1\b/.test(waitingQueue));
     thirdUpdates.resolve(
       createRuntimeTelegramApiResponse([
         {
@@ -8746,7 +8938,7 @@ test("Extension runtime preserves both busy Next notices through follower queue 
         },
       ]),
     );
-    await waitForCondition(() => abortCount === 1);
+    await waitForRuntimeState(t, "busy Next abort", () => abortCount === 1);
     idle = true;
     const abortedMessage = {
       role: "assistant",
@@ -8755,8 +8947,8 @@ test("Extension runtime preserves both busy Next notices through follower queue 
     };
     await handlers.get("agent_end")?.({ messages: [abortedMessage] }, ctx);
     await handlers.get("agent_settled")?.({}, ctx);
-    await waitForCondition(() => sentMessages.length === 2);
-    await waitForCondition(() =>
+    await waitForRuntimeState(t, "next prompt dispatch", () => sentMessages.length === 2);
+    await waitForRuntimeState(t, "abort notice", () =>
       sendTexts.includes("<b>⏹️ This operation was aborted.</b>")
     );
     const lifecycleNotices = sendTexts.filter((text) =>
@@ -8780,7 +8972,7 @@ test("Extension runtime preserves both busy Next notices through follower queue 
     await handlers.get("message_end")?.({ message: completedMessage }, ctx);
     await handlers.get("agent_end")?.({ messages: [completedMessage] }, ctx);
     await handlers.get("agent_settled")?.({}, ctx);
-    await waitForCondition(() => sendTexts.includes("follow-up answer"));
+    await waitForRuntimeState(t, "follow-up answer", () => sendTexts.includes("follow-up answer"));
     const dispatchBody = sendBodies.find((body) =>
       getRuntimeTelegramApiText(body) ===
         "<b>⏩ Dispatching next queued turn.</b>"
@@ -8795,12 +8987,18 @@ test("Extension runtime preserves both busy Next notices through follower queue 
     });
     assert.equal(finalBody?.reply_parameters, undefined);
     fourthUpdates.resolve(createRuntimeTelegramApiResponse([]));
-    await handlers.get("session_shutdown")?.({}, ctx);
   } finally {
-    restoreFetch();
-    await telegramConfig.restore();
+    secondUpdates.resolve(createRuntimeTelegramApiResponse([]));
+    thirdUpdates.resolve(createRuntimeTelegramApiResponse([]));
+    fourthUpdates.resolve(createRuntimeTelegramApiResponse([]));
+    try {
+      if (shutdownContext) await handlers.get("session_shutdown")?.({}, shutdownContext);
+    } finally {
+      restoreFetch();
+      await telegramConfig.restore();
+    }
   }
-});
+}, 20_000);
 
 test("Extension runtime keeps rapid ordinary messages as distinct queued turns", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();

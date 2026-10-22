@@ -73,11 +73,13 @@ export interface TelegramDeliveryTarget {
 Resolution rules:
 
 - `active-turn` requires a current Telegram-owned turn and resolves its exact `{ chatId, threadId? }`.
-- `instance` resolves the current process's assigned follower/leader thread, or the paired private chat in classic mode. It does not silently fall back to an unrelated active thread.
-- `aggregate` resolves the paired private chat without `threadId`; it is the Threaded Mode `All` surface and the ordinary classic chat. Follower aggregate messages carry an internal authenticated-bus marker that the leader validates for the assigned chat and strips before Bot API transport; unmarked or cross-chat threadless follower writes remain denied.
-- `target` validates an explicit destination against the active profile and current runtime authority. A classic owner may target its paired private chat. A follower may target only its assigned thread or aggregate surface. A leader may target its own thread, aggregate surface, or a currently live bound thread for that profile. Unknown, stale, cross-profile, and unpaired targets are rejected.
+- `instance` resolves the current process's assigned follower/leader Thread, or the paired private chat in Classic Mode. In Threaded Mode, a missing assigned Thread returns `target-unavailable`; it never falls back to All or another instance.
+- `aggregate` resolves the paired private chat only in Classic Mode. In Threaded Mode, `All` is input-only: aggregate sends return `target-unavailable`, and even retained follower aggregate markers cannot authorize an All write.
+- `target` validates an explicit destination against the active profile and current runtime authority. A Classic owner may target its paired private chat. A Threaded follower may target only its assigned Thread; a leader may target its own or another currently live bound Thread. Explicit threadless targets, unknown, stale, cross-profile, and unpaired targets are rejected.
 
 No scope selects another named profile. Profile activation remains session-local bridge state.
+
+Threaded Mode applies to active-turn output and edits through retained Classic handles too. The Bot API client rejects new positive private-chat sends, copies, forwards, drafts and chat actions without a positive safe-integer top-level `message_thread_id`, before transport/file access and again at asynchronous/retry authority boundaries. Reply anchors and caller guards cannot substitute a Thread target. Classic DM, explicit channel destinations, business namespaces, callback answers and deletion remain distinct. The extension does not auto-clean historical All output.
 
 ### Handles
 
@@ -209,8 +211,8 @@ Extension consumers remain trusted local code, but the contract still preserves 
 The implementation must cover:
 
 - Classic `instance` and `aggregate` resolution.
-- Leader own-thread, aggregate, and live-bound explicit target resolution.
-- Follower assigned-thread and aggregate routing through the leader.
+- Leader own-Thread and live-bound explicit target resolution; no All fallback on target loss.
+- Follower assigned-Thread routing through the leader; no aggregate-marker escape.
 - Missing active turns and disconnected runtimes.
 - Cross-profile, unknown, stale, and unauthorized explicit targets.
 - Plain, HTML, and Markdown chunking.

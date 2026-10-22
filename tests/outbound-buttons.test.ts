@@ -92,6 +92,10 @@ test("Fenced top-level button sequences are vertical aliases for explicit matric
   for (const source of [
     '{Valid|one}\n{"label":"Broken","prompt":}',
     '{Valid|one}\n{Broken|}',
+    '[{Valid|one}]\n[{Broken|}]',
+    '[{Valid|one}]\n[]',
+    '[{Valid|one}]\n[{"label":"Broken","prompt":}]',
+    '[{Valid|one}]\n[{Valid|two}] trailing',
     '{Valid|one} trailing',
   ]) {
     const plan = planTelegramButtonReply(`\`\`\`telegram_button\n${source}\n\`\`\``, {
@@ -99,6 +103,39 @@ test("Fenced top-level button sequences are vertical aliases for explicit matric
     });
     assert.equal(plan.markdown, "");
     assert.equal(plan.replyMarkup, undefined);
+  }
+});
+
+test("Adjacent top-level button groups normalize to one matrix without changing rows or actions", () => {
+  const vertical = '[{First|one}{Second|two}]';
+  const cases = [
+    ['[{First|one}]\n[{Second|two}]', vertical],
+    ['[{First|one}], [{Second|two}]', vertical],
+    ['{First|one}\n[{Second|two}]', vertical],
+    ['[{"label":"First","prompt":"one"}]\n{Second|two}', vertical],
+    ['[[{First|one}{Second|two}]]\n[{Third|three}]', '[[{First|one}{Second|two}]{Third|three}]'],
+    ['[{First|one}]\n[{Unavailable|||1}]', '[{First|one}{Unavailable|||1}]'],
+  ];
+  for (const rendering of ["rich", "html"] as const) {
+    for (const wrapper of ["fence", "comment"] as const) {
+      const plan = (payload: string) => {
+        const actions: unknown[] = [];
+        const markdown = wrapper === "fence"
+          ? `\`\`\`telegram_button\n${payload}\n\`\`\``
+          : `<!-- telegram_button ${payload} -->`;
+        const reply = planTelegramButtonReply(markdown, {
+          rendering,
+          registerAction: (action) => {
+            actions.push(action);
+            return `tgbtn:${actions.length}`;
+          },
+        });
+        return { ...reply, actions };
+      };
+      for (const [source, canonical] of cases) {
+        assert.deepEqual(plan(source!), plan(canonical!), `${rendering}/${wrapper}: ${source}`);
+      }
+    }
   }
 });
 

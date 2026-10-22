@@ -31,6 +31,50 @@ import {
 } from "../lib/outbound.ts";
 import type { TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
 
+for (const outcome of ["settled", "unconfirmed", "reset", "failed", "capture-failed", "notify-failed", "async-notify-failed"] as const)
+test(`Publication drain hints follow actual final decrement and preserve uncertainty (${outcome})`, async () => {
+  let notifications = 0;
+  const publication = createTelegramActivityPublicationRuntime({ captureDrain() {
+    if (outcome === "capture-failed") throw new Error("observer");
+    return () => {
+      assert.equal(publication.hasPending(), false);
+      assert.equal(publication.hasUnconfirmed(), false);
+      if (outcome === "notify-failed") throw new Error("observer");
+      if (outcome === "async-notify-failed") return Promise.reject(new Error("observer"));
+      notifications++;
+    };
+  } });
+  const work = publication.beginWork(), reserved = publication.reserve();
+  if (outcome === "reset") publication.reset();
+  await (outcome === "failed"
+    ? assert.rejects(reserved.publish(async () => { throw new Error("delivery"); }), /delivery/)
+    : reserved.publish(async () => {}));
+  assert.equal(notifications, 0, "Other outstanding work still protects publication");
+  work.settle(outcome === "unconfirmed" ? "unconfirmed" : "settled");
+  work.settle("settled");
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(publication.hasPending(), false);
+  assert.equal(notifications, outcome === "settled" || outcome === "failed" ? 1 : 0);
+  assert.equal(publication.hasUnconfirmed(), outcome === "unconfirmed");
+});
+
+for (const stop of [false, true]) test(`Activity drain hints follow the last handler and ignore stopped queues (${stop})`, async () => {
+  const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  let notifications = 0;
+  const unregister = registerTelegramActivityHandler({ id: "drain-observer", async handle() { entered.resolve(); await finish.promise; } });
+  const dispatcher = createTelegramActivityDispatcher({ captureDrain: () => () => {
+    assert.equal(dispatcher.hasPending?.(), false); notifications++;
+  } });
+  try {
+    dispatcher.dispatch(createEvent("agent-end")); await entered.promise;
+    dispatcher.dispatch(createEvent("agent-settled", 2));
+    assert.equal(notifications, 0);
+    if (stop) dispatcher.stop();
+    finish.resolve(); await waitForActivityDispatch();
+    assert.equal(notifications, stop ? 0 : 1);
+  } finally { finish.resolve(); dispatcher.stop(); unregister(); }
+});
+
 test("Live work publication observation includes reservations, queued/running tails, failure and reset", async () => {
   const publication = createTelegramActivityPublicationRuntime();
   assert.equal(publication.hasPending(), false);

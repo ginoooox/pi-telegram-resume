@@ -751,6 +751,13 @@ export declare function isTelegramThreadCleanupJournalNamespaceClear(input: Tele
         }[];
     };
 }): boolean;
+/** Demand-driven recovery only; caller holds temporary-cleanup admission. Never a deletion grant. */
+export declare function recoverTelegramThreadCleanupDeadQueueOwners(input: Parameters<typeof isTelegramThreadCleanupJournalNamespaceClear>[0] & {
+    recoveryOwner: TelegramUpdateJournalQueueOwnerIdentity;
+    isCurrent: () => boolean;
+    withSourceSerialization: NonNullable<TelegramUpdateJournalStoreOptions["withSourceSerialization"]>;
+    getQueueProcessLiveness?: TelegramUpdateJournalStoreOptions["getQueueProcessLiveness"];
+}): number;
 export declare function publishTelegramUpdateJournalSegment(path: string, segment: TelegramUpdateJournalSegment): TelegramUpdateJournalSegmentPublicationResult;
 export declare function createTelegramUpdateQueueHandoffToken(): string;
 export declare function createTelegramUpdateJournalBotIdentity(input: {

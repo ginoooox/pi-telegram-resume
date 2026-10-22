@@ -6,6 +6,16 @@
 
 type MaybePromise<T> = T | Promise<T>;
 
+/**
+ * Structural port for run-collapsing diagnostics: a repeated identical failure extends its run instead of logging
+ * again, and the closing success records one outcome. The composition root owns the collapsed implementation.
+ */
+export interface TelegramRepeatedFailureLogPort {
+  record: (error: unknown, details?: Record<string, unknown>) => void;
+  settled: () => void;
+  reset: () => void;
+}
+
 export interface TelegramPollingConfig {
   botToken?: string;
 }
@@ -682,6 +692,8 @@ export interface TelegramStartupThreadCapabilityProbeDeps extends TelegramThread
 export interface TelegramThreadCapabilityRuntimeDeps<
   TContext,
 > extends TelegramThreadCapabilityReaderDeps {
+  /** Collapses one sustained probe failure run; the caller supplies its owner. */
+  failureLog: TelegramRepeatedFailureLogPort;
   lifecycle?: TelegramThreadCapabilityLifecycle;
   topicTargetStore: TelegramThreadCapabilityStore;
   ownsLock: (ctx: TContext) => boolean;
@@ -757,6 +769,7 @@ export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
   registerFollowerWithOwner: (
     ctx: TContext,
     owner: TOwner,
+    options?: { recoverConnection?: boolean },
   ) => Promise<boolean | undefined>;
   restoreFollowerWithOwner: (
     ctx: TContext,
@@ -776,6 +789,7 @@ export interface TelegramThreadAwarePollingControls<TContext, TOwner> {
   registerFollowerWithLeader: (
     ctx: TContext,
     owner: TOwner,
+    options?: { recoverConnection?: boolean },
   ) => Promise<boolean | undefined>;
   restoreFollowerWithLeader?: (
     ctx: TContext,
@@ -801,6 +815,8 @@ export interface TelegramThreadCapabilityOrchestrationDeps<TContext, TOwner>
   extends
     TelegramThreadCapabilityReaderDeps,
     TelegramThreadAwarePollingControls<TContext, TOwner> {
+  /** Collapses one sustained probe failure run; the composition root supplies its owner. */
+  failureLog: TelegramRepeatedFailureLogPort;
   state: TelegramThreadCapabilityStateRuntime;
   topicTargetStore: TelegramThreadCapabilityStore;
   ownsLock: (ctx: TContext) => boolean;
@@ -880,6 +896,7 @@ export function createTelegramThreadCapabilityOrchestration<TContext, TOwner>(
     isTopicModeUnavailableError: deps.isTopicModeUnavailableError,
     updateStatus: deps.updateStatus,
     recordEvent: deps.recordEvent,
+    failureLog: deps.failureLog,
   };
   return {
     monitor: createTelegramThreadCapabilityMonitor(capabilityDeps),
@@ -1180,9 +1197,10 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
   const registerFollowerWithOwner = async (
     ctx: TContext,
     owner: TOwner,
+    options?: { recoverConnection?: boolean },
   ): Promise<boolean | undefined> => {
     if (!(await refreshFollowerState())) return undefined;
-    return deps.registerFollowerWithLeader(ctx, owner);
+    return deps.registerFollowerWithLeader(ctx, owner, options);
   };
   const restoreFollowerWithOwner = async (
     ctx: TContext,
@@ -1266,8 +1284,34 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
   let generation = 0;
   let transitionPromise: Promise<void> | undefined;
   let consecutiveDisabledProbes = 0;
+  // An absent leader endpoint repeats one identical probe failure every interval; the port collapses the run.
+  // Running it through one guard keeps a faulty diagnostics port from breaking probes or the interval callback.
+  const capabilityFailureLog: TelegramRepeatedFailureLogPort = {
+    record(error, details) {
+      try {
+        deps.failureLog.record(error, details);
+      } catch {
+        // Monitor diagnostics cannot create an uncaught interval exception.
+      }
+    },
+    settled() {
+      try {
+        deps.failureLog.settled();
+      } catch {
+        // Monitor diagnostics cannot fail a completed probe.
+      }
+    },
+    reset() {
+      try {
+        deps.failureLog.reset();
+      } catch {
+        // Monitor diagnostics cannot fail a monitor stop.
+      }
+    },
+  };
   const stop = (): void => {
     generation += 1;
+    capabilityFailureLog.reset();
     if (interval) clearInterval(interval);
     interval = undefined;
     deps.lifecycle?.invalidate();
@@ -1284,6 +1328,7 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
     tracked = readTelegramThreadCapability(deps)
       .then(async (threadModeEnabled) => {
         if (!isCurrent()) return;
+        capabilityFailureLog.settled();
         if (threadModeEnabled === undefined) {
           if (
             deps.topicTargetStore.getBotState().threadMode !== "enabled" &&
@@ -1303,7 +1348,9 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
         if (threadModeEnabled) consecutiveDisabledProbes = 0;
         const botState = deps.topicTargetStore.getBotState();
         const current = botState.threadMode;
-        if (threadModeEnabled && current === "enabled") return;
+        // Persisted capability is not proof that this owner started its local bus.
+        if (threadModeEnabled && current === "enabled" &&
+            (deps.getPollingStartedWithTelegramBus() || !deps.ownsLock(ctx))) return;
         if (!threadModeEnabled && current === "disabled") {
           if (
             !deps.ownsLock(ctx) ||
@@ -1352,11 +1399,7 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
       })
       .catch((error) => {
         if (!isCurrent()) return;
-        try {
-          deps.recordEvent("bus", error, { phase: "capability-monitor" });
-        } catch {
-          // Monitor diagnostics cannot create an unhandled interval rejection.
-        }
+        capabilityFailureLog.record(error);
       })
       .finally(() => {
         if (transitionPromise === tracked) transitionPromise = undefined;
@@ -1366,6 +1409,8 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
   return {
     start(ctx) {
       stop();
+      // Disabled-mode confirmation counts consecutive probes of one run, never observations from before a restart.
+      consecutiveDisabledProbes = 0;
       const expectedGeneration = generation;
       interval = setInterval(() => {
         if (generation !== expectedGeneration) return;
@@ -1377,11 +1422,7 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
           } catch {
             /* Timer shutdown must not escape the callback. */
           }
-          try {
-            deps.recordEvent("bus", error, { phase: "capability-monitor" });
-          } catch {
-            // Monitor diagnostics cannot create an uncaught interval exception.
-          }
+          capabilityFailureLog.record(error);
         }
       }, intervalMs);
       interval.unref?.();

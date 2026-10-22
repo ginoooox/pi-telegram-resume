@@ -4,8 +4,8 @@
  * Wraps the direct Telegram Bot API runtime so follower instances can route outbound calls through the bus leader
  */
 import { type TelegramBusSelectedMenuDeliveryObservation, type TelegramBusSelectedMenuTextEffect } from "./bus.ts";
-import type { TelegramBridgeApiRuntime } from "./telegram-api.ts";
-export type TelegramBusApiCall = (method: string, args: unknown[]) => Promise<unknown>;
+import type { TelegramApiCallOptions, TelegramBridgeApiRuntime } from "./telegram-api.ts";
+export type TelegramBusApiCall = (method: string, args: unknown[], localOptions?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<unknown>;
 export interface TelegramBusAwareApiRuntimeDeps {
     directRuntime: TelegramBridgeApiRuntime;
     ownsDirect: () => boolean;

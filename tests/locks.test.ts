@@ -1910,6 +1910,7 @@ test("Locked polling runtime prevents inherited child sessions from polling the 
 
 test("Locked polling runtime registers as follower when another live owner blocks start", async () => {
   const temp = createTempLockPath();
+  const recovery: boolean[] = [];
   try {
     const events: string[] = [];
     writeFileSync(
@@ -1931,7 +1932,8 @@ test("Locked polling runtime registers as follower when another live owner block
     const runtime = createTelegramLockedPollingRuntime({
       lock,
       hasBotToken: () => true,
-      registerFollowerWithOwner: async (ctx, owner) => {
+      registerFollowerWithOwner: async (ctx, owner, options) => {
+        recovery.push(options?.recoverConnection === true);
         events.push(
           `register:${ctx.cwd}:${owner.instanceId}:${owner.busSocketPath}`,
         );
@@ -1955,6 +1957,9 @@ test("Locked polling runtime registers as follower when another live owner block
       `register:/repo:owner-inst:${join(temp.dir, "bus.sock")}`,
       "status",
     ]);
+    assert.deepEqual(recovery, [false]);
+    assert.equal((await runtime.start({ cwd: "/repo" }, { forceFreshLeaderThread: true })).ok, true);
+    assert.deepEqual(recovery, [false, true]);
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }

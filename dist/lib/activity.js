@@ -116,10 +116,28 @@ function coalesceActivityEvents(previous, next) {
     }
     return next;
 }
+/** Optional observation must not change queue/transport settlement. */
+function captureActivityDrainObserver(capture) {
+    try {
+        const notify = capture?.();
+        return () => {
+            try {
+                const emitted = notify?.();
+                if (emitted)
+                    void Promise.resolve(emitted).catch(() => undefined);
+            }
+            catch { /* Observer failure is inert. */ }
+        };
+    }
+    catch {
+        return () => { };
+    }
+}
 /** @internal */
 export function createTelegramActivityDispatcher(deps = {}) {
     const queues = new Map();
     let stopped = false;
+    const hasPending = () => Array.from(queues.values()).some(queue => queue.active && (queue.running || queue.events.length > 0));
     const drain = async (queue) => {
         if (queue.running || !queue.active)
             return;
@@ -146,10 +164,12 @@ export function createTelegramActivityDispatcher(deps = {}) {
         }
         finally {
             queue.running = false;
+            if (!stopped && !hasPending())
+                queue.notifyDrained?.();
         }
     };
     return {
-        hasPending: () => Array.from(queues.values()).some((queue) => queue.active && (queue.running || queue.events.length > 0)),
+        hasPending,
         dispatch(event) {
             if (stopped)
                 return;
@@ -164,6 +184,8 @@ export function createTelegramActivityDispatcher(deps = {}) {
                     };
                     queues.set(registration.id, queue);
                 }
+                if (!queue.running && queue.events.length === 0)
+                    queue.notifyDrained = captureActivityDrainObserver(deps.captureDrain);
                 const previous = queue.events.at(-1);
                 if (previous && canCoalesceActivityEvents(previous, event)) {
                     queue.events[queue.events.length - 1] = coalesceActivityEvents(previous, event);
@@ -198,6 +220,7 @@ export function createTelegramActivityBridgeRuntime(deps) {
             runtime = createTelegramActivityRuntime({
                 generation: `${deps.generation}:${++generationSequence}`,
                 dispatcher: createTelegramActivityDispatcher({
+                    captureDrain: deps.captureDrain,
                     recordFailure: deps.recordFailure,
                 }),
                 observeEvent: deps.observeEvent,
@@ -470,13 +493,14 @@ export function createTelegramActivityRuntime(deps) {
         },
     };
 }
-export function createTelegramActivityPublicationRuntime() {
+export function createTelegramActivityPublicationRuntime(deps = {}) {
     let generation = 0;
     let tail = Promise.resolve();
     let outstanding = 0, unconfirmed = false;
     const pending = new Set();
     const reserve = () => {
         const admittedGeneration = generation;
+        const notifyDrained = captureActivityDrainObserver(deps.captureDrain);
         let state = "pending";
         let resolve;
         const ready = new Promise((accept) => {
@@ -499,6 +523,8 @@ export function createTelegramActivityPublicationRuntime() {
         })
             .finally(() => {
             outstanding -= 1;
+            if (admittedGeneration === generation && outstanding === 0 && !unconfirmed)
+                notifyDrained();
         });
         tail = result.catch(() => { });
         return {
@@ -522,6 +548,7 @@ export function createTelegramActivityPublicationRuntime() {
         hasUnconfirmed: () => unconfirmed,
         beginWork() {
             const admittedGeneration = generation;
+            const notifyDrained = captureActivityDrainObserver(deps.captureDrain);
             let settled = false;
             outstanding += 1;
             return {
@@ -532,6 +559,8 @@ export function createTelegramActivityPublicationRuntime() {
                     outstanding -= 1;
                     if (outcome === "unconfirmed" && admittedGeneration === generation)
                         unconfirmed = true;
+                    if (admittedGeneration === generation && outstanding === 0 && !unconfirmed)
+                        notifyDrained();
                 },
             };
         },

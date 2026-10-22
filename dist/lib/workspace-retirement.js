@@ -46,27 +46,41 @@ export function captureTelegramWorkspaceJournalProtectionSources(input) {
     let complete = input.binding.journalBindingsComplete === true ||
         input.discovery?.complete === true;
     const capture = (scope, resolve) => {
+        const sharedKey = scope.kind === "shared"
+            ? "shared"
+            : scope.kind === "discovered"
+                ? `discovered:${scope.path}`
+                : undefined;
+        let source = sharedKey === undefined
+            ? undefined
+            : input.sharedSourceReads?.get(sharedKey);
+        if (!source) {
+            source = readSource(scope, resolve);
+            if (sharedKey !== undefined)
+                input.sharedSourceReads?.set(sharedKey, source);
+        }
+        if (source.kind === "unknown")
+            complete = false;
+        sources.push(source);
+    };
+    const readSource = (scope, resolve) => {
         try {
             const binding = resolve();
-            if (!binding) {
-                complete = false;
-                sources.push({ kind: "unknown", scope });
-                return;
-            }
+            if (!binding)
+                return { kind: "unknown", scope };
             const read = binding.readForProtection ?? binding.journal.read;
             const snapshot = input.withJournalReference
                 ? input.withJournalReference(binding, read)
                 : read();
-            sources.push({
+            return {
                 kind: "available",
                 scope,
                 entries: snapshot.entries,
                 ...(snapshot.exists === undefined ? {} : { exists: snapshot.exists }),
-            });
+            };
         }
         catch {
-            complete = false;
-            sources.push({ kind: "unknown", scope });
+            return { kind: "unknown", scope };
         }
     };
     capture({ kind: "shared" }, input.resolveLeader);
@@ -292,8 +306,38 @@ export function captureTelegramWorkspaceExternalProtection(input) {
 }
 /** Shared read-only observer: protection and metadata pruning use the same scoped evidence path. */
 export function createTelegramWorkspaceProtectionObserver(deps) {
+    // One occupancy snapshot probes every binding synchronously; namespace and shared/discovered
+    // journal reads are binding-independent, so read them once per snapshot instead of per binding.
+    // Never widen this beyond one synchronous capture: post-fence rechecks need fresh evidence.
+    let snapshot;
+    const inspectNamespace = () => {
+        if (!snapshot)
+            return deps.inspectJournalNamespace?.();
+        if (!snapshot.namespace) {
+            try {
+                snapshot.namespace = { value: deps.inspectJournalNamespace?.() };
+            }
+            catch (error) {
+                snapshot.namespace = { error };
+            }
+        }
+        if ("error" in snapshot.namespace)
+            throw snapshot.namespace.error;
+        return snapshot.namespace.value;
+    };
+    const withSnapshot = (run) => {
+        if (snapshot)
+            return run();
+        snapshot = { reads: new Map() };
+        try {
+            return run();
+        }
+        finally {
+            snapshot = undefined;
+        }
+    };
     const captureJournalSources = (candidate) => {
-        const namespace = deps.inspectJournalNamespace?.();
+        const namespace = inspectNamespace();
         if (deps.inspectJournalNamespace &&
             (!namespace ||
                 namespace.sources.filter((source) => source.role === "polling")
@@ -332,9 +376,10 @@ export function createTelegramWorkspaceProtectionObserver(deps) {
                     },
                 }
                 : {}),
+            ...(snapshot ? { sharedSourceReads: snapshot.reads } : {}),
         });
     };
-    const capture = function (binding, options) {
+    const captureOne = function (binding, options) {
         return captureTelegramWorkspaceExternalProtection({
             binding,
             requireBindingProvenance: options?.requireBindingProvenance,
@@ -384,7 +429,7 @@ export function createTelegramWorkspaceProtectionObserver(deps) {
         });
     };
     return {
-        capture,
+        capture: Object.assign(captureOne, { withSnapshot }),
         captureJournalSources,
         getJournalWriterProtection: deps.getJournalWriterProtection ?? (() => "unknown"),
     };

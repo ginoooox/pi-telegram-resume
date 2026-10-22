@@ -1,6 +1,6 @@
 /**
  * Regression tests for Telegram runtime JSONL diagnostics log
- * Covers session-local reset, scope changes, and append-only event evidence
+ * Covers session-local reset, scope changes, append-only event evidence, and collapsed failure runs
  */
 
 import assert from "node:assert/strict";
@@ -13,8 +13,10 @@ import test from "node:test";
 import { runNodeEval } from "./fixtures/node-eval.ts";
 import { resolveTelegramRuntimeLogPath, resolveTelegramPreviousSharedRuntimeLogPath, resolveTelegramRuntimeDir, resolveTelegramRuntimeLogsDir } from "../lib/paths.ts";
 import {
+  createTelegramFailureRunLog,
   createTelegramRuntimeJsonlLog,
   createTelegramRuntimeDiagnosticsRuntime,
+  getTelegramFailureSignature,
   getTelegramPreviousRuntimeLogPath,
   getTelegramRuntimeLogPath,
 } from "../lib/logging.ts";
@@ -647,4 +649,122 @@ test("Runtime JSONL log keeps previous logs per active profile path", async () =
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+function createFailureRunFixture(options: { nowMs?: () => number } = {}) {
+  const events: Array<{
+    category: string;
+    messageOrError: unknown;
+    details: Record<string, unknown>;
+  }> = [];
+  const log = createTelegramFailureRunLog({
+    category: "bus",
+    failurePhase: "fixture-phase",
+    outcomePhase: "fixture-phase-recovered",
+    label: "fixture probe",
+    context: () => ({ profile: "default" }),
+    ...(options.nowMs ? { getNowMs: options.nowMs } : {}),
+    record: (category, messageOrError, details) =>
+      events.push({ category, messageOrError, details }),
+  });
+  return { log, events, phases: () => events.map((event) => event.details.phase) };
+}
+
+test("Repeated identical failures collapse into one record and one outcome", () => {
+  let nowMs = 1000;
+  const fixture = createFailureRunFixture({ nowMs: () => nowMs });
+  const error = Object.assign(new Error("connect ENOENT /run/bus.sock"), {
+    code: "ENOENT",
+  });
+
+  assert.equal(fixture.log.record(error, { chatId: 7 }), true);
+  nowMs += 1000;
+  assert.equal(fixture.log.record(error, { chatId: 7 }), false);
+  nowMs += 1000;
+  assert.equal(fixture.log.record(error, { chatId: 7 }), false);
+  assert.deepEqual(fixture.phases(), ["fixture-phase"]);
+  assert.deepEqual(fixture.events[0]?.details, {
+    profile: "default",
+    chatId: 7,
+    phase: "fixture-phase",
+    failureSignature: "ENOENT",
+  });
+  assert.equal(fixture.events[0]?.category, "bus");
+  assert.equal(fixture.events[0]?.messageOrError, error);
+
+  nowMs += 3000;
+  assert.deepEqual(fixture.log.settled(), {
+    signature: "ENOENT",
+    failedAttempts: 3,
+    suppressedFailures: 2,
+    failedForMs: 5000,
+  });
+  assert.deepEqual(fixture.phases(), ["fixture-phase", "fixture-phase-recovered"]);
+  assert.deepEqual(fixture.events[1]?.details, {
+    profile: "default",
+    chatId: 7,
+    phase: "fixture-phase-recovered",
+    failureSignature: "ENOENT",
+    failedAttempts: 3,
+    suppressedFailures: 2,
+    failedForMs: 5000,
+  });
+  assert.match(String(fixture.events[1]?.messageOrError), /recovered after 3 failed attempts/u);
+  // A closed run cannot report a second outcome.
+  assert.equal(fixture.log.settled(), undefined);
+  assert.equal(fixture.phases().length, 2);
+});
+
+test("A changed failure kind opens a new run that names the one it superseded", () => {
+  let nowMs = 1000;
+  const fixture = createFailureRunFixture({ nowMs: () => nowMs });
+  const connectionError = Object.assign(new Error("connect ENOENT"), { code: "ENOENT" });
+  const timeoutError = new Error("Telegram bus transport timed out.");
+
+  fixture.log.record(connectionError);
+  nowMs += 500;
+  fixture.log.record(connectionError);
+  assert.equal(fixture.log.record(timeoutError), true);
+  assert.deepEqual(fixture.phases(), ["fixture-phase", "fixture-phase"]);
+  assert.equal(getTelegramFailureSignature(connectionError), "ENOENT");
+  assert.equal(getTelegramFailureSignature(timeoutError), "Telegram bus transport timed out.");
+  assert.deepEqual(fixture.events[1]?.details, {
+    profile: "default",
+    phase: "fixture-phase",
+    failureSignature: "Telegram bus transport timed out.",
+    previousFailureSignature: "ENOENT",
+    previousFailedAttempts: 2,
+    previousFailedForMs: 500,
+  });
+  // The superseded run still closes with its own outcome.
+  assert.equal(fixture.log.settled()?.failedAttempts, 1);
+});
+
+test("Reset ends a run without an outcome record and a later failure logs again", () => {
+  const fixture = createFailureRunFixture();
+  const error = Object.assign(new Error("connect ENOENT"), { code: "ENOENT" });
+
+  fixture.log.record(error);
+  fixture.log.record(error);
+  fixture.log.reset();
+  assert.equal(fixture.log.settled(), undefined);
+  fixture.log.record(error);
+  assert.deepEqual(fixture.phases(), ["fixture-phase", "fixture-phase"]);
+});
+
+test("A failed diagnostic sink never converts a failure into another failure", () => {
+  const log = createTelegramFailureRunLog({
+    category: "bus",
+    failurePhase: "fixture-phase",
+    outcomePhase: "fixture-phase-recovered",
+    label: "fixture probe",
+    record: () => {
+      throw new Error("diagnostic sink failed");
+    },
+  });
+  const error = new Error("connect ENOENT");
+  assert.equal(log.record(error), true);
+  assert.equal(log.record(error), false);
+  assert.equal(log.settled()?.failedAttempts, 2);
+  assert.equal(log.settled(), undefined);
 });

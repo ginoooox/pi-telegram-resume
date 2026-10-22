@@ -1,1 +1,3 @@
 node_modules/
+# Local maintainer/operator context is not publication-authorized.
+/docs/prompt-overlay-design.md

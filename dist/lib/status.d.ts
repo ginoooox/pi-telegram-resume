@@ -6,7 +6,7 @@
  */
 /** UI copy is allowlisted; raw exception text belongs only in redacted diagnostics. */
 export declare function formatTelegramConnectionFailure(error: unknown): string;
-export type TelegramStatusQueueLane = "control" | "priority" | "default";
+export type TelegramStatusQueueLane = "control" | "steer" | "priority" | "default";
 export interface TelegramUsageStats {
     totalInput: number;
     totalOutput: number;
@@ -345,7 +345,6 @@ export interface TelegramBridgeStatusRuntimeDeps<TQueueItem extends {
     hasPendingModelSwitch: () => boolean;
     getQueuedItems: () => TQueueItem[];
     getQueuedItemCount?: (items: TQueueItem[]) => number;
-    formatQueuedStatus: (items: TQueueItem[]) => string;
     getRecentRuntimeEvents: () => TelegramRuntimeEvent[];
     getRuntimeLockState?: () => string;
     getBusRole?: () => TelegramBridgeBusRole | undefined;

@@ -1,6 +1,7 @@
 /**
  * Regression tests for Telegram status helpers
  * Covers runtime diagnostics lines and recent-event redaction/ring-buffer behavior
+ * Zones: telegram ui, pi agent diagnostics, tui
  */
 
 import assert from "node:assert/strict";
@@ -8,6 +9,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import * as Queue from "../lib/queue.ts";
 import { createTelegramLockRuntime, mutateTelegramRuntimeStateSection, readTelegramRuntimeState } from "../lib/locks.ts";
 
 import {
@@ -1074,7 +1076,6 @@ test("Bridge status runtime excludes active work from the waiting count", () => 
     getActiveToolExecutions: () => 1,
     hasPendingModelSwitch: () => false,
     getQueuedItems: () => [{ queueLane: "default" as const }],
-    formatQueuedStatus: () => "",
     getRecentRuntimeEvents: () => [],
   });
   runtime.updateStatus({
@@ -1093,6 +1094,51 @@ test("Bridge status runtime excludes active work from the waiting count", () => 
   );
 });
 
+test("Bridge status totals all waiting lanes in one yellow counter using Queue executability", () => {
+  const prompt = (queueLane: Queue.TelegramQueueLane, extra: Partial<Queue.PendingTelegramTurn> = {}): Queue.PendingTelegramTurn => ({
+    kind: "prompt", chatId: 1, replyToMessageId: 10, queueOrder: 1, laneOrder: 1, queueLane,
+    statusSummary: "prompt", sourceMessageIds: [10], queuedAttachments: [],
+    content: [{ type: "text", text: "prompt" }], historyText: "prompt", ...extra,
+  });
+  const normal = prompt("default"), priority = prompt("priority"), steer = prompt("steer");
+  const frozen = prompt("steer", { steerAttempted: true });
+  const pendingPacket = prompt("steer", { steerAttempted: true, steerPacketTail: [frozen] });
+  const control: Queue.PendingTelegramControlItem = {
+    kind: "control", queueLane: "control", queueOrder: 0, laneOrder: 0, chatId: 1,
+    replyToMessageId: 9, statusSummary: "status", controlType: "status", execute: async () => {},
+  };
+  const cases: { items: Queue.TelegramQueueItem[]; pending?: boolean; suffix: string }[] = [
+    { items: [], suffix: "" },
+    { items: [normal, priority], suffix: "<warning> +2</warning>" },
+    { items: [steer], suffix: "<warning> +1</warning>" },
+    { items: [steer, priority, normal], suffix: "<warning> +3</warning>" },
+    { items: [control, normal, steer], suffix: "<warning> +3</warning>" },
+    { items: [normal, priority, steer], pending: true, suffix: "<warning> +2</warning>" },
+    { items: [pendingPacket, frozen, normal, steer], pending: true, suffix: "<warning> +2</warning>" },
+    { items: [prompt("default", { reactionSuppressionEmoji: "👎" }),
+      prompt("priority", { reactionSuppressionEmoji: "👎" }),
+      prompt("steer", { reactionSuppressionEmoji: "👎" }), frozen], suffix: "" },
+  ];
+  for (const { items, pending = false, suffix } of cases) {
+    const before = JSON.stringify(items);
+    let rendered = "";
+    const runtime = createTelegramBridgeStatusRuntime({
+      getConfig: () => ({ botToken: "token", allowedUserId: 7 }), isPollingActive: () => true,
+      getActiveSourceMessageIds: () => [99], hasActiveTurn: () => true,
+      hasDispatchPending: () => pending, isCompactionInProgress: () => true,
+      getActiveToolExecutions: () => 1, hasPendingModelSwitch: () => false,
+      getQueuedItems: () => items, getQueuedItemCount: Queue.countExecutableTelegramQueueItems,
+      getRecentRuntimeEvents: () => [],
+    });
+    runtime.updateStatus({ ui: {
+      theme: { fg: (token: string, text: string) => `<${token}>${text}</${token}>` },
+      setStatus: (_key: string, text: string) => { rendered = text; },
+    } });
+    assert.equal(rendered, `<accent>telegram</accent> <success>connected</success>${suffix}`);
+    assert.equal(JSON.stringify(items), before, "Status projection never mutates queued work");
+  }
+});
+
 test("Persistent polling conflict remains visible across ordinary refreshes until transport recovers", () => {
   let stopReason: string | undefined = "persistent-conflict";
   let busRole: "follower" | undefined;
@@ -1107,7 +1153,7 @@ test("Persistent polling conflict remains visible across ordinary refreshes unti
     getActiveSourceMessageIds: () => undefined, hasActiveTurn: () => false,
     hasDispatchPending: () => false, isCompactionInProgress: () => false,
     getActiveToolExecutions: () => 0, hasPendingModelSwitch: () => false,
-    getQueuedItems: () => [], formatQueuedStatus: () => "", getRecentRuntimeEvents: () => [],
+    getQueuedItems: () => [], getRecentRuntimeEvents: () => [],
   });
   const ctx = { ui: {
     theme: { fg: (_token: string, text: string) => text },
@@ -1142,7 +1188,6 @@ test("Bridge status runtime excludes skipped items from queued processing", () =
     hasPendingModelSwitch: () => false,
     getQueuedItems: () => [{ queueLane: "default" as const }],
     getQueuedItemCount: () => 0,
-    formatQueuedStatus: () => "",
     getRecentRuntimeEvents: () => [],
   });
   runtime.updateStatus({
@@ -1177,7 +1222,6 @@ test("Bridge status runtime builds status state from live ports", () => {
     getActiveToolExecutions: () => 3,
     hasPendingModelSwitch: () => true,
     getQueuedItems: () => [{ queueLane: "control" as const }],
-    formatQueuedStatus: () => " +1",
     getRecentRuntimeEvents: () => [
       { at: 1000, category: "api", message: "ok" },
     ],
@@ -1283,7 +1327,6 @@ test("Bridge status honors caller-resolved token availability and diagnostics", 
     getActiveToolExecutions: () => 0,
     hasPendingModelSwitch: () => false,
     getQueuedItems: () => [],
-    formatQueuedStatus: () => "",
     getRecentRuntimeEvents: () => [],
   });
   runtime.updateStatus({
@@ -1316,7 +1359,6 @@ test("Bridge status falls back to raw token presence without a resolved flag", (
     getActiveToolExecutions: () => 0,
     hasPendingModelSwitch: () => false,
     getQueuedItems: () => [],
-    formatQueuedStatus: () => "",
     getRecentRuntimeEvents: () => [],
   });
   runtime.updateStatus({
@@ -1588,6 +1630,20 @@ test("Bridge status lines include local bus diagnostics", () => {
       "- follower endpoint [pipe]: \\\\.\\pipe\\pi-telegram-demo-follower",
     ),
   );
+});
+
+test("Bridge status counts Steer without changing legacy empty-lane copy", () => {
+  const state = {
+    pollingActive: false, pendingDispatch: false, compactionInProgress: false,
+    activeToolExecutions: 0, pendingModelSwitch: false,
+    queuedItems: [{ queueLane: "steer" as const }, { queueLane: "priority" as const }],
+    recentRuntimeEvents: [],
+  };
+  assert.ok(buildTelegramBridgeStatusLines(state).includes(
+    "- queued turns: 2 (control=0, steer=1, priority=1, default=0)"));
+  assert.ok(buildTelegramBridgeStatusLines(state, { verbose: true }).includes(
+    "- lanes: control=0, steer=1, priority=1, default=0"));
+  assert.ok(!buildTelegramBridgeStatusLines({ ...state, queuedItems: [] }).join("\n").includes("steer="));
 });
 
 test("Bridge status lines include queue lanes and recent runtime events", () => {

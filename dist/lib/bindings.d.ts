@@ -57,17 +57,18 @@ export interface TelegramQueueBindingRuntime<TContext> {
     requestNextDispatchAnnouncement: () => void;
     cancelNextDispatchAnnouncement: () => void;
     watchdog: Queue.TelegramQueueDispatchWatchdogRuntime<TContext>;
+    onTurnEnd: (event: Pick<Pi.TurnEndEvent, "turnIndex" | "outcome">, ctx: TContext) => Pi.TurnEndEventResult | undefined;
 }
 export declare function createTelegramQueueBindingRuntime<TContext>(deps: {
     store: Queue.TelegramQueueStateStore<TContext>;
     queue: Pick<Runtime.TelegramBridgeRuntime["queue"], "allocateItemOrder">;
-    lifecycle: Pick<Runtime.TelegramBridgeRuntime["lifecycle"], "isCompactionInProgress" | "hasDispatchPending">;
-    activeTurn: Pick<Queue.TelegramActiveTurnStore, "has">;
+    lifecycle: Pick<Runtime.TelegramBridgeRuntime["lifecycle"], "isCompactionInProgress" | "hasDispatchPending"> & Partial<Pick<Runtime.TelegramBridgeRuntime["lifecycle"], "getActiveToolExecutions">>;
+    activeTurn: Pick<Queue.TelegramActiveTurnStore, "has"> & Partial<Pick<Queue.TelegramActiveTurnStore, "get">>;
     admission: {
         getSettlement: () => {
             onItemsDiscarded: (items: readonly Queue.TelegramQueueItem<TContext>[], ctx: TContext) => boolean;
             isItemReady: (item: Queue.TelegramQueueItem<TContext>) => boolean;
-            onPromptHandedOff?: (item: Queue.PendingTelegramTurn, ctx: TContext) => boolean;
+            onPromptHandedOff?: (item: Pick<Queue.PendingTelegramTurn, "admissionReceipts">, ctx: TContext) => boolean;
             onControlSettled: (item: Queue.PendingTelegramControlItem<TContext>, ctx: TContext) => void;
         } | undefined;
         hasPendingQueueMutationForItem: (item: Queue.TelegramQueueItem<TContext>) => boolean;
@@ -77,6 +78,8 @@ export declare function createTelegramQueueBindingRuntime<TContext>(deps: {
     promptDispatch: Runtime.TelegramPromptDispatchRuntime<TContext>;
     isIdle: (ctx: TContext) => boolean;
     hasPendingMessages: (ctx: TContext) => boolean;
+    isContextCurrent?: (ctx: TContext) => boolean;
+    isContextAborted?: (ctx: TContext) => boolean;
     updateStatus: (ctx: TContext, error?: string) => void;
     sendTextReply: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendTextReply"];
     sendUserMessage: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendUserMessage"];
@@ -177,6 +180,7 @@ export interface TelegramActivityBindingRuntime {
 /** Compose public activity fanout, verbosity, and assistant output ordering. */
 export declare function createTelegramActivityBindingRuntime<TTransportStamp>(deps: {
     generation: string;
+    captureDrain?: () => (() => void) | undefined;
     assistantOutput: Omit<Parameters<typeof createTelegramAssistantOutputBindingRuntime<TTransportStamp>>[0], "waitForActivityIdle" | "enqueue">;
     activityVerbosity: Omit<Parameters<typeof ActivityVerbosity.createTelegramActivityVerbosityRuntime<TelegramAssistantOutputAuthority<TTransportStamp>>>[0], "captureAuthority" | "isAuthorityActive" | "recordFailure" | "enqueue">;
 }): TelegramActivityBindingRuntime;
@@ -265,14 +269,16 @@ interface TelegramLifecycleBindingDeps {
     shutdownGenerativeAppLiveSurfaces?: () => void;
     resolveAutomaticThreadCleanupEnabled?: () => boolean | Promise<boolean>;
     buttonActionStore: OutboundHandlers.TelegramButtonActionStore;
-    callMultipart: OutboundHandlers.TelegramVoiceReplySenderDeps["sendMultipart"];
+    callMultipart: (...args: Parameters<TelegramApi.TelegramBridgeApiRuntime["callMultipart"]>) => Promise<unknown>;
     sendChatAction: NonNullable<OutboundHandlers.TelegramVoiceReplySenderDeps["sendChatAction"]>;
     sendRecordVoiceAction: NonNullable<OutboundHandlers.TelegramVoiceReplySenderDeps["sendRecordVoiceAction"]>;
     sendMarkdownReply: Queue.TelegramAgentEndHookRuntimeDeps<Queue.PendingTelegramTurn, Pi.ExtensionContext, Pi.AgentEndEvent["messages"][number], Keyboard.TelegramInlineKeyboardMarkup>["sendMarkdownReply"];
     sendTextReply: Queue.TelegramAgentEndHookRuntimeDeps<Queue.PendingTelegramTurn, Pi.ExtensionContext, Pi.AgentEndEvent["messages"][number], Keyboard.TelegramInlineKeyboardMarkup>["sendTextReply"] & NonNullable<OutboundHandlers.TelegramVoiceReplySenderDeps["sendTextReply"]>;
     dispatchNextQueuedTelegramTurn: (ctx: Pi.ExtensionContext) => void;
+    onSteerTurnEnd?: TelegramQueueBindingRuntime<Pi.ExtensionContext>["onTurnEnd"];
     onPromptHandedOff?: (turn: Queue.PendingTelegramTurn, ctx: Pi.ExtensionContext) => void;
     answerGuestQuery: TelegramApi.TelegramBridgeApiRuntime["answerGuestQuery"];
+    editGuestInlineMessage?: TelegramApi.TelegramBridgeApiRuntime["editGuestInlineMessage"];
     deleteMessage: TelegramApi.TelegramBridgeApiRuntime["deleteMessage"];
     sendGuestReply: NonNullable<Queue.TelegramAgentEndHookRuntimeDeps<Queue.PendingTelegramTurn, Pi.ExtensionContext, Pi.AgentEndEvent["messages"][number], Keyboard.TelegramInlineKeyboardMarkup>["sendGuestReply"]>;
     editGuestReply?: Queue.TelegramAgentEndHookRuntimeDeps<Queue.PendingTelegramTurn, Pi.ExtensionContext, Pi.AgentEndEvent["messages"][number], Keyboard.TelegramInlineKeyboardMarkup>["editGuestReply"];
@@ -288,11 +294,12 @@ interface TelegramLifecycleBindingDeps {
     }) => void;
     canSendAgentActivity: (ctx: Pi.ExtensionContext) => boolean;
     isSessionContextActive: (ctx: Pi.ExtensionContext) => boolean;
+    getSessionGeneration?: () => number;
     isTurnTransportActive?: (turn: Queue.PendingTelegramTurn) => boolean;
     updateStatus: TelegramBridgeStatusUpdater;
     recordRuntimeEvent: TelegramRuntimeEventRecorder;
     /** Settled-session hint for owners that wait on agent idleness, such as old-tab cleanup after a live rebind. */
     onSessionSettled?: (ctx: Pi.ExtensionContext) => void;
 }
-export declare function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, activityRuntime, activityVerbosityRuntime, diagnostics, assistantOutputRuntime, sessionLifecycleRuntime, configStore, abort, typing, lifecycle, activeTurnRuntime, telegramQueueStore, modelSwitchController, previewRuntime, promptDispatchRuntime, deferredQueueDispatchRuntime, modelContextAvailabilityRuntime, disconnectOnQuit, onSessionStarted, shutdownGenerativeAppLiveSurfaces, resolveAutomaticThreadCleanupEnabled, buttonActionStore, callMultipart, sendChatAction, sendRecordVoiceAction, sendMarkdownReply, sendTextReply, dispatchNextQueuedTelegramTurn, onPromptHandedOff, answerGuestQuery, deleteMessage, sendGuestReply, editGuestReply, stopGuestPlaceholder, preparePreviewDelivery, finalizeMarkdownPreview, proactivePushTargetGetter, getAssistantRenderingMode, recordMessageOwnership, canSendAgentActivity, isSessionContextActive, isTurnTransportActive, updateStatus, recordRuntimeEvent, onSessionSettled, }: TelegramLifecycleBindingDeps): void;
+export declare function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, activityRuntime, activityVerbosityRuntime, diagnostics, assistantOutputRuntime, sessionLifecycleRuntime, configStore, abort, typing, lifecycle, activeTurnRuntime, telegramQueueStore, modelSwitchController, previewRuntime, promptDispatchRuntime, deferredQueueDispatchRuntime, modelContextAvailabilityRuntime, disconnectOnQuit, onSessionStarted, shutdownGenerativeAppLiveSurfaces, resolveAutomaticThreadCleanupEnabled, buttonActionStore, callMultipart, sendChatAction, sendRecordVoiceAction, sendMarkdownReply, sendTextReply, dispatchNextQueuedTelegramTurn, onSteerTurnEnd, onPromptHandedOff, answerGuestQuery, editGuestInlineMessage, deleteMessage, sendGuestReply, editGuestReply, stopGuestPlaceholder, preparePreviewDelivery, finalizeMarkdownPreview, proactivePushTargetGetter, getAssistantRenderingMode, recordMessageOwnership, canSendAgentActivity, isSessionContextActive, getSessionGeneration, isTurnTransportActive, updateStatus, recordRuntimeEvent, onSessionSettled, }: TelegramLifecycleBindingDeps): void;
 export {};

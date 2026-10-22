@@ -10,6 +10,10 @@ import {
   collectTelegramFileInfos,
   collectTelegramMessageIds,
   createTelegramMediaGroupController,
+  createTelegramPendingGroupsState,
+  transitionTelegramPendingGroups,
+  type TelegramPendingGroupsEffect,
+  type TelegramPendingGroupsEvent,
   createTelegramMediaGroupDispatchRuntime,
   downloadTelegramMessageFiles,
   extractFirstTelegramMessageText,
@@ -18,9 +22,6 @@ import {
   formatTelegramHistoryText,
   getTelegramMediaGroupKey,
   guessMediaType,
-  queueTelegramMediaGroupMessage,
-  removePendingTelegramMediaGroupMessages,
-  type TelegramMediaGroupState,
 } from "../lib/media.ts";
 
 type TestTimer = ReturnType<typeof setTimeout>;
@@ -301,90 +302,68 @@ test("Media helpers key messages by chat and media group", () => {
 });
 
 test("Media helpers replace debounce timers and dispatch grouped messages", async () => {
-  const groups = new Map<
-    string,
-    TelegramMediaGroupState<{
-      message_id: number;
-      chat: { id: number };
-      media_group_id?: string;
-      marker?: string;
-    }>
-  >();
+  type AlbumMessage = {
+    message_id: number;
+    chat: { id: number };
+    media_group_id?: string;
+    marker?: string;
+  };
   const cleared: number[] = [];
   const callbacks: Array<() => void> = [];
-  const dispatched: number[][] = [];
+  const dispatched: AlbumMessage[][] = [];
   let nextTimer = 1;
-  const setTimer = (callback: () => void): TestTimer => {
-    callbacks.push(callback);
-    return createTestTimer(nextTimer++);
-  };
-  const clearTimer = (timer: TestTimer): void => {
-    cleared.push(getTestTimerId(timer));
+  const controller = createTelegramMediaGroupController<AlbumMessage>({
+    debounceMs: 100,
+    setTimer: (callback) => {
+      callbacks.push(callback);
+      return createTestTimer(nextTimer++);
+    },
+    clearTimer: (timer) => cleared.push(getTestTimerId(timer)),
+  });
+  const dispatchMessages = (messages: AlbumMessage[]) => {
+    dispatched.push(messages);
   };
   assert.equal(
-    queueTelegramMediaGroupMessage({
+    controller.queueMessage({
       message: { message_id: 1, chat: { id: 7 }, media_group_id: "album" },
-      groups,
-      debounceMs: 100,
-      setTimer,
-      clearTimer,
-      dispatchMessages: (messages) =>
-        dispatched.push(messages.map((message) => message.message_id)),
+      dispatchMessages,
     }),
     true,
   );
-  queueTelegramMediaGroupMessage({
+  controller.queueMessage({
     message: { message_id: 2, chat: { id: 7 }, media_group_id: "album" },
-    groups,
-    debounceMs: 100,
-    setTimer,
-    clearTimer,
-    dispatchMessages: (messages) =>
-      dispatched.push(messages.map((message) => message.message_id)),
+    dispatchMessages,
   });
-  queueTelegramMediaGroupMessage({
-    message: {
-      message_id: 2,
-      chat: { id: 7 },
-      media_group_id: "album",
-      marker: "rebound",
-    },
-    groups,
-    debounceMs: 100,
-    setTimer,
-    clearTimer,
-    dispatchMessages: (messages) =>
-      dispatched.push(messages.map((message) => message.message_id)),
+  controller.queueMessage({
+    message: { message_id: 2, chat: { id: 7 }, media_group_id: "album", marker: "rebound" },
+    dispatchMessages,
   });
-  assert.equal([...groups.values()][0]?.messages.length, 2);
-  assert.equal([...groups.values()][0]?.messages[1]?.marker, "rebound");
   assert.deepEqual(cleared, [1, 2]);
   callbacks.at(-1)?.();
   await Promise.resolve();
-  assert.deepEqual(dispatched, [[1, 2]]);
-  assert.equal(groups.size, 0);
+  assert.deepEqual(dispatched.map((messages) => messages.map((message) => message.message_id)), [[1, 2]]);
+  assert.equal(dispatched[0]?.[1]?.marker, "rebound", "A duplicate id replaces the message in place");
+  await Promise.resolve();
+  assert.equal(await controller.flushMessage(1), false, "A dispatched group is gone");
 });
 
 test("Media group keeps messages until asynchronous dispatch succeeds", async () => {
-  const groups = new Map<
-    string,
-    TelegramMediaGroupState<{
-      message_id: number;
-      chat: { id: number };
-      media_group_id?: string;
-    }>
-  >();
   const callbacks: Array<() => void> = [];
   let attempts = 0;
-  queueTelegramMediaGroupMessage({
-    message: { message_id: 1, chat: { id: 7 }, media_group_id: "album" },
-    groups,
+  const controller = createTelegramMediaGroupController<{
+    message_id: number;
+    chat: { id: number };
+    media_group_id?: string;
+  }>({
     debounceMs: 10,
     setTimer: (callback) => {
       callbacks.push(callback);
       return createTestTimer(callbacks.length);
     },
     clearTimer: () => {},
+  });
+  controller.queueMessage({
+    message: { message_id: 1, chat: { id: 7 }, media_group_id: "album" },
     dispatchMessages: async () => {
       attempts += 1;
       if (attempts === 1) throw new Error("queue admission failed");
@@ -394,13 +373,44 @@ test("Media group keeps messages until asynchronous dispatch succeeds", async ()
   callbacks[0]?.();
   await Promise.resolve();
   await Promise.resolve();
-  assert.equal(groups.size, 1);
-  assert.equal(callbacks.length, 2);
+  assert.equal(callbacks.length, 2, "A failed batch stays and re-arms its debounce");
   callbacks[1]?.();
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(attempts, 2);
-  assert.equal(groups.size, 0);
+  assert.equal(await controller.flushMessage(1), false, "The group leaves only after a successful dispatch");
+});
+
+test("Media group recovers from a dispatcher that throws synchronously", async () => {
+  const callbacks: Array<() => void> = [];
+  let attempts = 0;
+  const controller = createTelegramMediaGroupController<{
+    message_id: number;
+    chat: { id: number };
+    media_group_id?: string;
+  }>({
+    debounceMs: 10,
+    setTimer: (callback) => {
+      callbacks.push(callback);
+      return createTestTimer(callbacks.length);
+    },
+    clearTimer: () => {},
+  });
+  controller.queueMessage({
+    message: { message_id: 1, chat: { id: 7 }, media_group_id: "album" },
+    dispatchMessages: () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("synchronous admission failure");
+    },
+  });
+  assert.doesNotThrow(() => callbacks[0]?.(), "A timer callback never leaks the dispatcher's exception");
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(callbacks.length, 2, "The group is not stuck dispatching; it retries");
+  callbacks[1]?.();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(attempts, 2);
 });
 
 test("Media group controller owns timers, removal, and cleanup", () => {
@@ -559,24 +569,122 @@ test("Media group dispatch runtime handles immediate and grouped messages", asyn
 });
 
 test("Media helpers remove pending groups by message id", () => {
-  const groups = new Map<
-    string,
-    TelegramMediaGroupState<{ message_id: number; chat: { id: number } }>
-  >();
-  groups.set("7:album", {
-    messages: [
-      { message_id: 1, chat: { id: 7 } },
-      { message_id: 2, chat: { id: 7 } },
-    ],
-    flushTimer: createTestTimer(10),
-  });
   const cleared: number[] = [];
-  assert.equal(
-    removePendingTelegramMediaGroupMessages(groups, [2], (timer) => {
-      cleared.push(getTestTimerId(timer));
-    }),
-    1,
+  let nextTimer = 10;
+  const controller = createTelegramMediaGroupController<{
+    message_id: number;
+    chat: { id: number };
+    media_group_id?: string;
+  }>({
+    setTimer: () => createTestTimer(nextTimer++),
+    clearTimer: (timer) => cleared.push(getTestTimerId(timer)),
+  });
+  controller.queueMessage({ message: { message_id: 1, chat: { id: 7 }, media_group_id: "album" }, dispatchMessages: () => {} });
+  controller.queueMessage({ message: { message_id: 2, chat: { id: 7 }, media_group_id: "album" }, dispatchMessages: () => {} });
+  assert.equal(controller.removeMessages([2]), 1);
+  assert.deepEqual(cleared, [10, 11]);
+  assert.equal(controller.removeMessages([1]), 0);
+});
+
+type GroupMessage = { message_id: number };
+type GroupEvent = TelegramPendingGroupsEvent<GroupMessage, string, undefined>;
+type GroupEffect = TelegramPendingGroupsEffect<GroupMessage, string>;
+
+/** Folds events through the pure group transition, keeping every effect in order. */
+function runPendingGroups(events: GroupEvent[], requireContext = true) {
+  let state = createTelegramPendingGroupsState<GroupMessage, string>();
+  const effects: GroupEffect[] = [];
+  for (const event of events) {
+    const next = transitionTelegramPendingGroups(state, event, { debounceMs: 10, requireContext });
+    state = next.state;
+    effects.push(...next.effects);
+  }
+  return { state, effects };
+}
+
+const queuedMessage = (id: number, rearm: "always" | "ifIdle" = "always", context: string | null = "ctx"): GroupEvent => ({
+  type: "queued", key: "k", message: { message_id: id }, ...(context === null ? {} : { context }), delayMs: 10, rearm,
+});
+const batches = (effects: GroupEffect[]) =>
+  effects.flatMap((effect) => (effect.type === "dispatch" ? [effect.messages.map((message) => message.message_id)] : []));
+
+test("Pending groups dispatch one batch at a time and keep later messages for the next", () => {
+  const run = runPendingGroups([
+    queuedMessage(1),
+    { type: "timerFired", key: "k", timerId: 1 },
+    queuedMessage(2),
+    { type: "timerFired", key: "k", timerId: 2 },
+    { type: "dispatchSettled", key: "k", dispatchId: 1, ok: true },
+  ]);
+  assert.deepEqual(batches(run.effects), [[1]], "A timer during a dispatch waits for it");
+  assert.deepEqual(run.state.groups.get("k")?.messages, [{ message_id: 2 }]);
+  assert.deepEqual(run.effects.at(-1), { type: "armTimer", key: "k", timerId: 3, delayMs: 10 },
+    "Settlement re-arms for what is left");
+});
+
+test("Pending groups end a closed batch at its message, even while an earlier batch is in flight", () => {
+  const run = runPendingGroups([
+    queuedMessage(1),
+    { type: "timerFired", key: "k", timerId: 1 },
+    queuedMessage(2),
+    { type: "batchClosed", key: "k" },
+    queuedMessage(3),
+    { type: "dispatchSettled", key: "k", dispatchId: 1, ok: true },
+    { type: "timerFired", key: "k", timerId: 3 },
+    { type: "dispatchSettled", key: "k", dispatchId: 2, ok: true },
+    { type: "timerFired", key: "k", timerId: 4 },
+  ]);
+  assert.deepEqual(batches(run.effects), [[1], [2], [3]],
+    "A count-based limit taken during the first batch would have sent [2, 3] together");
+});
+
+test("Pending groups keep a failed batch, ignore stale timers and settlements, and drop removed groups", () => {
+  const failed = runPendingGroups([
+    queuedMessage(1),
+    { type: "timerFired", key: "k", timerId: 1 },
+    { type: "dispatchSettled", key: "k", dispatchId: 1, ok: false },
+  ]);
+  assert.deepEqual(failed.state.groups.get("k")?.messages, [{ message_id: 1 }]);
+  assert.equal(failed.state.groups.get("k")?.timerId, 2);
+  const stale = runPendingGroups([
+    queuedMessage(1), queuedMessage(2),
+    { type: "timerFired", key: "k", timerId: 1 },
+    { type: "cleared" },
+    { type: "dispatchSettled", key: "k", dispatchId: 1, ok: true },
+  ]);
+  assert.deepEqual(batches(stale.effects), [], "A replaced timer cannot dispatch");
+  assert.equal(stale.state.groups.size, 0);
+  const removed = transitionTelegramPendingGroups(
+    runPendingGroups([queuedMessage(1)]).state,
+    { type: "removed", messageIds: [1] },
+    { debounceMs: 10, requireContext: true },
   );
-  assert.deepEqual(cleared, [10]);
-  assert.equal(groups.size, 0);
+  assert.equal(removed.result, 1);
+  assert.deepEqual(removed.effects, [{ type: "cancelTimer", timerId: 1 }]);
+});
+
+test("Pending groups hold timers while suspended and resume in the replacement context", () => {
+  const run = runPendingGroups([
+    queuedMessage(1),
+    { type: "suspended" },
+    queuedMessage(2),
+    { type: "resumed", context: "next" },
+    { type: "timerFired", key: "k", timerId: 2 },
+  ]);
+  assert.deepEqual(run.effects.slice(0, 2), [
+    { type: "armTimer", key: "k", timerId: 1, delayMs: 10 },
+    { type: "cancelTimer", timerId: 1 },
+  ]);
+  const dispatched = run.effects.at(-1);
+  assert.equal(dispatched?.type, "dispatch");
+  assert.equal(dispatched?.type === "dispatch" ? dispatched.context : undefined, "next");
+});
+
+test("Pending groups re-arm a duplicate only when idle and wait without a required context", () => {
+  const held = runPendingGroups([queuedMessage(1), queuedMessage(1, "ifIdle")]);
+  assert.equal(held.effects.length, 1, "An armed timer already covers the duplicate");
+  const contextless = runPendingGroups([queuedMessage(1, "always", null), { type: "timerFired", key: "k", timerId: 1 }]);
+  assert.deepEqual(batches(contextless.effects), [], "Text waits for a context");
+  const media = runPendingGroups([queuedMessage(1, "always", null), { type: "timerFired", key: "k", timerId: 1 }], false);
+  assert.deepEqual(batches(media.effects), [[1]], "Media dispatches without one");
 });

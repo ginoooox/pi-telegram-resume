@@ -23,10 +23,12 @@ import type {
   TelegramSendRichMessageBody,
   TelegramSendRichMessageDraftBody,
   TelegramSentMessage,
+  TelegramTypingActionOptions,
   TelegramUpdate,
 } from "./telegram-api.ts";
 import {
   buildTelegramAnswerGuestQueryBody,
+  assertTelegramApiCallAuthority,
   isTelegramApiCommitUnknownError,
   isTelegramMessageNotModifiedError,
   TelegramApiAuthorityError,
@@ -36,6 +38,7 @@ import {
 export type TelegramBusApiCall = (
   method: string,
   args: unknown[],
+  localOptions?: Pick<TelegramApiCallOptions, "assertAuthority">,
 ) => Promise<unknown>;
 
 export interface TelegramBusAwareApiRuntimeDeps {
@@ -235,8 +238,9 @@ function sendTelegramFollowerChatAction(
   >,
   chatId: number,
   action: string,
-  options?: { message_thread_id?: number },
+  options?: TelegramTypingActionOptions,
 ): Promise<boolean> {
+  assertTelegramApiCallAuthority(options?.assertAuthority, false);
   const body = withDefaultThreadTarget(
     {
       chat_id: chatId,
@@ -247,7 +251,11 @@ function sendTelegramFollowerChatAction(
     },
     deps.getDefaultTarget?.(),
   );
-  return deps.callFollowerApi("call", ["sendChatAction", body]).then(asBoolean);
+  // Only plain single-attempt policy crosses IPC; the captured assertion is a local issuance fence.
+  const args = ["sendChatAction", body, ...(action === "typing"
+    ? [{ maxAttempts: 1, retrySafety: "non-idempotent" }] : [])];
+  return deps.callFollowerApi("call", args, options?.assertAuthority
+    ? { assertAuthority: options.assertAuthority } : undefined).then(asBoolean);
 }
 
 export function createTelegramBusAwareApiRuntime(
@@ -345,7 +353,7 @@ export function createTelegramBusAwareApiRuntime(
     },
     sendTypingAction(
       chatId: number,
-      options?: { message_thread_id?: number },
+      options?: TelegramTypingActionOptions,
     ): Promise<unknown> {
       return deps.ownsDirect()
         ? deps.directRuntime.sendTypingAction(chatId, options)
@@ -528,9 +536,10 @@ export function createTelegramBusAwareApiRuntime(
     editGuestInlineMessage(
       inlineMessageId: string,
       content: TelegramEditGuestInlineMessageContent,
+      options?: Pick<TelegramApiCallOptions, "assertAuthority">,
     ): Promise<void> {
       return deps.ownsDirect()
-        ? deps.directRuntime.editGuestInlineMessage(inlineMessageId, content)
+        ? deps.directRuntime.editGuestInlineMessage(inlineMessageId, content, options)
         : rejectTelegramDirectOwnership("editGuestInlineMessage");
     },
     async deleteMessage(chatId: number, messageId: number): Promise<void> {

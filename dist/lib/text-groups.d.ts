@@ -22,18 +22,6 @@ export interface TelegramTextGroupMessage {
     forward_from?: TelegramMessageUser;
     forward_sender_name?: string;
 }
-export interface TelegramTextGroupState<TMessage, TContext = unknown> {
-    messages: TMessage[];
-    context?: TContext;
-    flushTimer?: ReturnType<typeof setTimeout>;
-    dispatching?: boolean;
-    suspended?: boolean;
-    reschedule?: (delayMs?: number) => void;
-    dispatchNow?: () => Promise<void>;
-    dispatchPromise?: Promise<void>;
-    dispatchLimit?: number;
-    forwardPairCandidate?: TelegramForwardCommentBatchPosition;
-}
 export type TelegramForwardCommentBatchPosition = "comment" | "forward";
 export interface TelegramTextGroupController<TMessage, TContext = unknown> {
     prepareUpdateBatch: (updates: readonly {
@@ -65,20 +53,6 @@ export interface TelegramGroupedInputClearerDeps {
     clearMediaGroups: () => void;
     clearTextGroups: () => void;
 }
-export declare function queueTelegramTextGroupMessage<TMessage extends TelegramTextGroupMessage, TContext = unknown>(options: {
-    message: TMessage;
-    context: TContext;
-    groups: Map<string, TelegramTextGroupState<TMessage, TContext>>;
-    debounceMs: number;
-    minSplitLength: number;
-    setTimer: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
-    clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
-    dispatchMessages: (messages: TMessage[], ctx: TContext) => unknown | Promise<unknown>;
-    forceStart?: boolean;
-    dispatchImmediately?: boolean;
-    forwardPairCandidate?: TelegramForwardCommentBatchPosition;
-    delayMs?: number;
-}): boolean;
 export declare function createTelegramTextGroupController<TMessage extends TelegramTextGroupMessage, TContext = unknown>(options?: TelegramTextGroupControllerOptions): TelegramTextGroupController<TMessage, TContext>;
 export declare function createTelegramTextGroupDispatchRuntime<TMessage extends TelegramTextGroupMessage, TContext>(deps: {
     textGroups: TelegramTextGroupController<TMessage, TContext>;

@@ -1981,6 +1981,7 @@ export interface TelegramLockedPollingRuntime<
   registerFollowerWithOwner?: (
     ctx: TContext,
     owner: TelegramLockEntry,
+    options?: { recoverConnection?: boolean },
   ) => boolean | undefined | Promise<boolean | undefined>;
   restoreFollowerWithOwner?: (
     ctx: TContext,
@@ -2008,6 +2009,7 @@ interface TelegramLockedPollingRuntimeDeps<
   registerFollowerWithOwner?: (
     ctx: TContext,
     owner: TelegramLockEntry,
+    options?: { recoverConnection?: boolean },
   ) => boolean | undefined | Promise<boolean | undefined>;
   restoreFollowerWithOwner?: (
     ctx: TContext,
@@ -2294,6 +2296,7 @@ export function createTelegramLockedPollingRuntime<
             const registered = await deps.registerFollowerWithOwner(
               ctx,
               acquired.lock,
+              options.forceFreshLeaderThread ? { recoverConnection: true } : undefined,
             );
             if (!isCurrent()) return cancelled;
             if (registered) {
@@ -2518,8 +2521,8 @@ export function createTelegramLockedPollingRuntime<
       sessionAutoStartRun = run;
     },
     registerFollowerWithOwner: deps.registerFollowerWithOwner
-      ? async (ctx, owner) => {
-          const registered = await deps.registerFollowerWithOwner?.(ctx, owner);
+      ? async (ctx, owner, options) => {
+          const registered = await deps.registerFollowerWithOwner?.(ctx, owner, options);
           if (registered) deps.updateStatus(ctx);
           return registered === true;
         }

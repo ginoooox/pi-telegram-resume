@@ -8,7 +8,7 @@ Living index of project documentation in `/docs`.
 
 ## Documents
 
-- [architecture.md](./architecture.md) — Overview of the Telegram bridge runtime, optional profile isolation, queueing model and Priority/Normal plus Keep/Skip reaction policy, native Rich Markdown delivery, UI/compat rendering, and interactive controls
+- [architecture.md](./architecture.md) — Overview of the Telegram bridge runtime, optional profile isolation, queueing model and Normal/Priority/Steer plus Keep/Skip reaction policy, native Rich Markdown delivery, UI/compat rendering, and interactive controls
 - [public-api.md](./public-api.md) — Stable public API map: package entrypoints, commands, config, assistant markup, extension APIs, smoke examples, and compatibility boundaries
 - [delivery.md](./delivery.md) — Target-aware companion delivery contract for operational views, logical message handles, target scopes, lifecycle fencing, and leader/follower transport
 - [activity.md](./activity.md) — Normalized Pi lifecycle API for extension-owned reasoning, intermediate prose, tool activity, source identity, delivery contexts, and consumer policy examples

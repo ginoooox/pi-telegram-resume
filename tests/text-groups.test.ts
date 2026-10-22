@@ -25,31 +25,40 @@ function createMessage(
   };
 }
 
-test("Text group helper delays likely split messages and appends quick continuations", () => {
-  const groups = new Map<
-    string,
-    TextGroups.TelegramTextGroupState<TestMessage, string>
-  >();
-  const timers: Array<() => void> = [];
-  const dispatched: string[] = [];
-  const queue = (message: TestMessage) =>
-    TextGroups.queueTelegramTextGroupMessage({
+/** Raw split recovery through the controller: without forward-comment pairing, only the split-length rule starts a group. */
+function createSplitRecovery(options: {
+  minSplitLength?: number;
+  timers: Array<() => void>;
+  dispatchMessages?: (messages: TestMessage[], ctx: string) => unknown | Promise<unknown>;
+}) {
+  const controller = TextGroups.createTelegramTextGroupController<TestMessage, string>({
+    debounceMs: 10,
+    minSplitLength: options.minSplitLength ?? 8,
+    forwardCommentWaitMs: false,
+    setTimer: (callback) => {
+      options.timers.push(callback);
+      return callback as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimer: () => {},
+  });
+  const queue = (message: TestMessage): boolean =>
+    controller.queueMessage({
       message,
       context: "ctx",
-      groups,
-      debounceMs: 10,
-      minSplitLength: 8,
-      setTimer: (callback) => {
-        timers.push(callback);
-        return callback as unknown as ReturnType<typeof setTimeout>;
-      },
-      clearTimer: () => {},
-      dispatchMessages: (messages, ctx) => {
-        dispatched.push(
-          `${ctx}:${messages.map((item) => item.text).join("|")}`,
-        );
-      },
+      dispatchMessages: options.dispatchMessages ?? (() => {}),
     });
+  return { controller, queue };
+}
+
+test("Text group helper delays likely split messages and appends quick continuations", () => {
+  const timers: Array<() => void> = [];
+  const dispatched: string[] = [];
+  const { queue } = createSplitRecovery({
+    timers,
+    dispatchMessages: (messages, ctx) => {
+      dispatched.push(`${ctx}:${messages.map((item) => item.text).join("|")}`);
+    },
+  });
   assert.equal(queue(createMessage(1, "short")), false);
   assert.equal(queue(createMessage(2, "long-enough")), true);
   assert.equal(queue(createMessage(3, "tail")), true);
@@ -251,39 +260,26 @@ test("Text group controller coalesces media-only forwards and comments in either
 });
 
 test("Text group keeps split messages until asynchronous dispatch succeeds", async () => {
-  const groups = new Map<
-    string,
-    TextGroups.TelegramTextGroupState<TestMessage, string>
-  >();
   const timers: Array<() => void> = [];
   let attempts = 0;
-  TextGroups.queueTelegramTextGroupMessage({
-    message: createMessage(1, "long-enough"),
-    context: "ctx",
-    groups,
-    debounceMs: 10,
-    minSplitLength: 8,
-    setTimer: (callback) => {
-      timers.push(callback);
-      return callback as unknown as ReturnType<typeof setTimeout>;
-    },
-    clearTimer: () => {},
+  const { controller, queue } = createSplitRecovery({
+    timers,
     dispatchMessages: async () => {
       attempts += 1;
       if (attempts === 1) throw new Error("queue admission failed");
     },
   });
+  queue(createMessage(1, "long-enough"));
 
   timers[0]?.();
   await Promise.resolve();
   await Promise.resolve();
-  assert.equal(groups.size, 1);
-  assert.equal(timers.length, 2);
+  assert.equal(timers.length, 2, "A failed batch stays and re-arms its debounce");
   timers[1]?.();
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(attempts, 2);
-  assert.equal(groups.size, 0);
+  assert.equal(await controller.flushMessage(1), false, "The group leaves only after a successful dispatch");
 });
 
 test("Text group controller clears pending timers without stale dispatch", () => {
@@ -359,158 +355,48 @@ test("Text group suspension resumes admitted input in the replacement context", 
 });
 
 test("Text group helper uses 3600 as the default near-limit threshold", () => {
-  const groups = new Map<
-    string,
-    TextGroups.TelegramTextGroupState<TestMessage, string>
-  >();
-  const timers: Array<() => void> = [];
-  const queue = (message: TestMessage) =>
-    TextGroups.queueTelegramTextGroupMessage({
-      message,
-      context: "ctx",
-      groups,
-      debounceMs: 10,
-      minSplitLength: 3600,
-      setTimer: (callback) => {
-        timers.push(callback);
-        return callback as unknown as ReturnType<typeof setTimeout>;
-      },
-      clearTimer: () => {},
-      dispatchMessages: () => {},
-    });
+  const { queue } = createSplitRecovery({ minSplitLength: 3600, timers: [] });
   assert.equal(queue(createMessage(1, "x".repeat(3599))), false);
   assert.equal(queue(createMessage(2, "x".repeat(3600))), true);
 });
 
 test("Text group helper ignores commands, bots, media groups, and non-contiguous tails", () => {
-  const groups = new Map<
-    string,
-    TextGroups.TelegramTextGroupState<TestMessage, string>
-  >();
-  const timers: Array<() => void> = [];
-  const base = {
-    context: "ctx",
-    groups,
-    debounceMs: 10,
-    minSplitLength: 8,
-    setTimer: (callback: () => void) => {
-      timers.push(callback);
-      return callback as unknown as ReturnType<typeof setTimeout>;
-    },
-    clearTimer: () => {},
-    dispatchMessages: () => {},
-  };
-  assert.equal(
-    TextGroups.queueTelegramTextGroupMessage({
-      ...base,
-      message: createMessage(1, "/template lots of text"),
-    }),
-    false,
-  );
-  assert.equal(
-    TextGroups.queueTelegramTextGroupMessage({
-      ...base,
-      message: createMessage(2, "long-enough", {
-        from: { id: 77, is_bot: true },
-      }),
-    }),
-    false,
-  );
-  assert.equal(
-    TextGroups.queueTelegramTextGroupMessage({
-      ...base,
-      message: createMessage(3, "long-enough", { media_group_id: "album" }),
-    }),
-    false,
-  );
-  assert.equal(
-    TextGroups.queueTelegramTextGroupMessage({
-      ...base,
-      message: createMessage(4, "long-enough"),
-    }),
-    true,
-  );
-  assert.equal(
-    TextGroups.queueTelegramTextGroupMessage({
-      ...base,
-      message: createMessage(30, "tail"),
-    }),
-    false,
-  );
+  const { queue } = createSplitRecovery({ timers: [] });
+  assert.equal(queue(createMessage(1, "/template lots of text")), false);
+  assert.equal(queue(createMessage(2, "long-enough", { from: { id: 77, is_bot: true } })), false);
+  assert.equal(queue(createMessage(3, "long-enough", { media_group_id: "album" })), false);
+  assert.equal(queue(createMessage(4, "long-enough")), true);
+  assert.equal(queue(createMessage(30, "tail")), false);
 });
 
 test("Text group helper scopes split recovery by thread target", () => {
-  const groups = new Map<
-    string,
-    TextGroups.TelegramTextGroupState<TestMessage, string>
-  >();
   const timers: Array<() => void> = [];
   const dispatched: string[] = [];
-  const queue = (message: TestMessage) =>
-    TextGroups.queueTelegramTextGroupMessage({
-      message,
-      context: "ctx",
-      groups,
-      debounceMs: 10,
-      minSplitLength: 8,
-      setTimer: (callback) => {
-        timers.push(callback);
-        return callback as unknown as ReturnType<typeof setTimeout>;
-      },
-      clearTimer: () => {},
-      dispatchMessages: (messages, ctx) => {
-        dispatched.push(
-          `${ctx}:${messages.map((item) => item.text).join("|")}`,
-        );
-      },
-    });
+  const { queue } = createSplitRecovery({
+    timers,
+    dispatchMessages: (messages, ctx) => {
+      dispatched.push(`${ctx}:${messages.map((item) => item.text).join("|")}`);
+    },
+  });
 
-  assert.equal(
-    queue(createMessage(1, "long-enough", { message_thread_id: 10 })),
-    true,
-  );
-  assert.equal(
-    queue(createMessage(2, "other-thread", { message_thread_id: 11 })),
-    true,
-  );
-  assert.equal(
-    queue(createMessage(3, "tail", { message_thread_id: 10 })),
-    true,
-  );
+  assert.equal(queue(createMessage(1, "long-enough", { message_thread_id: 10 })), true);
+  assert.equal(queue(createMessage(2, "other-thread", { message_thread_id: 11 })), true);
+  assert.equal(queue(createMessage(3, "tail", { message_thread_id: 10 })), true);
   assert.deepEqual(dispatched, []);
   timers.at(-1)?.();
   timers.at(-2)?.();
-  assert.deepEqual(dispatched.sort(), [
-    "ctx:long-enough|tail",
-    "ctx:other-thread",
-  ]);
+  assert.deepEqual(dispatched.sort(), ["ctx:long-enough|tail", "ctx:other-thread"]);
 });
 
 test("Text group helper appends many split tails with wider id gaps", () => {
-  const groups = new Map<
-    string,
-    TextGroups.TelegramTextGroupState<TestMessage, string>
-  >();
   const timers: Array<() => void> = [];
   const dispatched: string[] = [];
-  const queue = (message: TestMessage) =>
-    TextGroups.queueTelegramTextGroupMessage({
-      message,
-      context: "ctx",
-      groups,
-      debounceMs: 10,
-      minSplitLength: 8,
-      setTimer: (callback) => {
-        timers.push(callback);
-        return callback as unknown as ReturnType<typeof setTimeout>;
-      },
-      clearTimer: () => {},
-      dispatchMessages: (messages, ctx) => {
-        dispatched.push(
-          `${ctx}:${messages.map((item) => item.text).join("|")}`,
-        );
-      },
-    });
+  const { queue } = createSplitRecovery({
+    timers,
+    dispatchMessages: (messages, ctx) => {
+      dispatched.push(`${ctx}:${messages.map((item) => item.text).join("|")}`);
+    },
+  });
 
   assert.equal(queue(createMessage(1, "long-enough")), true);
   assert.equal(queue(createMessage(8, "tail-1")), true);

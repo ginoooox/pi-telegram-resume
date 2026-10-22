@@ -4,6 +4,15 @@
  * Owns polling request builders, stop conditions, and the long-poll loop runtime for Telegram updates
  */
 type MaybePromise<T> = T | Promise<T>;
+/**
+ * Structural port for run-collapsing diagnostics: a repeated identical failure extends its run instead of logging
+ * again, and the closing success records one outcome. The composition root owns the collapsed implementation.
+ */
+export interface TelegramRepeatedFailureLogPort {
+    record: (error: unknown, details?: Record<string, unknown>) => void;
+    settled: () => void;
+    reset: () => void;
+}
 export interface TelegramPollingConfig {
     botToken?: string;
 }
@@ -174,6 +183,8 @@ export interface TelegramStartupThreadCapabilityProbeDeps extends TelegramThread
     getNowMs?: () => number;
 }
 export interface TelegramThreadCapabilityRuntimeDeps<TContext> extends TelegramThreadCapabilityReaderDeps {
+    /** Collapses one sustained probe failure run; the caller supplies its owner. */
+    failureLog: TelegramRepeatedFailureLogPort;
     lifecycle?: TelegramThreadCapabilityLifecycle;
     topicTargetStore: TelegramThreadCapabilityStore;
     ownsLock: (ctx: TContext) => boolean;
@@ -221,7 +232,9 @@ export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
         forceFreshLeaderThread?: boolean;
     }) => Promise<void>;
     stopPolling: () => Promise<void>;
-    registerFollowerWithOwner: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
+    registerFollowerWithOwner: (ctx: TContext, owner: TOwner, options?: {
+        recoverConnection?: boolean;
+    }) => Promise<boolean | undefined>;
     restoreFollowerWithOwner: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
     stopFollowerRegistration: () => void;
 }
@@ -233,7 +246,9 @@ export interface TelegramThreadAwarePollingControls<TContext, TOwner> {
     stopBusLeaderPolling: () => Promise<void>;
     startLeaderHealth: () => void;
     stopLeaderHealth: () => void;
-    registerFollowerWithLeader: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
+    registerFollowerWithLeader: (ctx: TContext, owner: TOwner, options?: {
+        recoverConnection?: boolean;
+    }) => Promise<boolean | undefined>;
     restoreFollowerWithLeader?: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
     hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
     stopFollowerRegistration: () => void;
@@ -247,6 +262,8 @@ export interface TelegramThreadAwarePollingDeps<TContext, TOwner> extends Telegr
     setForceFreshLeaderThreadOnNextStart: (forceFresh: boolean) => void;
 }
 export interface TelegramThreadCapabilityOrchestrationDeps<TContext, TOwner> extends TelegramThreadCapabilityReaderDeps, TelegramThreadAwarePollingControls<TContext, TOwner> {
+    /** Collapses one sustained probe failure run; the composition root supplies its owner. */
+    failureLog: TelegramRepeatedFailureLogPort;
     state: TelegramThreadCapabilityStateRuntime;
     topicTargetStore: TelegramThreadCapabilityStore;
     ownsLock: (ctx: TContext) => boolean;

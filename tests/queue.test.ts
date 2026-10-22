@@ -1,6 +1,7 @@
 /**
  * Regression tests for Telegram queue and runtime decision helpers
  * Exercises queue ordering, mutation, dispatch planning, lifecycle plans, and model-switch guard behavior
+ * Zones: telegram queue, pi agent lifecycle, scheduling
  */
 
 import assert from "node:assert/strict";
@@ -11,6 +12,7 @@ import { join } from "node:path";
 import { registerTelegramVoiceSynthesisProvider } from "../lib/voice.ts";
 import { createTelegramActivityPublicationRuntime } from "../lib/activity.ts";
 import { extractRunAssistantMessage } from "../lib/replies.ts";
+import { buildTelegramBridgeSystemPrompt } from "../lib/prompts.ts";
 import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 import { createTelegramPreviewController, createTelegramAssistantPreviewRuntime } from "../lib/preview.ts";
 import {
@@ -57,8 +59,10 @@ import {
   createTelegramQueueHandoffPayload,
   createTelegramQueueHandoffStagingRuntime,
   createTelegramQueueItemCountGetter,
+  countExecutableTelegramQueueItems,
   createTelegramQueueMutationController,
   createTelegramQueueStore,
+  createTelegramSteerBoundaryRuntime,
   createTelegramSessionLifecycleHooks,
   createTelegramSessionLifecycleRuntime,
   createTelegramSessionStateApplier,
@@ -68,7 +72,6 @@ import {
   enqueueTelegramPromptTurnRuntime,
   executeTelegramControlItemRuntime,
   executeTelegramQueueDispatchPlan,
-  formatQueuedTelegramItemsStatus,
   getNextTelegramToolExecutionCount,
   getTelegramQueueLaneContract,
   handleTelegramAgentEndRuntime,
@@ -79,7 +82,9 @@ import {
   partitionTelegramQueueItemsForHistory,
   observeTelegramTargetQueueWork,
   planNextTelegramQueueAction,
+  parseTelegramQueueHandoffPayload,
   planTelegramPromptEnqueue,
+  planTelegramSteerPacket,
   removeTelegramQueueItemByReceipt,
   removeTelegramQueueItemsByMessageIds,
   removeTelegramQueueItemsByMessageIdsRuntime,
@@ -331,20 +336,26 @@ test("Queue lane contracts define admission modes and dispatch order", () => {
         allowedKinds: ["control", "prompt"],
       },
       {
+        lane: "steer",
+        admissionMode: "steer-queue",
+        dispatchRank: 1,
+        allowedKinds: ["prompt"],
+      },
+      {
         lane: "priority",
         admissionMode: "priority-queue",
-        dispatchRank: 1,
+        dispatchRank: 2,
         allowedKinds: ["prompt"],
       },
       {
         lane: "default",
         admissionMode: "default-queue",
-        dispatchRank: 2,
+        dispatchRank: 3,
         allowedKinds: ["prompt"],
       },
     ],
   );
-  assert.equal(getTelegramQueueLaneContract("priority").dispatchRank, 1);
+  assert.equal(getTelegramQueueLaneContract("priority").dispatchRank, 2);
   assert.equal(
     getTelegramQueueLaneContract("control").admissionMode,
     "control-queue",
@@ -371,6 +382,367 @@ test("Queue lane contracts define admission modes and dispatch order", () => {
         "Invalid Telegram queue admission: control item cannot use default lane",
     },
   );
+});
+
+test("Steer packet planning preserves a fixed FIFO prefix of original complete items", () => {
+  const receipt = createTelegramQueueAdmissionReceipt({ queueKind: "prompt", scope: "steer", sourceUpdateIds: [10, 11] })!;
+  const first = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 3, laneOrder: 1,
+    sourceMessageIds: [100, 101], admissionReceipts: [receipt], target: { chatId: 1, threadId: 7 },
+    content: [{ type: "text", text: "album" }, { type: "image", data: "aW1hZ2U=", mimeType: "image/png" }] });
+  const second = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 2, laneOrder: 2, target: first.target });
+  const normal = createQueueTestPromptTurn({ queueOrder: 1 });
+  const items = [second, normal, first];
+  const plan = planTelegramSteerPacket(items, { blocked: false, isItemReady: () => true });
+  assert.equal(plan.kind, "packet");
+  if (plan.kind !== "packet") assert.fail("expected packet");
+  assert.deepEqual(plan.items, [first, second]);
+  assert.strictEqual(plan.items[0], first);
+  assert.strictEqual(plan.items[0]!.admissionReceipts![0], receipt);
+  assert.strictEqual(plan.items[0]!.content, first.content);
+  assert.deepEqual(items, [second, normal, first]);
+  assert.deepEqual(planNextTelegramQueueAction([first, normal], true), { kind: "none", remainingItems: [first, normal] });
+  assert.throws(() => createTelegramQueueHandoffPayload(first), /requires compatible lane support/);
+  assert.equal(isTelegramQueueItemAdmissionValid({ kind: "control", queueLane: "steer" }), false);
+});
+
+test("Steer packet planning yields to guarded work and cannot bypass an unready head", () => {
+  const first = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 1, laneOrder: 1 });
+  const second = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 2, laneOrder: 2 });
+  assert.deepEqual(planTelegramSteerPacket([first, second], { blocked: true,
+    isItemReady: () => { assert.fail("blocked selection must not inspect sources"); } }), { kind: "none" });
+  assert.deepEqual(planTelegramSteerPacket([first, second], { blocked: false,
+    isItemReady: (item) => item !== first }), { kind: "none" });
+  const control = createQueueTestControlItem();
+  assert.deepEqual(planTelegramSteerPacket([first, control], { blocked: false, isItemReady: () => true }), { kind: "none" });
+  const ready = planTelegramSteerPacket([first, control, second], { blocked: false,
+    isItemReady: (item) => item !== control, canAppend: (packet) => packet.length === 0 });
+  assert.deepEqual(ready, { kind: "packet", items: [first] });
+  assert.deepEqual(planTelegramSteerPacket([first], { blocked: false, isItemReady: () => true,
+    canAppend: () => false }), { kind: "none" });
+});
+
+test("Steer packets do not cross suppression, guest, target, or profile-generation boundaries", () => {
+  const first = createQueueTestPromptTurn({ queueLane: "steer", laneOrder: 1, queueOrder: 1,
+    target: { chatId: 1, threadId: 7 }, transportStamp: { profile: "default", generation: "one" } });
+  for (const changes of [
+    { reactionSuppressionEmoji: "👎" },
+    { guestQueryId: "guest" },
+    { chatId: 2 },
+    { target: { chatId: 1, threadId: 8 } },
+    { transportStamp: { profile: "other", generation: "one" } },
+    { transportStamp: { profile: "default", generation: "two" } },
+  ]) {
+    const barrier = createQueueTestPromptTurn({ ...first, queueOrder: 2, laneOrder: 2, ...changes });
+    const later = createQueueTestPromptTurn({ ...first, queueOrder: 3, laneOrder: 3 });
+    assert.deepEqual(planTelegramSteerPacket([later, barrier, first], { blocked: false,
+      isItemReady: () => true }), { kind: "packet", items: [first] });
+  }
+  const skipped = createQueueTestPromptTurn({ ...first, reactionSuppressionEmoji: "👎" });
+  assert.deepEqual(planTelegramSteerPacket([skipped, first], { blocked: false,
+    isItemReady: () => true }), { kind: "skip", item: skipped });
+  assert.deepEqual(planTelegramSteerPacket([skipped], { blocked: false,
+    isItemReady: () => false }), { kind: "none" });
+});
+
+test("Steer lane transitions append at destination tail while Keep and Skip preserve lane identity", () => {
+  const turn = createQueueTestPromptTurn({ queueOrder: 4 });
+  const moved = applyTelegramQueuePromptReactionDisposition([turn], 2,
+    { kind: "reaction-transition", promptLane: "steer", priorityEmoji: "🔥" }, 20);
+  assert.equal(moved.items[0]!.queueLane, "steer");
+  assert.equal(moved.items[0]!.queueOrder, 4);
+  assert.equal(moved.items[0]!.laneOrder, 20);
+  const skipped = applyTelegramQueuePromptReactionDisposition(moved.items, 2,
+    { kind: "reaction-transition", suppressionEmoji: "👎" });
+  assert.equal(skipped.items[0]!.queueLane, "steer");
+  assert.equal(skipped.items[0]!.laneOrder, 20);
+  const kept = applyTelegramQueuePromptReactionDisposition(skipped.items, 2,
+    { kind: "reaction-transition", suppressionEmoji: null });
+  assert.equal(kept.items[0]!.queueLane, "steer");
+  assert.equal(kept.items[0]!.laneOrder, 20);
+  const repeated = applyTelegramQueuePromptReactionDisposition(kept.items, 2,
+    { kind: "reaction-transition", promptLane: "steer", priorityEmoji: "🔥" });
+  assert.equal(repeated.changed, false);
+  const priority = applyTelegramQueuePromptReactionDisposition(kept.items, 2,
+    { kind: "reaction-transition", promptLane: "priority", priorityEmoji: "👍" }, 30);
+  assert.equal(priority.items[0]!.queueLane, "priority");
+  assert.equal(priority.items[0]!.laneOrder, 30);
+});
+
+test("Steer idle dispatch pins original objects and consumes one reply and voice owner at agent_start", () => {
+  const attachment = { path: "/tmp/packet.txt", fileName: "packet.txt" };
+  const first = createQueueTestPromptTurn({ queueLane: "steer", historyText: "first", target: { chatId: 1, threadId: 7 }, voiceReplyPreferred: true });
+  const image = { type: "image" as const, data: "AA==", mimeType: "image/png" };
+  const second = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 2, laneOrder: 2,
+    target: first.target, sourceMessageIds: [3, 4], content: [image], historyText: "second",
+    voiceReplyRequired: true, queuedAttachments: [attachment] });
+  const normal = createQueueTestPromptTurn({ queueOrder: 3, laneOrder: 3 });
+  const store = createTelegramQueueStore<string>();
+  store.setQueuedItems([first, second, normal]);
+  let pending = false;
+  let sourceCalls = 0;
+  const payloads: PendingTelegramTurn["content"][] = [];
+  const controller = createTelegramQueueDispatchRuntime<string>({ ...store,
+    isIdle: () => true, hasPendingMessages: () => false, hasActiveTurn: () => false,
+    hasDispatchPending: () => pending, isCompactionInProgress: () => false,
+    updateStatus: () => {}, sendTextReply: async () => undefined,
+    steerDispatch: { commitPacket(items) {
+      sourceCalls += 1;
+      assert.deepEqual(items, [first, second]);
+      assert.ok(items.every(item => item.steerAttempted));
+      controller.dispatchNext("ctx"); // A source callback cannot re-enter the critical section.
+      return true;
+    } },
+    onPromptDispatchStart: () => { pending = true; },
+    onPromptDispatchFailure: () => assert.fail("No submission failure expected"),
+    sendUserMessage: content => payloads.push(content),
+  });
+  controller.dispatchNext("ctx");
+  controller.dispatchNext("ctx");
+  assert.equal(sourceCalls, 1);
+  assert.equal(payloads.length, 1);
+  assert.deepEqual(payloads[0], [{ type: "text", text: "[telegram]\n" },
+    ...first.content, { type: "text", text: "\n\n" }, image]);
+  assert.equal(payloads[0]![3], image);
+  const promptGuidance = buildTelegramBridgeSystemPrompt({
+    prompt: payloads[0]!.filter(block => block.type === "text").map(block => block.text).join("\n"),
+    systemPrompt: "base", localSystemPromptSuffix: "local", telegramTurnSystemPromptSuffix: "telegram",
+  });
+  assert.match(String(promptGuidance.systemPrompt), /The current user message came from Telegram/);
+  assert.deepEqual(store.getQueuedItems(), [first, second, normal]);
+  assert.deepEqual(first.sourceMessageIds, [2], "Original source groups are never rewritten");
+  assert.equal(first.historyText, "first");
+  assert.equal(countExecutableTelegramQueueItems(store.getQueuedItems()), 1);
+  const control = createQueueTestControlItem<string>();
+  const mutation = createTelegramQueueMutationController<string>({ ...store,
+    hasPendingDispatch: () => pending, updateStatus: () => {} });
+  mutation.append(control, "ctx");
+  assert.equal(store.getQueuedItems()[0], first, "Control admission cannot displace Pi's owned packet head");
+  const plan = buildTelegramAgentStartPlan({ queuedItems: store.getQueuedItems(), hasActiveTurn: false,
+    hasPendingDispatch: pending });
+  const active = plan.activeTurn!;
+  assert.equal(active.replyToMessageId, first.replyToMessageId);
+  assert.equal(active.target, first.target);
+  assert.deepEqual(active.sourceMessageIds, [2, 3, 4]);
+  assert.deepEqual(active.steerPacketSourceOrders, [1, 2]);
+  assert.equal(active.steerPacketTail, undefined);
+  assert.equal(active.voiceReplyPreferred, true);
+  assert.equal(active.voiceReplyRequired, true);
+  assert.equal(active.queuedAttachments[0], attachment);
+  assert.deepEqual(active.content, payloads[0]);
+  assert.equal(active.historyText, "first\n\nsecond");
+  assert.deepEqual(plan.remainingItems, [control, normal]);
+});
+
+test("Steer idle readiness yields to native, compaction, active, pending, and source-head barriers", () => {
+  for (const mode of ["native", "compaction", "active", "pending", "busy", "source", "mutation", "context", "missing-port", "capacity"] as const) {
+    const first = createQueueTestPromptTurn({ queueLane: "steer",
+      admissionReceipts: [createTelegramQueueAdmissionReceipt({ queueKind: "prompt", scope: "guard", sourceUpdateIds: [1] })!],
+      ...(mode === "capacity" ? { content: [{ type: "text", text: "x".repeat(TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BYTES) }] } : {}) });
+    const second = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 2, laneOrder: 2 });
+    const store = createTelegramQueueStore<string>(); store.setQueuedItems([first, second]);
+    const controller = createTelegramQueueDispatchRuntime<string>({ ...store,
+      isIdle: () => mode !== "busy", hasPendingMessages: () => mode === "native", hasActiveTurn: () => mode === "active",
+      hasDispatchPending: () => mode === "pending", isCompactionInProgress: () => mode === "compaction",
+      isQueueItemAdmissionReady: item => mode !== "source" || item !== first,
+      isQueueItemTransportActive: item => mode !== "source" || item !== first,
+      hasPendingInboundQueueMutationForItem: item => mode === "mutation" && item === first,
+      ...(mode === "missing-port" ? {} : { steerDispatch: {
+        isContextCurrent: () => mode !== "context", commitPacket: () => assert.fail(`No source mutation in ${mode}`),
+      } }),
+      updateStatus: () => {}, sendTextReply: async () => undefined,
+      onPromptDispatchStart: () => assert.fail(`No pending head in ${mode}`),
+      onPromptDispatchFailure: () => assert.fail(`Not an attempted failure in ${mode}`),
+      sendUserMessage: () => assert.fail(`No input in ${mode}`),
+    });
+    controller.dispatchNext("ctx");
+    assert.deepEqual(store.getQueuedItems(), [first, second]);
+    assert.equal(first.steerAttempted, undefined);
+    assert.equal(second.steerAttempted, undefined);
+  }
+});
+
+test("Steer idle attempts freeze refused, partial, stale, and unknown outcomes without SDK replay", () => {
+  for (const mode of ["refused", "partial", "throws", "native", "source", "generation", "unknown-send", "after-start"] as const) {
+    const first = createQueueTestPromptTurn({ queueLane: "steer" });
+    const second = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 2, laneOrder: 2 });
+    const store = createTelegramQueueStore<string>(); store.setQueuedItems([first, second]);
+    let generation = 1, commits = 0, submissions = 0, failures = 0;
+    let native = false, source = true;
+    const controller = createTelegramQueueDispatchController<string>({ ...store,
+      canDispatch: () => !native, getDispatchGeneration: () => generation,
+      isDispatchGenerationActive: captured => captured === generation,
+      isQueueItemTransportActive: () => source, updateStatus: () => {}, sendTextReply: async () => undefined,
+      steerDispatch: { canSubmit: () => !native, commitPacket(items) {
+        commits += 1;
+        assert.ok(items.every(item => item.steerAttempted));
+        if (mode === "throws") throw Error("receipt unavailable");
+        if (mode === "native") native = true;
+        if (mode === "source") source = false;
+        if (mode === "generation") generation = 2;
+        return mode !== "refused" && mode !== "partial";
+      } },
+      onPromptDispatchStart: () => { if (mode === "after-start") native = true; },
+      onPromptDispatchFailure: () => { failures += 1; },
+      sendUserMessage: () => { submissions += 1; throw Error("SDK issuance outcome unknown"); },
+    });
+    controller.dispatchNext("ctx");
+    native = false; source = true;
+    controller.dispatchNext("ctx");
+    assert.equal(commits, 1);
+    assert.equal(submissions, mode === "unknown-send" ? 1 : 0);
+    assert.equal(failures, mode === "generation" ? 0 : 1,
+      "Same-session refusals clear our pending flag; obsolete failures cannot clear replacement flags");
+    assert.deepEqual(store.getQueuedItems(), [first, second]);
+    assert.ok(store.getQueuedItems().every(item => item.kind === "prompt" && item.steerAttempted));
+    assert.equal(countExecutableTelegramQueueItems(store.getQueuedItems()), 0);
+    assert.deepEqual(consumeDispatchedTelegramPrompt(store.getQueuedItems(), false).remainingItems, [first, second]);
+  }
+});
+
+test("Next announces one Steer packet at the first original anchor and cancellation issues nothing", async () => {
+  for (const cancel of [false, true]) {
+    const first = createQueueTestPromptTurn({ queueLane: "steer", replyToMessageId: 10 });
+    const second = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 2, laneOrder: 2, replyToMessageId: 11 });
+    const store = createTelegramQueueStore<string>(); store.setQueuedItems([first, second]);
+    const events: string[] = [];
+    let release!: () => void;
+    const notice = new Promise<void>(resolve => { release = resolve; });
+    const controller = createTelegramQueueDispatchController<string>({ ...store,
+      canDispatch: () => true, updateStatus: () => {},
+      sendTextReply: async (_chatId, anchor) => { events.push(`notice:${anchor}`); await notice; return 99; },
+      reconcileNextDispatchAnnouncementReplyOwnership: item => { events.push(`claim:${item.replyToMessageId}`); },
+      steerDispatch: { commitPacket: packet => { assert.deepEqual(packet, [first, second]); events.push("commit"); return true; } },
+      onPromptDispatchStart: () => { events.push("start"); },
+      onPromptDispatchFailure: () => assert.fail("No failure expected"),
+      sendUserMessage: () => { events.push("send"); },
+    });
+    controller.requestNextDispatchAnnouncement(); controller.dispatchNext("ctx");
+    assert.deepEqual(events, ["notice:10"]);
+    assert.equal(first.steerAttempted, undefined, "Notice preparation is still editable waiting input");
+    if (cancel) controller.cancelNextDispatchAnnouncement();
+    release(); await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(events, cancel ? ["notice:10", "claim:10"] : ["notice:10", "claim:10", "commit", "start", "send"]);
+    assert.equal(first.steerAttempted, cancel ? undefined : true);
+  }
+});
+
+test("Steer boundary publishes one whole packet without consuming active reply ownership", () => {
+  const first = createQueueTestPromptTurn({ queueLane: "steer", laneOrder: 1, queueOrder: 2,
+    content: [{ type: "text", text: "first" }, { type: "image", data: "aW1hZ2U=", mimeType: "image/png" }] });
+  const second = createQueueTestPromptTurn({ queueLane: "steer", laneOrder: 2, queueOrder: 3,
+    content: [{ type: "text", text: "second" }] });
+  const normal = createQueueTestPromptTurn({ queueOrder: 4 });
+  const active = createQueueTestPromptTurn({ queueOrder: 1 });
+  const store = createTelegramQueueStore([first, second, normal]);
+  let commits = 0;
+  const runtime = createTelegramSteerBoundaryRuntime({ ...store, getGeneration: () => 1,
+    isContextCurrent: () => true, isBlocked: () => false, isItemCurrent: () => true,
+    isItemReady: () => true, getActiveTurn: () => active, updateStatus: () => {}, discardItem: () => true,
+    commitPacket(items) {
+      commits++;
+      assert.deepEqual(items, [first, second]);
+      assert.ok(items.every(item => item.steerAttempted));
+      return true;
+    },
+  });
+  const result = runtime.onTurnEnd({ turnIndex: 2, outcome: "completed" }, "ctx");
+  assert.equal(result?.continue, true);
+  assert.equal(result?.entries?.length, 1);
+  const entry = result!.entries![0]!;
+  assert.equal(entry.type, "custom_message");
+  if (entry.type !== "custom_message") assert.fail("expected custom message");
+  assert.deepEqual(entry.content, [
+    ...first.content, { type: "text", text: "\n\n" }, ...second.content,
+  ]);
+  assert.deepEqual(store.getQueuedItems(), [normal]);
+  assert.equal(active.queueOrder, 1);
+  assert.equal(runtime.onTurnEnd({ turnIndex: 3, outcome: "completed" }, "ctx"), undefined);
+  assert.equal(commits, 1);
+});
+
+test("Steer boundary withholds blocked or stale work before any source disposition", () => {
+  for (const mode of ["blocked", "stale", "aborted", "error", "changed-during-read", "wrong-active-target"] as const) {
+    const turn = createQueueTestPromptTurn({ queueLane: "steer" });
+    const store = createTelegramQueueStore([turn]);
+    let generation = 1, reads = 0;
+    const runtime = createTelegramSteerBoundaryRuntime({ ...store, getGeneration: () => generation,
+      isContextCurrent: () => mode !== "stale", isBlocked: () => mode === "blocked",
+      isItemCurrent: () => true,
+      isItemReady: () => { if (mode === "changed-during-read" && ++reads === 1) generation++; return true; },
+      getActiveTurn: () => mode === "wrong-active-target" ? createQueueTestPromptTurn({ chatId: 9 }) : undefined,
+      updateStatus: () => {}, discardItem: () => { assert.fail("no discard"); },
+      commitPacket: () => { assert.fail("no commit"); },
+    });
+    const outcome = mode === "aborted" ? "aborted" : mode === "error" ? "error" : "completed";
+    assert.equal(runtime.onTurnEnd({ turnIndex: 1, outcome }, "ctx"), undefined, mode);
+    assert.equal(turn.steerAttempted, undefined, mode);
+    assert.strictEqual(store.getQueuedItems()[0], turn);
+  }
+});
+
+test("Steer partial or failed settlement freezes exact objects and cannot replay or fold them", () => {
+  for (const mode of ["partial", "throw", "lost-context", "lost-source", "lost-active-target", "removed"] as const) {
+    const first = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 1, laneOrder: 1 });
+    const second = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 2, laneOrder: 2 });
+    const store = createTelegramQueueStore([first, second]);
+    let generation = 1, commits = 0, sourceCurrent = true;
+    let active: PendingTelegramTurn | undefined;
+    const runtime = createTelegramSteerBoundaryRuntime({ ...store, getGeneration: () => generation,
+      isContextCurrent: () => true, isBlocked: () => false, isItemCurrent: () => sourceCurrent,
+      isItemReady: () => true, getActiveTurn: () => active, updateStatus: () => {}, discardItem: () => true,
+      commitPacket: () => {
+        commits++;
+        if (mode === "throw") throw new Error("settlement failed");
+        if (mode === "lost-context") generation++;
+        if (mode === "lost-source") sourceCurrent = false;
+        if (mode === "lost-active-target") active = createQueueTestPromptTurn({ chatId: 8 });
+        if (mode === "removed") store.setQueuedItems([]);
+        return mode !== "partial";
+      },
+    });
+    assert.equal(runtime.onTurnEnd({ turnIndex: 1, outcome: "completed" }, "ctx"), undefined, mode);
+    assert.ok(first.steerAttempted && second.steerAttempted);
+    assert.equal(runtime.onTurnEnd({ turnIndex: 2, outcome: "completed" }, "ctx"), undefined, mode);
+    assert.equal(commits, 1);
+    assert.equal(createTelegramQueueItemCountGetter(store)(), 0);
+    assert.deepEqual(partitionTelegramQueueItemsForHistory(store.getQueuedItems()).historyTurns, []);
+    const reaction = applyTelegramQueuePromptReactionDisposition(store.getQueuedItems(), 2,
+      { kind: "reaction-transition", promptLane: "default", suppressionEmoji: "👎" }, 8);
+    assert.equal(reaction.changed, false);
+    assert.equal(removeTelegramQueueItemsByMessageIds(store.getQueuedItems(), [2]).removedCount, 0);
+  }
+});
+
+test("Waiting Steer cannot be absorbed by ordinary abort-history folding", () => {
+  const steer = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 2 });
+  const normal = createQueueTestPromptTurn();
+  const partition = partitionTelegramQueueItemsForHistory([normal, steer]);
+  assert.deepEqual(partition.historyTurns, [normal]);
+  assert.deepEqual(partition.remainingItems, [steer]);
+});
+
+test("Steer skip settles before removal and leaves later packet selection independent", () => {
+  const skipped = createQueueTestPromptTurn({ queueLane: "steer", reactionSuppressionEmoji: "👎" });
+  const kept = createQueueTestPromptTurn({ queueLane: "steer", queueOrder: 2, laneOrder: 2 });
+  for (const settled of [false, true]) {
+    const store = createTelegramQueueStore([skipped, kept]);
+    let commits = 0;
+    const runtime = createTelegramSteerBoundaryRuntime({ ...store, getGeneration: () => 1,
+      isContextCurrent: () => true, isBlocked: () => false, isItemCurrent: () => true,
+      isItemReady: () => true, getActiveTurn: () => undefined, updateStatus: () => {},
+      discardItem: (item) => { assert.strictEqual(item, skipped); return settled; },
+      commitPacket: (items) => { commits++; assert.deepEqual(items, [kept]); return true; },
+    });
+    const result = runtime.onTurnEnd({ turnIndex: 1, outcome: "completed" }, "ctx");
+    assert.equal(result?.continue, settled ? true : undefined);
+    if (settled) {
+      const entry = result!.entries![0]!;
+      assert.equal(entry.type, "custom_message");
+      if (entry.type === "custom_message") assert.deepEqual(entry.content, kept.content, "A singleton adds no label or separator");
+    }
+    assert.equal(commits, settled ? 1 : 0);
+    if (!settled) assert.strictEqual(store.getQueuedItems()[0], skipped);
+  }
 });
 
 test("Queue planning rejects invalid queue admission", () => {
@@ -574,6 +946,25 @@ test("Queue admission deduplicates exact receipts and rejects conflicts", () => 
       }),
     /overlaps an existing receipt/u,
   );
+});
+
+test("Steer handoff codec preserves only compatible unspent input and refuses attempted projections", () => {
+  const receipt = createTelegramQueueAdmissionReceipt({ queueKind: "prompt", scope: "steer-wire", sourceUpdateIds: [1, 2] })!;
+  const prompt = createQueueTestPromptTurn({ queueLane: "steer", admissionReceipts: [receipt],
+    priorityEmoji: "🔥", reactionSuppressionEmoji: "👎", target: { chatId: 1, threadId: 7 },
+    content: [{ type: "text", text: "whole group" }, { type: "image", data: "AA==", mimeType: "image/png" }] });
+  assert.throws(() => createTelegramQueueHandoffPayload(prompt), /requires compatible lane support/);
+  const payload = createTelegramQueueHandoffPayload(prompt, { steerSupported: true });
+  assert.deepEqual(parseTelegramQueueHandoffPayload(payload), payload);
+  assert.deepEqual(restoreTelegramQueueHandoffPayload(payload, () => assert.fail("No closure")), prompt);
+  for (const marker of [{ steerAttempted: true }, { steerAttempted: false }, { steerPacketTail: [] }, { steerPacketSourceOrders: [1] }]) {
+    assert.equal(parseTelegramQueueHandoffPayload({ ...payload, ...marker }), undefined);
+  }
+  for (const marker of [{ steerAttempted: true as const }, { steerPacketTail: [] }, { steerPacketSourceOrders: [1] }]) {
+    assert.throws(() => createTelegramQueueHandoffPayload({ ...prompt, ...marker }, { steerSupported: true }), /cannot be transferred/);
+  }
+  assert.equal(parseTelegramQueueHandoffPayload({ ...payload, guestQueryId: "guest" }), undefined);
+  assert.throws(() => createTelegramQueueHandoffPayload({ ...prompt, guestQueryId: "guest" }, { steerSupported: true }), /Guest prompts/);
 });
 
 test("Queue handoff payload preserves prompts and reconstructs controls without serializing closures", async () => {
@@ -979,6 +1370,25 @@ test("Queue mutation controller binds queue accessors to runtime mutations", () 
     "discard:e:control",
     "e",
   ]);
+});
+
+test("Guest Skip cannot discard Pi's pending head but can discard a waiting guest behind it", () => {
+  const head = createQueueTestPromptTurn({ queueOrder: 1, guestQueryId: "issued", guestInlineMessageId: "issued-inline" });
+  const waiting = createQueueTestPromptTurn({ queueOrder: 2, guestQueryId: "waiting", guestInlineMessageId: "waiting-inline" });
+  const store = createTelegramQueueStore<string>([head, waiting]);
+  const discarded: TelegramQueueItem<string>[] = [];
+  const controller = createTelegramQueueMutationController<string>({ ...store,
+    hasPendingDispatch: () => true, onItemsDiscarded: items => { discarded.push(...items); },
+    updateStatus: () => {},
+  });
+  assert.equal(controller.removeGuestPromptByQueueOrder?.(1, "ctx"), false);
+  assert.deepEqual(discarded, []);
+  assert.deepEqual(store.getQueuedItems(), [head, waiting]);
+  assert.equal(controller.removeGuestPromptByQueueOrder?.(2, "ctx"), true);
+  assert.deepEqual(discarded, [waiting]);
+  const consumed = consumeDispatchedTelegramPrompt(store.getQueuedItems(), true);
+  assert.strictEqual(consumed.activeTurn, head, "agent_start keeps the exact issued reply owner");
+  assert.deepEqual(consumed.remainingItems, []);
 });
 
 test("Queue order discard retains a guest prompt when durable settlement fails", () => {
@@ -1485,7 +1895,7 @@ test("Queue priority reactions apply to attachment-only prompt turns", () => {
   assert.equal(prioritized.items[0]?.statusSummary, "📎 voice.ogg");
 });
 
-test("Queued status formatting keeps the terminal status bar compact", () => {
+test("Executable queue counts include controls and exclude suppressed prompts", () => {
   const priorityPrompt: TelegramQueueItem = createQueueTestPromptTurn({
     replyToMessageId: 1,
     sourceMessageIds: [11],
@@ -1517,12 +1927,12 @@ test("Queued status formatting keeps the terminal status bar compact", () => {
     statusSummary: "⚡ status",
   });
   const items = [controlItem, priorityPrompt, skippedPrompt, defaultPrompt];
-  assert.equal(formatQueuedTelegramItemsStatus(items), " +3");
+  assert.equal(countExecutableTelegramQueueItems(items), 3);
   assert.equal(
     createTelegramQueueItemCountGetter({ getQueuedItems: () => items })(),
     3,
   );
-  assert.equal(formatQueuedTelegramItemsStatus([skippedPrompt]), "");
+  assert.equal(countExecutableTelegramQueueItems([skippedPrompt]), 0);
 });
 
 test("Queue enqueue planning folds queued prompts into history when requested", () => {
@@ -2307,40 +2717,83 @@ test("Agent end runtime records Guest Mode ACK edit failure without rejecting th
   assert.deepEqual(events, ["record:guest-ack-edit", "dispatch"]);
 });
 
-test("Agent end runtime records a Guest Mode ACK turn without editable text", async () => {
-  const events: string[] = [];
-  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
-    chatId: 0,
-    replyToMessageId: 0,
-    guestQueryId: "guest-1",
-    guestInlineMessageId: "inline-1",
-    queuedAttachments: [{ path: "/tmp/demo.txt", fileName: "demo.txt" }],
+for (const text of [undefined, "final caption"]) {
+  test(`Agent end runtime delivers a Guest Mode ACK attachment before text (caption=${!!text})`, async () => {
+    const events: unknown[] = [];
+    const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+      chatId: 0,
+      replyToMessageId: 0,
+      guestQueryId: "guest-1",
+      guestInlineMessageId: "inline-1",
+      queuedAttachments: [{ path: "/tmp/photo.png", fileName: "photo.png" }],
+    });
+    await handleTelegramAgentEndRuntime({
+      turn,
+      assistant: { text },
+      foldQueuedPromptsIntoHistory: false,
+      resetRuntimeState: () => {},
+      updateStatus: () => {},
+      dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+      clearPreview: async () => {},
+      setPreviewPendingText: () => {},
+      finalizeMarkdownPreview: async () => false,
+      sendMarkdownReply: async () => assert.fail("Guest media cannot use chat delivery"),
+      sendTextReply: async () => {},
+      sendQueuedAttachments: async () => assert.fail("Guest media cannot use chat uploads"),
+      answerGuestQuery: async () => assert.fail("The guest query is already answered"),
+      stopGuestPlaceholder: async (id) => { events.push(["stop", id]); },
+      sendGuestAttachment: async (capturedTurn, attachment, caption) => {
+        assert.equal(capturedTurn, turn);
+        events.push(["attachment", capturedTurn.guestInlineMessageId, attachment.path, caption]);
+      },
+      editGuestReply: async () => assert.fail("Text must not replace queued media"),
+      recordRuntimeEvent: (_category, _error, details) => { events.push(`record:${details?.phase}`); },
+    });
+    assert.deepEqual(events, [
+      ["stop", "inline-1"],
+      ["attachment", "inline-1", "/tmp/photo.png", text],
+      "dispatch",
+    ]);
   });
-  await handleTelegramAgentEndRuntime({
-    turn,
-    assistant: {},
-    foldQueuedPromptsIntoHistory: false,
-    resetRuntimeState: () => {},
-    updateStatus: () => {},
-    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
-    clearPreview: async () => {},
-    setPreviewPendingText: () => {},
-    finalizeMarkdownPreview: async () => false,
-    sendMarkdownReply: async () => {},
-    sendTextReply: async () => {},
-    sendQueuedAttachments: async () => {},
-    sendGuestAttachment: async () => {
-      events.push("unexpected:attachment");
-    },
-    editGuestReply: async () => {
-      events.push("unexpected:edit");
-    },
-    recordRuntimeEvent: (_category, _error, details) => {
-      events.push(`record:${details?.phase}`);
-    },
+}
+
+for (const scenario of ["upload-failure", "unknown-edit", "voice", "retired-placeholder", "missing-sender"] as const) {
+  test(`Guest ACK completion handles ${scenario} explicitly`, async () => {
+    const events: string[] = [];
+    let active = true;
+    await handleTelegramAgentEndRuntime({
+      turn: createQueueTestPromptTurn({
+        guestQueryId: "guest", guestInlineMessageId: "inline",
+        queuedAttachments: scenario === "voice" ? [] : [{ path: "photo.png", fileName: "photo.png" }],
+      }),
+      assistant: { text: "result" }, foldQueuedPromptsIntoHistory: false,
+      resetRuntimeState() {}, updateStatus() {}, isSessionActive: () => active,
+      dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+      clearPreview: async () => {}, setPreviewPendingText() {}, finalizeMarkdownPreview: async () => false,
+      sendMarkdownReply: async () => {}, sendTextReply: async () => {}, sendQueuedAttachments: async () => {},
+      answerGuestQuery: async () => assert.fail("Already answered"),
+      planOutboundReply: () => scenario === "voice" ? { markdown: "", voiceText: "spoken" } : { markdown: "result" },
+      sendGuestVoiceReply: async () => assert.fail("Inline voice edit is unsupported"),
+      stopGuestPlaceholder: async () => { if (scenario === "retired-placeholder") active = false; },
+      sendGuestAttachment: scenario === "missing-sender" ? undefined : async (_turn, _file, _caption, options) => {
+        assert.equal(options?.isDeliveryActive?.(), true);
+        events.push("attachment");
+        if (scenario === "unknown-edit") throw new TelegramApiCommitUnknownError("editMessageMedia", new Error("timeout"));
+        throw new Error("upload failed");
+      },
+      editGuestReply: async (_id, text) => {
+        assert.match(text, scenario === "voice" ? /cannot replace.*voice note/ : /could not deliver.*attachment/);
+        events.push("notice");
+      },
+      recordRuntimeEvent: (_category, _error, details) => events.push(`record:${details?.phase}`),
+    });
+    assert.deepEqual(events, scenario === "retired-placeholder" ? []
+      : scenario === "unknown-edit" ? ["attachment", "record:guest-attachment", "dispatch"]
+      : scenario === "voice" ? ["notice", "record:guest-ack-edited", "dispatch"]
+      : scenario === "missing-sender" ? ["record:guest-attachment", "notice", "record:guest-ack-edited", "dispatch"]
+      : ["attachment", "record:guest-attachment", "notice", "record:guest-ack-edited", "dispatch"]);
   });
-  assert.deepEqual(events, ["record:guest-ack-edit-empty", "dispatch"]);
-});
+}
 
 for (const [boundary, stage] of [
   ["turn", "synthesis"], ["session", "synthesis"],
@@ -3496,10 +3949,13 @@ for (const timing of ["queued", "flushing"] as const) {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let active = true;
     const effects: string[] = [];
-    const preview = createTelegramPreviewController({ sendDraft: async () => { effects.push("clear"); } });
-    const original = preview.createState();
-    original.mode = "draft"; original.draftId = 1; original.flushPromise = gate;
-    preview.setState(original);
+    // A real issued draft whose request is still in flight: the draft send waits on the gate, the clear is recorded.
+    const preview = createTelegramPreviewController({ minDraftIntervalMs: 0,
+      sendDraft: async (_chat, _draft, text) => { if (text !== undefined) { await gate; return; } effects.push("clear"); } });
+    preview.resetState(); preview.setPendingText("Draft in flight");
+    const inFlight = preview.flush(7);
+    const original = preview.getState()!;
+    assert.equal(original.draftId, 1); assert.equal(preview.isFlushing(), true);
     let task: (() => Promise<void>) | undefined;
     let delivery: Promise<void> | undefined;
     let hook: Promise<void> | undefined;
@@ -3527,8 +3983,8 @@ for (const timing of ["queued", "flushing"] as const) {
         delivery = task();
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
-      const next = preview.createState();
-      if (replacement === "preview") preview.setState(next);
+      if (replacement === "preview") preview.resetState();
+      const next = preview.getState();
       if (replacement === "authority") active = false;
       if (timing === "queued") delivery = task();
       release();
@@ -3537,9 +3993,9 @@ for (const timing of ["queued", "flushing"] as const) {
         ...(replacement === "none" ? ["clear"] : []),
         ...(stopReason === "error" && replacement !== "authority" ? ["error"] : []),
       ]);
-      assert.equal(preview.getState(), replacement === "none" ? undefined : replacement === "preview" ? next : original);
+      assert.equal(preview.getState()?.id, replacement === "none" ? undefined : replacement === "preview" ? next?.id : original.id);
     } finally {
-      release(); await hook; await delivery; preview.invalidate();
+      release(); await hook; await delivery; await inFlight; preview.invalidate();
     }
   });
 }
@@ -5552,8 +6008,9 @@ test("Dispatch runtime idles on none and executes control items directly", () =>
   assert.deepEqual(events, ["idle", "control"]);
 });
 
-test("Dispatch runtime sends prompt turns as normal user messages", () => {
+test("Dispatch runtime sends prompt turns as normal user messages with the exact typing target", () => {
   const events: string[] = [];
+  const target = { chatId: 2, threadId: 42 };
   executeTelegramQueueDispatchPlan(
     {
       kind: "prompt",
@@ -5569,6 +6026,7 @@ test("Dispatch runtime sends prompt turns as normal user messages", () => {
         content: [{ type: "text", text: "prompt" }],
         historyText: "prompt",
         statusSummary: "prompt",
+        target,
       },
       remainingItems: [],
     },
@@ -5576,7 +6034,8 @@ test("Dispatch runtime sends prompt turns as normal user messages", () => {
       executeControlItem: () => {
         events.push("control");
       },
-      onPromptDispatchStart: (chatId) => {
+      onPromptDispatchStart: (chatId, selectedTarget) => {
+        assert.deepEqual(selectedTarget, target);
         events.push(`start:${chatId}`);
       },
       sendUserMessage: (_content, options) => {
@@ -6283,7 +6742,7 @@ test("Queue dispatch clears a suppressed final item without a model turn", () =>
 
   controller.dispatchNext("ctx");
   assert.deepEqual(events, ["items:0", "status"]);
-  assert.equal(formatQueuedTelegramItemsStatus(queuedItems), "");
+  assert.equal(countExecutableTelegramQueueItems(queuedItems), 0);
 });
 
 test("Queue dispatch waits for earlier pending inbound queue mutations", () => {

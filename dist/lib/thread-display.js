@@ -4,7 +4,9 @@
  * Owns mode-specific labels and serialized, authority-fenced title application.
  * Excludes routing, name allocation, profile mutation, and live-owner discovery.
  */
+import { homedir } from "node:os";
 import { isDeepStrictEqual } from "node:util";
+import { normalizeTelegramWorkspacePath } from "./workspace-identity.js";
 function labelText(value) {
     return value.replace(/\s+/gu, " ").trim();
 }
@@ -20,14 +22,16 @@ function boundedLabel(base, suffix = "") {
 function directorySegments(cwd) {
     return cwd.split("/").filter(Boolean);
 }
-function distinguishingDirectorySegments(cwd, directories) {
-    const parts = directorySegments(cwd);
+function distinguishingDirectorySegments(cwd, directories, homeDirectory) {
+    // Substitute only exact home identity; qualification must still distinguish ordinary folders named home.
+    const segments = (directory) => directory === homeDirectory ? ["home"] : directorySegments(directory);
+    const parts = segments(cwd);
     if (!parts.length)
         return [];
     for (let depth = 1; depth <= parts.length; depth++) {
         const candidate = labelText(parts.slice(-depth).join("/"));
         const collides = directories.some((other) => other !== cwd &&
-            labelText(directorySegments(other).slice(-depth).join("/")).toLowerCase() === candidate.toLowerCase());
+            labelText(segments(other).slice(-depth).join("/")).toLowerCase() === candidate.toLowerCase());
         if (!collides)
             return parts.slice(-depth);
     }
@@ -45,8 +49,8 @@ export function tokenizeTelegramDirectorySegment(segment) {
         .split(/[^\p{L}\p{N}]+|\u0000/gu)
         .filter(Boolean);
 }
-function formatDirectoryLabel(cwd, directories, mode) {
-    const segments = distinguishingDirectorySegments(cwd, directories);
+function formatDirectoryLabel(cwd, directories, mode, homeDirectory) {
+    const segments = distinguishingDirectorySegments(cwd, directories, homeDirectory);
     if (!segments.length)
         return "/";
     const formatted = segments
@@ -99,6 +103,10 @@ function countTelegramDisplayLabels(bindings, labels, mode, liveBindingKeys) {
 }
 export function resolveTelegramWorkspaceDisplayNames(bindings, mode, liveBindingKeys = new Set()) {
     const labels = new Map();
+    const homeDirectory = (mode === "directory-snake" || mode === "directory-title") &&
+        (process.platform === "linux" || process.platform === "darwin")
+        ? normalizeTelegramWorkspacePath(homedir())
+        : undefined;
     const directories = Array.from(new Set(bindings.map((binding) => binding.cwd)));
     const liveDirectoryCounts = new Map();
     for (const binding of bindings) {
@@ -127,7 +135,7 @@ export function resolveTelegramWorkspaceDisplayNames(bindings, mode, liveBinding
         else {
             const base = mode === "directories"
                 ? directoryLabel(binding.cwd, directories)
-                : formatDirectoryLabel(binding.cwd, directories, mode);
+                : formatDirectoryLabel(binding.cwd, directories, mode, homeDirectory);
             bases.set(binding.bindingKey, base);
             const showSuffix = mode === "directories"
                 ? binding.showSlotSuffix ||

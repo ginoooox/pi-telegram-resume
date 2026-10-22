@@ -42,13 +42,13 @@ export interface TelegramModelMenuInputCacheDeps<TModel extends MenuModel = Menu
     cacheTtlMs: number;
     now?: number;
     reloadSettings: () => Promise<void>;
-    refreshAvailableModels: () => TModel[];
+    refreshAvailableModels: () => TModel[] | Promise<TModel[]>;
     getConfiguredScopedModelPatterns: () => string[] | undefined;
     getCliScopedModelPatterns: () => string[] | undefined;
 }
 export interface TelegramModelMenuRuntimeContext<TModel extends MenuModel = MenuModel> {
     modelRegistry: {
-        refresh: () => void;
+        refresh: () => void | Promise<unknown>;
         getAvailable: () => TModel[];
     };
 }

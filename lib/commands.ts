@@ -53,7 +53,7 @@ import {
 } from "./updates.ts";
 
 export type TelegramHeldCommandName =
-  "status" | "abort" | "stop" | "next" | "continue";
+  "status" | "start" | "help" | "abort" | "stop" | "next" | "continue";
 
 /** Commands-owned no-fold admission over the ordinary recipient queue; source reporting stays separate from removal. */
 export interface TelegramHeldTurnAdmission {
@@ -2387,6 +2387,8 @@ export interface TelegramSelectedCommandAdmission {
   /** Independent exact recipient/target lifetime, including inside captured menu transport adapters. */
   assertRecipientCurrent(): void;
   reportCompleted(): boolean;
+  /** Optional recipient release barrier after acceptance; rejection suppresses effects without replay. */
+  beforeEffects?(): Promise<void>;
 }
 
 /**
@@ -2881,54 +2883,59 @@ export function createTelegramCommandHandler<
       },
     };
   };
-  const heldPlans: Record<TelegramHeldCommandName, HeldPlan> = {
-    status: {
-      completion: "before-effect",
-      effect: "showStatus",
-      prepare(ctx, effects) {
-        const scopedStatus = effects?.showStatus;
-        const captured = {
-          ...deps,
-          showStatus: scopedStatus
-            ? (
-                message: TMessage,
-                context: TContext,
-                options?: Pick<TelegramApiCallOptions, "assertAuthority">,
-              ) => {
-                const address = getTelegramCommandMessageTarget(message);
-                return scopedStatus.call(
-                  effects,
-                  address.chatId,
-                  address.replyToMessageId,
-                  context,
-                  address.threadId,
-                  options,
-                );
-              }
-            : deps.showStatus,
-        };
-        return {
-          captured,
-          portsCurrent: () => !effects || effects.showStatus === scopedStatus,
-          async run({ message, command, assertRecipient }) {
-            const recipientOptions = { assertAuthority: assertRecipient };
-            return handleTelegramCommandRuntime(
-              command.name,
-              message,
-              ctx,
-              {
-                ...captured,
-                assertExecutionCurrent: assertRecipient,
-                showStatus: (value: TMessage, context: TContext) =>
-                  captured.showStatus(value, context, recipientOptions),
-              },
-              command.args,
-              resumeLists,
-            );
-          },
-        };
-      },
+  // Held followers are already paired and bound. Start/help open the same restricted menu as status;
+  // they cannot pair an operator, bootstrap another Thread or invoke unrestricted Bot API effects.
+  const heldMenuPlan: HeldPlan = {
+    completion: "before-effect",
+    effect: "showStatus",
+    prepare(ctx, effects) {
+      const scopedStatus = effects?.showStatus;
+      const captured = {
+        ...deps,
+        showStatus: scopedStatus
+          ? (
+              message: TMessage,
+              context: TContext,
+              options?: Pick<TelegramApiCallOptions, "assertAuthority">,
+            ) => {
+              const address = getTelegramCommandMessageTarget(message);
+              return scopedStatus.call(
+                effects,
+                address.chatId,
+                address.replyToMessageId,
+                context,
+                address.threadId,
+                options,
+              );
+            }
+          : deps.showStatus,
+      };
+      return {
+        captured,
+        portsCurrent: () => !effects || effects.showStatus === scopedStatus,
+        async run({ message, command, assertRecipient }) {
+          const recipientOptions = { assertAuthority: assertRecipient };
+          return handleTelegramCommandRuntime(
+            "status",
+            message,
+            ctx,
+            {
+              ...captured,
+              assertExecutionCurrent: assertRecipient,
+              showStatus: (value: TMessage, context: TContext) =>
+                captured.showStatus(value, context, recipientOptions),
+            },
+            command.args,
+            resumeLists,
+          );
+        },
+      };
     },
+  };
+  const heldPlans: Record<TelegramHeldCommandName, HeldPlan> = {
+    status: heldMenuPlan,
+    start: heldMenuPlan,
+    help: heldMenuPlan,
     abort: {
       completion: "after-semantics",
       effect: "sendTextReply",
@@ -3172,7 +3179,8 @@ export function createTelegramCommandHandler<
           ? copySelectedMenuCarrier(original)
           : copySelectedReplyAnchor(original);
     const assertRecipientCurrent = admission.assertRecipientCurrent,
-      report = admission.reportCompleted;
+      report = admission.reportCompleted,
+      beforeEffects = admission.beforeEffects;
     const effects: TelegramHeldCommandEffects<TContext> | undefined =
       parsed.name === "status"
         ? undefined
@@ -3204,8 +3212,11 @@ export function createTelegramCommandHandler<
         throw new Error(`Selected ${parsed.name} plan owner is unavailable.`);
     };
     return issueSelectedOnce(assertCurrent, async () => {
-      if (plan.completion === "before-effect" && !report.call(admission))
-        return false;
+      if (plan.completion === "before-effect") {
+        if (!report.call(admission)) return false;
+        if (beforeEffects) await beforeEffects();
+        assertRecipientCurrent();
+      }
       return prepared.run({
         message,
         command: parsed,
@@ -3241,7 +3252,8 @@ export function createTelegramCommandHandler<
         from: { ...original.from },
       };
       const assertRecipientCurrent = admission.assertRecipientCurrent,
-        reportCompleted = admission.reportCompleted;
+        reportCompleted = admission.reportCompleted,
+        beforeEffects = admission.beforeEffects;
       const assertAdmissionCurrent = createSelectedSemanticGuard(
         admission,
         () => captured.assertExecutionCurrent?.(original),
@@ -3267,7 +3279,7 @@ export function createTelegramCommandHandler<
               );
             },
           },
-          { assertSemanticCurrent, assertRecipientCurrent, reportCompleted },
+          { assertSemanticCurrent, assertRecipientCurrent, reportCompleted, beforeEffects },
         ),
       );
     };
@@ -3711,6 +3723,7 @@ export function createTelegramCommandHandler<
       const assertSourceCurrent = admission.assertSourceCurrent,
         assertRecipientCurrent = admission.assertRecipientCurrent;
       const reportCompleted = admission.reportCompleted,
+        beforeEffects = admission.beforeEffects,
         assertExecutionCurrent = deps.assertExecutionCurrent;
       const assertIssuanceCurrent = () => {
         assertSourceCurrent.call(admission);
@@ -3743,9 +3756,12 @@ export function createTelegramCommandHandler<
       };
       return issueSelectedOnce(
         assertIssuanceCurrent,
-        async () =>
-          reportCompleted.call(admission) &&
-          handleTelegramCommandRuntime(name, message, ctx, recipientDeps, args, resumeLists),
+        async () => {
+          if (!reportCompleted.call(admission)) return false;
+          if (beforeEffects) await beforeEffects();
+          assertRecipientCurrent();
+          return handleTelegramCommandRuntime(name, message, ctx, recipientDeps, args, resumeLists);
+        },
       );
     },
   });
@@ -3870,6 +3886,7 @@ async function handleTelegramHelpCommand<
     assertSemanticCurrent(): void;
     assertRecipientCurrent(): void;
     reportCompleted(): boolean;
+    beforeEffects?(): Promise<void>;
   },
 ): Promise<boolean> {
   const assertSemanticCurrent =
@@ -3892,6 +3909,7 @@ async function handleTelegramHelpCommand<
   if (admission) {
     assertSemanticCurrent();
     if (!admission.reportCompleted()) return false;
+    if (admission.beforeEffects) await admission.beforeEffects();
     admission.assertRecipientCurrent();
   }
   const assertEffectCurrent =

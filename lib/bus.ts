@@ -142,6 +142,9 @@ export const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION =
   "durable-follower-admission-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF =
   "queue-handoff-v1" as const;
+/** Unspent Steer lane codec; independent from baseline receipt handoff support. */
+export const TELEGRAM_BUS_CAPABILITY_QUEUE_STEER = "queue-steer-v1" as const;
+export const TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY = "explicit-connect-recovery-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE =
   "input-custody-reference-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME =
@@ -156,6 +159,9 @@ export const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT =
   "session-replacement-intent-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE =
   "workspace-restore-v1" as const;
+/** Shared Workspace readers understand independent pre-dispatch input/cleanup state. */
+export const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND = "live-rebind-pre-dispatch-reader-v2" as const;
+export const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION = "live-rebind-pre-dispatch-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE =
   "live-thread-rebind-save-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY =
@@ -178,6 +184,14 @@ export const TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES = [
   TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET,
   TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
 ] as const;
+
+/** Start/help are restricted menu aliases, negotiated separately from the original held-command set. */
+export const TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES = "held-menu-aliases-v1" as const;
+export function getTelegramBusHeldCommandCapabilities(name: string): readonly string[] {
+  return name === "start" || name === "help"
+    ? [...TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES, TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES]
+    : TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES;
+}
 
 export interface TelegramBusSelectedCommandInput {
   name: string;
@@ -458,6 +472,11 @@ export function hasTelegramBusCapability(
   return identity?.capabilities.includes(capability) ?? false;
 }
 
+export function hasTelegramBusSteerQueueHandoffCapability(identity: TelegramBusProtocolIdentity | undefined): boolean {
+  return hasTelegramBusCapability(identity, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF) &&
+    hasTelegramBusCapability(identity, TELEGRAM_BUS_CAPABILITY_QUEUE_STEER);
+}
+
 export function getTelegramInputCustodyPeerReadiness(
   followers: readonly Pick<
     TelegramBusFollowerView,
@@ -665,12 +684,6 @@ function hasTelegramBusDeliveryMarker(
   );
 }
 
-export function markTelegramBusAggregateDelivery<
-  T extends Record<string, unknown>,
->(body: T): T {
-  return { ...body, [TELEGRAM_BUS_AGGREGATE_DELIVERY_FIELD]: true };
-}
-
 export function markTelegramBusCrossTargetDelivery<
   T extends Record<string, unknown>,
 >(body: T): T {
@@ -787,7 +800,7 @@ export function isTelegramFollowerApiCallAllowed(input: {
     if (apiMethod === "setMyCommands")
       return isBotCommandRegistration(input.args[1]);
     if (apiMethod === "sendChatAction")
-      return isTargetChatScoped(input.args[1]);
+      return isTargetScoped(input.args[1]);
     if (
       apiMethod === "sendMessage" &&
       hasTelegramBusDeliveryMarker(
@@ -795,8 +808,7 @@ export function isTelegramFollowerApiCallAllowed(input: {
         TELEGRAM_BUS_AGGREGATE_DELIVERY_FIELD,
       )
     ) {
-      const body = input.args[1] as Record<string, unknown>;
-      return body.message_thread_id === undefined && isTargetChatScoped(body);
+      return false;
     }
     if (
       (apiMethod === "sendMessage" || apiMethod === "sendRichMessage") &&
@@ -1006,6 +1018,7 @@ export type TelegramBusEnvelope = (
   | {
       kind: "follower.register";
       requestId: string;
+      recoverConnection?: true;
       registration: TelegramBusInstanceRegistration;
     }
   | {
@@ -1156,7 +1169,7 @@ export type TelegramBusEnvelope = (
       recipientBindingKey: string;
       operationId: string;
       sourceUpdateIds: number[];
-      mode: "release" | "discard" | "observe" | "observe-command";
+      mode: "release" | "discard" | "observe" | "observe-held" | "observe-command";
       oldTarget?: TelegramTarget & { threadId: number };
       preparedSource?: TelegramBusPreparedCommandSource;
       selectedCommand?: TelegramBusSelectedCommandInput;
@@ -1492,7 +1505,8 @@ export function parseTelegramBusEnvelope(
         ]) ||
         (Object.hasOwn(value, "preparedSource") && !selectedCommand) ||
         (value.mode === "observe-command" &&
-          (!selectedCommand || Object.hasOwn(value, "oldTarget")))
+          (!selectedCommand || Object.hasOwn(value, "oldTarget"))) ||
+        (value.mode === "observe-held" && (parseThreadTarget(value.oldTarget)?.threadId ?? 0) <= 0)
       )
         break;
       if (
@@ -1513,7 +1527,7 @@ export function parseTelegramBusEnvelope(
           : value.mode === "release" ||
             value.mode === "discard" ||
             value.mode === "observe-command" ||
-            (value.mode === "observe" &&
+            ((value.mode === "observe" || value.mode === "observe-held") &&
               !!parseThreadTarget(value.oldTarget))) &&
         isUniqueSourceUpdateIds(value.sourceUpdateIds) &&
         typeof value.sentAtMs === "number" &&
@@ -1530,9 +1544,10 @@ export function parseTelegramBusEnvelope(
             | "release"
             | "discard"
             | "observe"
+            | "observe-held"
             | "observe-command",
           sentAtMs: value.sentAtMs,
-          ...(value.mode === "observe"
+          ...((value.mode === "observe" || value.mode === "observe-held")
             ? { oldTarget: parseThreadTarget(value.oldTarget)! }
             : {}),
           ...(selectedCommand ? { selectedCommand, preparedSource } : {}),
@@ -1928,6 +1943,8 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
     message: TMessage;
     ownership: TelegramBusForwardOwnership;
     ctx: TContext;
+    /** Process-local source/recipient lifetime; never part of the wire envelope. */
+    assertAuthority?: () => void;
   }) => Promise<TelegramBusForeignUpdateSettlement>;
   forwardEditedMessage: (input: {
     message: TMessage;
@@ -2059,6 +2076,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
   const send = async (
     envelope: TelegramBusDurableForwardEnvelope,
     ownership: TelegramBusForwardOwnership,
+    assertAuthority?: () => void,
   ): Promise<TelegramBusForeignUpdateSettlement> => {
     if (
       deps.validateForwardOwnership &&
@@ -2080,10 +2098,15 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
         socketPath,
         envelope,
         timeoutMs: deps.timeoutMs ?? TELEGRAM_BUS_FOLLOWER_CONTROL_TIMEOUT_MS,
-        retry: getTelegramBusTransportRetryPolicy({
+        retry: assertAuthority ? { attempts: 1, delayMs: 0 } : getTelegramBusTransportRetryPolicy({
           endpoint: socketPath,
           operation: "operation",
         }),
+        ...(assertAuthority || deps.validateForwardOwnership ? { assertAuthority() {
+          assertAuthority?.();
+          if (deps.validateForwardOwnership && !deps.validateForwardOwnership(ownership))
+            throw new Error("Telegram follower forwarding ownership changed.");
+        } } : {}),
       });
     } catch (error) {
       return reject({
@@ -2180,6 +2203,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
       base: ForwardBase,
       sentAtMs: number,
     ) => TelegramBusDurableForwardEnvelope,
+    assertAuthority?: () => void,
   ): Promise<TelegramBusForeignUpdateSettlement> => {
     const prepared = prepare(kind, value, ownership);
     if ("settlement" in prepared) return Promise.resolve(prepared.settlement);
@@ -2194,6 +2218,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
         ? { kind: "leader.wakeInputCustody", ...base, sentAtMs: getNowMs() }
         : build(base, getNowMs()),
       ownership,
+      assertAuthority,
     );
   };
   return {
@@ -2216,7 +2241,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
           sentAtMs,
         }),
       ),
-    forwardMessage: ({ message, ownership }) =>
+    forwardMessage: ({ message, ownership, assertAuthority }) =>
       forward("leader.forwardMessage", message, ownership, (base, sentAtMs) => {
         const forwardCommentBatchPosition =
           deps.getForwardCommentBatchPosition?.(message);
@@ -2229,7 +2254,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
             : {}),
           sentAtMs,
         };
-      }),
+      }, assertAuthority),
     forwardEditedMessage: ({ message, ownership }) =>
       forward(
         "leader.forwardEditedMessage",
@@ -2417,6 +2442,7 @@ export function createTelegramBusLiveRebindController(deps: {
             | "release"
             | "discard"
             | "observe"
+            | "observe-held"
             | "observe-command";
           sourceUpdateIds: number[];
           slot: string;
@@ -2460,6 +2486,7 @@ export function createTelegramBusLiveRebindController(deps: {
           "release",
           "discard",
           "observe",
+          "observe-held",
           "observe-command",
         ].includes(input.mode) ||
           (input.mode === "observe-command" && !selectedCommand)))
@@ -2505,7 +2532,8 @@ export function createTelegramBusLiveRebindController(deps: {
           }
         : { updates: input.updates }),
     });
-    const observing = "mode" in expected && expected.mode === "observe";
+    const observing = "mode" in expected && (expected.mode === "observe" || expected.mode === "observe-held");
+    const observingHeld = "mode" in expected && expected.mode === "observe-held";
     const commandObserving =
       "mode" in expected && expected.mode === "observe-command";
     const settling =
@@ -2520,12 +2548,8 @@ export function createTelegramBusLiveRebindController(deps: {
         ? [TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY]
         : []),
       ...(settling || held ? [TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE] : []),
-      ...(held
-        ? [
-            TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET,
-            TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
-          ]
-        : []),
+      ...(observingHeld ? [TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION] : []),
+      ...(held ? getTelegramBusHeldCommandCapabilities(held.name) : []),
     ];
     const follower = deps.getFollower(expected.instanceId),
       secret = deps.getAuthSecret();
@@ -2635,7 +2659,7 @@ export function createTelegramBusLiveRebindController(deps: {
             ? {
                 kind: "leader.settleLiveRebind" as const,
                 mode: expected.mode as
-                  "release" | "discard" | "observe" | "observe-command",
+                  "release" | "discard" | "observe" | "observe-held" | "observe-command",
                 sourceUpdateIds: expected.sourceUpdateIds!,
                 ...(observing ? { oldTarget: expected.oldTarget } : {}),
               }
@@ -3273,33 +3297,42 @@ export async function sendTelegramBusLocalEnvelope(
   };
   const attempts = Math.max(1, resolvedOptions.retry?.attempts ?? 1);
   const delayMs = Math.max(0, resolvedOptions.retry?.delayMs ?? 0);
+  // Log the first failure, then only the outcome: a reloading leader would otherwise log every attempt.
   for (let attempt = 1; ; attempt += 1) {
     try {
-      return await sendTelegramBusLocalEnvelopeOnce(resolvedOptions);
+      const response = await sendTelegramBusLocalEnvelopeOnce(resolvedOptions);
+      if (attempt > 1)
+        resolvedOptions.recordTransportEvent?.("client-recovered", {
+          ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
+          ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
+          attempt,
+          attempts,
+        });
+      return response;
     } catch (error) {
       const info = classifyTelegramBusTransportError(error);
-      resolvedOptions.recordTransportEvent?.("client-failed", {
-        ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
-        ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
-        attempt,
-        attempts,
-        ...info,
-      });
-      if (
+      const final =
         error instanceof TelegramBusLocalAuthorityError ||
         attempt >= attempts ||
-        !isRetryableTelegramBusTransportError(error)
-      ) {
-        throw error;
-      }
-      resolvedOptions.recordTransportEvent?.("client-retry", {
-        ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
-        ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
-        attempt,
-        attempts,
-        delayMs,
-        ...info,
-      });
+        !isRetryableTelegramBusTransportError(error);
+      if (attempt === 1 || final)
+        resolvedOptions.recordTransportEvent?.("client-failed", {
+          ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
+          ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
+          attempt,
+          attempts,
+          ...info,
+        });
+      if (final) throw error;
+      if (attempt === 1)
+        resolvedOptions.recordTransportEvent?.("client-retry", {
+          ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
+          ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
+          attempt,
+          attempts,
+          delayMs,
+          ...info,
+        });
       await delayTelegramBusTransportRetry(delayMs);
     }
   }
@@ -3526,8 +3559,12 @@ function parseRegisterEnvelope(
   requestId: string,
   kind: "follower.register" | "follower.restoreWorkspace",
 ): TelegramBusEnvelope | undefined {
+  if (value.recoverConnection !== undefined &&
+      (kind !== "follower.register" || value.recoverConnection !== true)) return undefined;
   const registration = parseRegistration(value.registration);
-  return registration ? { kind, requestId, registration } : undefined;
+  return registration ? { kind, requestId, registration,
+    ...(kind === "follower.register" && value.recoverConnection === true ? { recoverConnection: true as const } : {}),
+  } : undefined;
 }
 
 function parseFollowerPresenceEnvelope(

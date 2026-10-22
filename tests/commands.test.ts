@@ -55,6 +55,9 @@ import {
   handleTelegramNextCommand,
   handleTelegramStopCommand,
   parseTelegramCommand,
+  parseSessionRename,
+  renameSession,
+  selectSessionToResume,
   registerTelegramBotCommands,
   registerTelegramCommand,
   registerTelegramBridgeCommands,
@@ -3077,7 +3080,7 @@ test("Held control registry refuses incomplete semantic ports before source obse
   assert.deepEqual(f.effects, []);
 });
 
-for (const name of ["status", "abort"] as const) for (const fault of ["current", "completion-refused", "effect-lost"] as const) {
+for (const name of ["status", "start", "help", "abort"] as const) for (const fault of ["current", "completion-refused", "effect-lost"] as const) {
   test(`Held command registry preserves native completion ordering and detached effects (${name}, ${fault})`, async () => {
     const f = createFencedCommandTargetFixture(), dir = mkdtempSync(join(tmpdir(), "pi-held-command-registry-"));
     const options = { path: join(dir, "journal.json"), botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "fixture" }) };
@@ -3114,7 +3117,7 @@ for (const name of ["status", "abort"] as const) for (const fault of ["current",
       recipientCurrent = true; assert.equal(held.release(() => true), true);
       await worker.waitForDrain(); await new Promise(resolve => setImmediate(resolve)); await worker.waitForDrain();
       const semantics = name === "abort" ? ["clear-model", "fold", "abort", "update"] : [];
-      assert.deepEqual(f.effects, [...semantics, "complete", ...(fault === "completion-refused" ? [] : [name === "status" ? "status" : "reply"])]);
+      assert.deepEqual(f.effects, [...semantics, "complete", ...(fault === "completion-refused" ? [] : [name === "abort" ? "reply" : "status"])]);
       assert.equal(ordinary, 0);
       assert.deepEqual(plan.inspectCompletion(), fault === "completion-refused" ? undefined : readiness.snapshot.source);
       assert.equal(journal.read().entries.length, fault === "completion-refused" ? 1 : 0);
@@ -3556,6 +3559,38 @@ for (const mode of ["current", "response"] as const) {
       assert.equal(await dispatch(), false);
     } finally { f.restore(); }
   });
+}
+
+for (const command of ["status", "model", "thinking", "queue", "settings"] as const) {
+  for (const outcome of ["release", "reject", "recipient-lost"] as const) {
+    test(`Selected menu ${command} holds its captured release barrier (${outcome})`, async () => {
+      const f = createFencedCommandTargetFixture(), gate = Promise.withResolvers<void>();
+      f.deps.openSettingsMenu = async () => { f.effects.push("settings"); };
+      let reports = 0, recipientCurrent = true;
+      const admission = {
+        assertSourceCurrent() { assert.equal(reports, 0); },
+        assertRecipientCurrent() { if (!recipientCurrent) throw new Error("Recipient ended"); },
+        reportCompleted() { reports++; f.revoke(); return true; },
+        beforeEffects: () => gate.promise,
+      };
+      const dispatch = createTelegramCommandHandlerTargetRuntime(f.deps).prepareSelectedMenuCommand(
+        { name: command, args: "" }, [f.message], f.ctx, admission)!;
+      admission.beforeEffects = async () => assert.fail("A replacement admission port cannot release the prepared command");
+      const running = dispatch();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(reports, 1);
+      assert.deepEqual(f.effects, [], "Acceptance cannot issue menu effects before release");
+      assert.equal(await dispatch(), false, "An accepted but held command is already one-shot");
+      if (outcome === "reject") gate.reject(new Error("Release refused"));
+      else { recipientCurrent = outcome !== "recipient-lost"; gate.resolve(); }
+      if (outcome === "release") assert.equal(await running, true);
+      else await assert.rejects(running, /Release refused|Recipient ended/);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.deepEqual(f.effects, outcome === "release" ? [command] : []);
+      assert.equal(reports, 1);
+      assert.equal(await dispatch(), false);
+    });
+  }
 }
 
 for (const command of ["status", "model", "thinking", "queue", "settings"] as const) {
@@ -5936,4 +5971,53 @@ test("Session action contains failures and emits a terminal failure result", asy
   assert.equal(harness.failures.length, 1);
   assert.match(String(harness.failures[0]), /replacement failed/);
   assert.equal(harness.runtime.hasPending(), false);
+});
+
+test("/resume accepts only an unambiguous saved session in this workspace", () => {
+  const sessions = [
+    { id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", cwd: "/repo" },
+    { id: "aaaaaaaa-bbbb-bbbb-bbbb-bbbbbbbbbbbb", cwd: "/repo" },
+    { id: "cccccccc-cccc-cccc-cccc-cccccccccccc", cwd: "/other" },
+  ];
+  assert.deepEqual(selectSessionToResume(sessions, "/repo", sessions[0]!.id, "aaaaaaaa"),
+    { error: "Session ID is ambiguous; use more characters." });
+  assert.deepEqual(selectSessionToResume(sessions, "/repo", sessions[0]!.id, "aaaaaaaa-bbbb"),
+    { id: sessions[1]!.id });
+  assert.deepEqual(selectSessionToResume(sessions, "/repo", sessions[0]!.id, sessions[0]!.id),
+    { error: "This session is already active." });
+  assert.deepEqual(selectSessionToResume(sessions, "/repo", sessions[0]!.id, "cccccccc"),
+    { error: "Session not found in this workspace." });
+  assert.ok("error" in selectSessionToResume(sessions, "/repo", sessions[0]!.id, "bad"));
+});
+
+test("/resume resolves exact names without guessing between duplicate names", () => {
+  const sessions = [
+    { id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", cwd: "/repo", name: "Current" },
+    { id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", cwd: "/repo", name: "Resume   Test" },
+    { id: "cccccccc-cccc-cccc-cccc-cccccccccccc", cwd: "/repo", name: "resume test" },
+    { id: "dddddddd-dddd-dddd-dddd-dddddddddddd", cwd: "/repo", name: "Distinct" },
+    { id: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", cwd: "/other", name: "Distinct" },
+    { id: "ffffffff-ffff-ffff-ffff-ffffffffffff", cwd: "/repo", name: "deadbeef" },
+  ];
+  const select = (name: string) => selectSessionToResume(sessions, "/repo", sessions[0]!.id, name);
+  assert.deepEqual(select(" distinct "), { id: sessions[3]!.id });
+  assert.deepEqual(select("current"), { error: "This session is already active." });
+  assert.match((select("RESUME TEST") as { error: string }).error, /Several sessions/);
+  assert.deepEqual(select("unknown"), { error: "Session not found in this workspace." });
+  assert.deepEqual(select("bbbbbbbb"), { id: sessions[1]!.id });
+  assert.deepEqual(select("deadbeef"), { id: sessions[5]!.id });
+});
+
+test("/rename validates its session name without touching the Thread title", () => {
+  let stored = "";
+  const setName = (name: string) => { stored = name; };
+  assert.deepEqual(parseSessionRename("  Release notes  "), { name: "Release notes" });
+  assert.equal(renameSession("  Release notes  ", setName), "Pi session renamed: Release notes");
+  assert.equal(stored, "Release notes");
+  for (const input of ["", "  ", "A".repeat(81), "line\nbreak", "a\u0000b"]) {
+    assert.ok("error" in parseSessionRename(input));
+    renameSession(input, setName);
+    assert.equal(stored, "Release notes");
+  }
+  assert.ok("name" in parseSessionRename("A".repeat(80)));
 });

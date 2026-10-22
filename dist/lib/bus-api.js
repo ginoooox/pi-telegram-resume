@@ -4,7 +4,7 @@
  * Wraps the direct Telegram Bot API runtime so follower instances can route outbound calls through the bus leader
  */
 import { markTelegramBusCrossTargetDelivery, parseTelegramBusSelectedMenuTextEffect, stripTelegramBusApiMetadata, } from "./bus.js";
-import { buildTelegramAnswerGuestQueryBody, isTelegramApiCommitUnknownError, isTelegramMessageNotModifiedError, TelegramApiAuthorityError, TelegramApiCommitUnknownError, } from "./telegram-api.js";
+import { buildTelegramAnswerGuestQueryBody, assertTelegramApiCallAuthority, isTelegramApiCommitUnknownError, isTelegramMessageNotModifiedError, TelegramApiAuthorityError, TelegramApiCommitUnknownError, } from "./telegram-api.js";
 function asRecord(value) {
     return value && typeof value === "object" && !Array.isArray(value)
         ? value
@@ -142,6 +142,7 @@ export function createTelegramSelectedMenuTextApi(deps) {
 }
 /** Followers route every chat action through the leader's generic `sendChatAction` call. */
 function sendTelegramFollowerChatAction(deps, chatId, action, options) {
+    assertTelegramApiCallAuthority(options?.assertAuthority, false);
     const body = withDefaultThreadTarget({
         chat_id: chatId,
         action,
@@ -149,7 +150,11 @@ function sendTelegramFollowerChatAction(deps, chatId, action, options) {
             ? { message_thread_id: options.message_thread_id }
             : {}),
     }, deps.getDefaultTarget?.());
-    return deps.callFollowerApi("call", ["sendChatAction", body]).then(asBoolean);
+    // Only plain single-attempt policy crosses IPC; the captured assertion is a local issuance fence.
+    const args = ["sendChatAction", body, ...(action === "typing"
+            ? [{ maxAttempts: 1, retrySafety: "non-idempotent" }] : [])];
+    return deps.callFollowerApi("call", args, options?.assertAuthority
+        ? { assertAuthority: options.assertAuthority } : undefined).then(asBoolean);
 }
 export function createTelegramBusAwareApiRuntime(deps) {
     return {
@@ -334,9 +339,9 @@ export function createTelegramBusAwareApiRuntime(deps) {
                 ? deps.directRuntime.answerGuestQueryForInlineMessage(guestQueryId, text, options)
                 : rejectTelegramDirectOwnership("answerGuestQueryForInlineMessage");
         },
-        editGuestInlineMessage(inlineMessageId, content) {
+        editGuestInlineMessage(inlineMessageId, content, options) {
             return deps.ownsDirect()
-                ? deps.directRuntime.editGuestInlineMessage(inlineMessageId, content)
+                ? deps.directRuntime.editGuestInlineMessage(inlineMessageId, content, options)
                 : rejectTelegramDirectOwnership("editGuestInlineMessage");
         },
         async deleteMessage(chatId, messageId) {

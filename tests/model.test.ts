@@ -1,6 +1,7 @@
 /**
  * Regression tests for Telegram model control helpers
  * Exercises model selection state/resolution plus in-flight model-switch orchestration
+ * Zones: telegram, pi agent, shared utils
  */
 
 import assert from "node:assert/strict";
@@ -13,12 +14,12 @@ import {
   createCurrentModelRuntime,
   createCurrentModelStore,
   createCurrentModelUpdateRuntime,
-  createPendingModelSwitchStore,
   createTelegramModelSwitchContinuationQueue,
   createTelegramModelSwitchContinuationQueueRuntime,
   createTelegramModelSwitchContinuationTurnBuilder,
   createTelegramModelSwitchController,
   createTelegramModelSwitchControllerRuntime,
+  createTelegramModelSwitchMachineState,
   getCanonicalModelId,
   isThinkingLevel,
   type MenuModel,
@@ -26,12 +27,15 @@ import {
   parseTelegramCliScopedModelPatterns,
   parseTelegramScopedModelPatternList,
   resolveScopedModelPatterns,
-  restartTelegramModelSwitchContinuation,
   shouldTriggerPendingTelegramModelSwitchAbort,
   sortScopedModels,
+  transitionTelegramModelSwitch,
+  type TelegramModelSwitchEffect,
+  type TelegramModelSwitchEvent,
   THINKING_LEVELS,
 } from "../lib/model.ts";
 import type { PendingTelegramTurn } from "../lib/queue.ts";
+import * as Queue from "../lib/queue.ts";
 
 function createModelTestModel(
   provider = "openai",
@@ -207,17 +211,6 @@ test("Model helpers resolve scoped model patterns and sort current models first"
   );
 });
 
-test("Pending model-switch store owns selection state helpers", () => {
-  const store = createPendingModelSwitchStore<{ id: string }>();
-  assert.equal(store.has(), false);
-  assert.equal(store.get(), undefined);
-  store.set({ id: "next" });
-  assert.equal(store.has(), true);
-  assert.deepEqual(store.get(), { id: "next" });
-  store.clear();
-  assert.equal(store.has(), false);
-});
-
 test("In-flight model switch is allowed for any interruptible active agent run", () => {
   assert.equal(
     canRestartAgentRunForTelegramModelSwitch({
@@ -272,38 +265,66 @@ test("Pending model switch abort waits until no tool executions remain", () => {
   );
 });
 
-test("Model-switch continuation restart queues before abort when state is present", () => {
-  const events: string[] = [];
-  assert.equal(
-    restartTelegramModelSwitchContinuation({
-      activeTurn: { id: 1 },
-      abort: () => {
-        events.push("abort");
-      },
-      selection: createModelTestSelection(),
-      queueContinuation: (turn, selection) => {
-        events.push(`queue:${turn.id}:${selection.model.id}`);
-      },
-    }),
-    true,
-  );
-  assert.deepEqual(events, ["queue:1:gpt-5", "abort"]);
-  assert.equal(
-    restartTelegramModelSwitchContinuation({
-      activeTurn: undefined,
-      abort: () => {},
-      selection: createModelTestSelection(),
-      queueContinuation: () => {
-        events.push("unexpected");
-      },
-    }),
-    false,
-  );
+type SwitchSelection = { model: { provider: string; id: string } };
+
+/** Folds events through the pure model-switch transition, keeping every effect and the last call result. */
+function runModelSwitchMachine(events: TelegramModelSwitchEvent<SwitchSelection>[]) {
+  let state = createTelegramModelSwitchMachineState<SwitchSelection>();
+  const effects: TelegramModelSwitchEffect<SwitchSelection>[] = [];
+  let result = false;
+  for (const event of events) {
+    const next = transitionTelegramModelSwitch(state, event);
+    state = next.state;
+    effects.push(...next.effects);
+    result = next.result;
+  }
+  return { state, effects, result };
+}
+
+const SWITCH_TURN = { chatId: 7, replyToMessageId: 9 };
+const runFacts = (activeToolExecutions: number, hasAbortHandler = true) => ({
+  type: "abortRequested" as const, hasAbortHandler, activeToolExecutions,
+});
+
+test("Model-switch machine queues the continuation before the abort", () => {
+  const restarted = runModelSwitchMachine([
+    { type: "restartRequested", selection: createModelTestSelection(), turn: SWITCH_TURN, hasAbortHandler: true },
+  ]);
+  assert.equal(restarted.result, true);
+  assert.deepEqual(restarted.effects.map((effect) => effect.type), ["queueContinuation", "abort"]);
+  const refused = runModelSwitchMachine([
+    { type: "restartRequested", selection: createModelTestSelection(), hasAbortHandler: true },
+  ]);
+  assert.equal(refused.result, false, "No turn means no successor to queue, so nothing is aborted");
+  assert.deepEqual(refused.effects, []);
+});
+
+test("Model-switch machine waits for tools and an abort handler before firing a staged switch", () => {
+  const staged = { type: "staged" as const, selection: createModelTestSelection(), turn: SWITCH_TURN };
+  assert.deepEqual(runModelSwitchMachine([staged, runFacts(1)]).effects, []);
+  assert.deepEqual(runModelSwitchMachine([staged, runFacts(0, false)]).effects, []);
+  const fired = runModelSwitchMachine([staged, runFacts(1), runFacts(0)]);
+  assert.equal(fired.result, true);
+  assert.deepEqual(fired.effects[0], { type: "queueContinuation", turn: SWITCH_TURN, selection: createModelTestSelection() });
+  assert.equal(fired.state.pending, null);
+  const local = runModelSwitchMachine([{ type: "staged", selection: createModelTestSelection() }, { ...runFacts(0), activeTurn: SWITCH_TURN }]);
+  assert.equal(local.result, true, "Without a staged turn the run's active turn answers");
+  assert.deepEqual(runModelSwitchMachine([staged, { type: "cleared" }, runFacts(0)]).effects, []);
+});
+
+test("Model-switch machine: a restart consumes a staged switch, so it cannot abort its own continuation", () => {
+  const raced = runModelSwitchMachine([
+    { type: "staged", selection: { model: { provider: "openai", id: "staged" } }, turn: SWITCH_TURN },
+    { type: "restartRequested", selection: createModelTestSelection(), turn: SWITCH_TURN, hasAbortHandler: true },
+    { ...runFacts(0), activeTurn: SWITCH_TURN },
+  ]);
+  assert.equal(raced.state.pending, null);
+  assert.deepEqual(raced.effects.map((effect) => effect.type), ["queueContinuation", "abort"],
+    "Only the restart acts; the stale staged selection never fires against the continuation run");
 });
 
 test("Model-switch controller centralizes pending abort and continuation queueing", () => {
   const events: string[] = [];
-  let pendingSelection: { model: { provider: string; id: string } } | undefined;
   let activeToolExecutions = 1;
   let activeTurn = createModelTestTurn({
     chatId: 1,
@@ -314,12 +335,11 @@ test("Model-switch controller centralizes pending abort and continuation queuein
     historyText: "previous",
     statusSummary: "previous",
   });
-  const controller = createTelegramModelSwitchController({
+  const controller = createTelegramModelSwitchController<
+    object,
+    { model: { provider: string; id: string } }
+  >({
     isIdle: () => false,
-    getPendingModelSwitch: () => pendingSelection,
-    setPendingModelSwitch: (selection) => {
-      pendingSelection = selection;
-    },
     getActiveTurn: () => activeTurn,
     getAbortHandler: () => {
       return () => {
@@ -342,24 +362,22 @@ test("Model-switch controller centralizes pending abort and continuation queuein
   activeToolExecutions = 0;
   assert.equal(controller.triggerPendingAbort({}), true);
   assert.deepEqual(events, ["status", "queue:2:gpt-5", "abort"]);
-  assert.equal(pendingSelection, undefined);
+  assert.equal(controller.hasPendingSwitch(), false);
 });
 
 test("Model-switch controller resumes a local run in the exact Telegram menu target", () => {
   const events: string[] = [];
-  let pendingSelection: { model: { provider: string; id: string } } | undefined;
   let activeToolExecutions = 0;
   const continuationTurn = {
     chatId: 7,
     replyToMessageId: 9,
     target: { chatId: 7, threadId: 11 },
   };
-  const controller = createTelegramModelSwitchController({
+  const controller = createTelegramModelSwitchController<
+    object,
+    { model: { provider: string; id: string } }
+  >({
     isIdle: () => false,
-    getPendingModelSwitch: () => pendingSelection,
-    setPendingModelSwitch: (selection) => {
-      pendingSelection = selection;
-    },
     getActiveTurn: () => undefined,
     getAbortHandler: () => () => {
       events.push("abort");
@@ -403,7 +421,7 @@ test("Model-switch controller resumes a local run in the exact Telegram menu tar
     "queue:7:11:9:gpt-5",
     "abort",
   ]);
-  assert.equal(pendingSelection, undefined);
+  assert.equal(controller.hasPendingSwitch(), false);
 
   controller.stagePendingSwitch(
     createModelTestSelection(),
@@ -415,7 +433,7 @@ test("Model-switch controller resumes a local run in the exact Telegram menu tar
     "queue:7:11:9:gpt-5",
     "abort",
   ]);
-  assert.equal(pendingSelection, undefined);
+  assert.equal(controller.hasPendingSwitch(), false);
 
   activeToolExecutions = 1;
   controller.stagePendingSwitch(
@@ -425,21 +443,57 @@ test("Model-switch controller resumes a local run in the exact Telegram menu tar
   );
   controller.clearPendingSwitch();
   assert.equal(controller.triggerPendingAbort({}), false);
-  assert.equal(pendingSelection, undefined);
+  assert.equal(controller.hasPendingSwitch(), false);
+});
+
+test("Model-switch controller: restart-now supersedes a switch staged behind a running tool", () => {
+  const events: string[] = [];
+  let activeToolExecutions = 1;
+  const controller = createTelegramModelSwitchController<object, SwitchSelection>({
+    isIdle: () => false,
+    getActiveTurn: () => createModelTestTurn({ replyToMessageId: 5 }),
+    getAbortHandler: () => () => events.push("abort"),
+    hasAbortHandler: () => true,
+    getActiveToolExecutions: () => activeToolExecutions,
+    queueContinuation: (_turn, selection) => events.push(`queue:${selection.model.id}`),
+    updateStatus: () => {},
+  });
+  controller.stagePendingSwitch({ model: { provider: "openai", id: "staged" } }, {});
+  assert.equal(controller.hasPendingSwitch(), true);
+  assert.equal(controller.restartInterruptedTurn(createModelTestSelection(), {}), true);
+  assert.equal(controller.hasPendingSwitch(), false);
+  activeToolExecutions = 0;
+  assert.equal(controller.triggerPendingAbort({}), false, "The settled tool finds nothing staged to fire");
+  assert.deepEqual(events, ["queue:gpt-5", "abort"]);
+});
+
+test("Model-switch controller preserves the outer abort handler across synchronous re-entry", () => {
+  const events: string[] = [];
+  const outer = { owner: "outer" };
+  const nested = { owner: "nested" };
+  const controller = createTelegramModelSwitchController<object, SwitchSelection>({
+    isIdle: () => false,
+    getActiveTurn: () => createModelTestTurn(),
+    getAbortHandler: () => () => events.push("abort"),
+    hasAbortHandler: () => true,
+    getActiveToolExecutions: () => 0,
+    queueContinuation: (_turn, _selection, ctx) => {
+      assert.equal(ctx, outer);
+      events.push("queue");
+      assert.equal(controller.triggerPendingAbort(nested), false, "The outer restart already consumed pending state");
+    },
+    updateStatus: () => {},
+  });
+  assert.equal(controller.restartInterruptedTurn(createModelTestSelection(), outer), true);
+  assert.deepEqual(events, ["queue", "abort"], "Nested dispatch cannot erase the outer effect context");
 });
 
 test("Model-switch controller runtime binds continuation queue construction", () => {
   const appended: PendingTelegramTurn[] = [];
-  let pending: { model: { provider: string; id: string } } | undefined =
-    createModelTestSelection();
   let aborted = false;
   const activeTurn = createModelTestTurn();
   const controller = createTelegramModelSwitchControllerRuntime({
     isIdle: () => false,
-    getPendingModelSwitch: () => pending,
-    setPendingModelSwitch: (selection) => {
-      pending = selection;
-    },
     getActiveTurn: () => activeTurn,
     getAbortHandler: () => {
       return () => {
@@ -456,11 +510,41 @@ test("Model-switch controller runtime binds continuation queue construction", ()
     },
     updateStatus: () => {},
   });
-  assert.equal(controller.triggerPendingAbort(undefined), true);
-  assert.equal(aborted, true);
-  assert.equal(pending, undefined);
+  assert.equal(controller.triggerPendingAbort(undefined), false, "Nothing is staged yet");
+  controller.stagePendingSwitch(createModelTestSelection(), undefined);
+  assert.equal(aborted, true, "A staged switch with no running tool fires at once");
+  assert.equal(controller.hasPendingSwitch(), false);
   assert.equal(appended[0]?.queueOrder, 5);
   assert.equal(appended[0]?.queueLane, "control");
+});
+
+test("Model-switch producer queues Control before abort without retargeting or spending waiting Steer", () => {
+  const steer = createModelTestTurn({ queueOrder: 1, laneOrder: 1, queueLane: "steer", target: { chatId: 7, threadId: 42 } });
+  const active = createModelTestTurn({ target: steer.target });
+  const store = Queue.createTelegramQueueStore<string>([steer]);
+  const mutation = Queue.createTelegramQueueMutationController({ ...store, updateStatus() {} });
+  const before = structuredClone(steer);
+  let aborts = 0;
+  const controller = createTelegramModelSwitchControllerRuntime({ isIdle: () => false, getActiveTurn: () => active,
+    getAbortHandler: () => () => {
+      aborts++;
+      assert.equal(store.getQueuedItems()[0]!.queueLane, "control", "Continuation publication precedes abort");
+      assert.equal(store.getQueuedItems()[1], steer);
+    }, hasAbortHandler: () => true, getActiveToolExecutions: () => 0,
+    allocateItemOrder: () => 2, allocateControlOrder: () => 2, appendQueuedItem: mutation.append, updateStatus() {} });
+  controller.stagePendingSwitch(createModelTestSelection(), "ctx");
+  assert.equal(aborts, 1);
+  const continuation = store.getQueuedItems()[0]!;
+  assert.ok(continuation.kind === "prompt");
+  assert.equal(continuation.queueLane, "control"); assert.deepEqual(continuation.sourceMessageIds, []);
+  assert.deepEqual(continuation.target, steer.target);
+  assert.deepEqual(steer, before, "A model change adds no task affinity, source rewrite or attempt marker to waiting Steer");
+  assert.deepEqual(Queue.planTelegramSteerPacket(store.getQueuedItems(), { blocked: false, isItemReady: () => true }), { kind: "none" });
+  const started = Queue.consumeDispatchedTelegramPrompt(store.getQueuedItems(), true);
+  assert.equal(started.activeTurn, continuation);
+  const packet = Queue.planTelegramSteerPacket(started.remainingItems, { blocked: false, isItemReady: () => true });
+  assert.equal(packet.kind, "packet");
+  if (packet.kind === "packet") assert.equal(packet.items[0], steer, "Same-session continuation preserves later Steer eligibility");
 });
 
 test("Model-switch continuation turn stays control-lane and resume-oriented", () => {

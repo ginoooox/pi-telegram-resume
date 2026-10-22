@@ -2,42 +2,28 @@
  * Telegram preview streaming helpers
  * Zones: telegram outbound, native rich markdown drafts
  * Owns safe draft preview selection, runtime updates, and preview finalization
+ * The streaming state machine is a pure transition function driven by one imperative shell per runtime.
  */
 import type { TelegramAssistantOutputPreparation } from "./activity.ts";
 import { type TelegramTarget } from "./target.ts";
-export type TelegramDraftSupport = "unknown" | "supported";
 export interface TelegramPreviewState {
     mode: "draft";
     draftId?: number;
     pendingText: string;
     lastSentText: string;
 }
-export interface TelegramPreviewRuntimeState extends TelegramPreviewState {
-    flushPromise?: Promise<void>;
-    flushRequested?: boolean;
-    precedingFlush?: Promise<void>;
-    publicationPromise?: Promise<void>;
-    sealed?: boolean;
-    nextDraftAt?: number;
-    flushTimer?: ReturnType<typeof setTimeout>;
+/** One immutable preview segment; a replacement segment gets a new id, so late results for an old one are dropped. */
+export interface TelegramPreviewSegment extends Readonly<TelegramPreviewState> {
+    readonly id: number;
+    readonly sealed: boolean;
 }
 export type TelegramPreviewReplyMarkup = unknown;
-export interface TelegramPreviewRuntimeDeps {
-    getState: () => TelegramPreviewRuntimeState | undefined;
-    setState: (state: TelegramPreviewRuntimeState | undefined) => void;
-    maxMessageLength: number;
-    minDraftIntervalMs?: number;
-    getDraftSupport: () => TelegramDraftSupport;
-    setDraftSupport: (support: TelegramDraftSupport) => void;
-    allocateDraftId: () => number;
-    sendDraft: (chatId: number, draftId: number, text?: string, options?: {
-        parse_mode?: string;
-        entities?: unknown[];
-        message_thread_id?: number;
-    }) => Promise<unknown>;
-    canSend?: () => boolean;
-    recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
-}
+type TelegramDraftSender = (chatId: number, draftId: number, text?: string, options?: {
+    parse_mode?: string;
+    entities?: unknown[];
+    message_thread_id?: number;
+}) => Promise<unknown>;
+type TelegramPreviewEventRecorder = (category: string, error: unknown, details?: Record<string, unknown>) => void;
 export interface TelegramPreviewActiveTurn {
     chatId: number;
     replyToMessageId?: number;
@@ -46,28 +32,6 @@ export interface TelegramPreviewActiveTurn {
     voiceReplyRequired?: boolean;
     guestQueryId?: string;
 }
-export interface TelegramAssistantMessagePreviewStartDeps<TMessage> {
-    getActiveTurn: () => TelegramPreviewActiveTurn | undefined;
-    isAssistantMessage: (message: TMessage) => boolean;
-    getState: () => TelegramPreviewRuntimeState | undefined;
-    setState: (state: TelegramPreviewRuntimeState | undefined) => void;
-    createPreviewState: () => TelegramPreviewRuntimeState;
-    canSend?: () => boolean;
-}
-export interface TelegramAssistantMessagePreviewUpdateDeps<TMessage> {
-    getActiveTurn: () => TelegramPreviewActiveTurn | undefined;
-    isAssistantMessage: (message: TMessage) => boolean;
-    getState: () => TelegramPreviewRuntimeState | undefined;
-    setState: (state: TelegramPreviewRuntimeState | undefined) => void;
-    createPreviewState: () => TelegramPreviewRuntimeState;
-    canSend?: () => boolean;
-    getMessageText: (message: TMessage) => string;
-    minDraftIntervalMs?: number;
-    schedulePreviewFlush: (chatId: number, options?: {
-        target?: TelegramTarget;
-    }) => void;
-}
-export type TelegramAssistantMessagePreviewHookDeps<TMessage> = TelegramAssistantMessagePreviewStartDeps<TMessage> & TelegramAssistantMessagePreviewUpdateDeps<TMessage>;
 export interface TelegramAssistantMessagePreviewHookEvent<TMessage> {
     message: TMessage;
 }
@@ -78,46 +42,37 @@ export interface TelegramAssistantMessagePreviewHooks<TMessage> {
 export interface TelegramPreviewControllerDeps {
     getDefaultReplyToMessageId?: () => number | undefined;
     maxMessageLength?: number;
-    initialDraftSupport?: TelegramDraftSupport;
-    sendDraft: (chatId: number, draftId: number, text?: string, options?: {
-        parse_mode?: string;
-        entities?: unknown[];
-        message_thread_id?: number;
-    }) => Promise<unknown>;
+    sendDraft: TelegramDraftSender;
     canSend?: () => boolean;
     maxDraftId?: number;
-    recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
+    /** Throttle between draft frames; defaults to the native draft cadence. */
+    minDraftIntervalMs?: number;
+    recordRuntimeEvent?: TelegramPreviewEventRecorder;
 }
+type TelegramPreviewTargetOptions = {
+    target?: TelegramTarget;
+};
 export interface TelegramPreviewController {
+    /** Read-only view of the current segment; it never grants mutation. */
+    getState: () => TelegramPreviewSegment | undefined;
+    /** True while a draft request is in flight or a pending request waits behind a publication. */
+    isFlushing: () => boolean;
     seal: () => void;
     preparePublication: () => TelegramAssistantOutputPreparation | undefined;
-    prepareClear: (chatId: number, options?: {
-        target?: TelegramTarget;
+    prepareClear: (chatId: number, options?: TelegramPreviewTargetOptions & {
         isDeliveryActive?: () => boolean;
     }) => () => Promise<void>;
-    getState: () => TelegramPreviewRuntimeState | undefined;
-    setState: (state: TelegramPreviewRuntimeState | undefined) => void;
     setPendingText: (text: string) => void;
-    createState: () => TelegramPreviewRuntimeState;
     resetState: () => void;
     invalidate: () => void;
-    clear: (chatId: number, options?: {
+    clear: (chatId: number, options?: TelegramPreviewTargetOptions & {
         awaitFlush?: boolean;
-        target?: TelegramTarget;
     }) => Promise<void>;
-    flush: (chatId: number, options?: {
-        target?: TelegramTarget;
-    }) => Promise<void>;
-    scheduleFlush: (chatId: number, options?: {
-        target?: TelegramTarget;
-    }) => void;
-    finalize: (chatId: number, replyToMessageId?: number, options?: {
-        target?: TelegramTarget;
-    }) => Promise<boolean>;
+    flush: (chatId: number, options?: TelegramPreviewTargetOptions) => Promise<void>;
+    scheduleFlush: (chatId: number, options?: TelegramPreviewTargetOptions) => void;
+    finalize: (chatId: number, replyToMessageId?: number, options?: TelegramPreviewTargetOptions) => Promise<boolean>;
 }
-export type TelegramPreviewControllerRuntimeDeps = TelegramPreviewControllerDeps;
-export declare function createTelegramPreviewControllerRuntime(deps: TelegramPreviewControllerRuntimeDeps): TelegramPreviewController;
-export interface TelegramAssistantPreviewRuntimeDeps<TMessage, TReplyMarkup = TelegramPreviewReplyMarkup> extends TelegramPreviewControllerRuntimeDeps {
+export interface TelegramAssistantPreviewRuntimeDeps<TMessage, TReplyMarkup = TelegramPreviewReplyMarkup> extends TelegramPreviewControllerDeps {
     getActiveTurn: () => TelegramPreviewActiveTurn | undefined;
     isAssistantMessage: (message: TMessage) => boolean;
     getMessageText: (message: TMessage) => string;
@@ -126,35 +81,113 @@ export interface TelegramAssistantPreviewRuntimeDeps<TMessage, TReplyMarkup = Te
         target?: TelegramTarget;
     }) => Promise<number | undefined>;
 }
-export interface TelegramPreparedPreviewDelivery<TReplyMarkup = unknown> {
-    clearPreview: TelegramPreviewController["clear"];
-    setPreviewPendingText: TelegramPreviewController["setPendingText"];
-    finalizeMarkdownPreview: ReturnType<typeof createTelegramNativeMarkdownPreviewFinalizer<TReplyMarkup>>;
-}
-export type TelegramAssistantPreviewRuntime<TMessage, TReplyMarkup = TelegramPreviewReplyMarkup> = TelegramPreviewController & TelegramAssistantMessagePreviewHooks<TMessage> & {
-    prepareDelivery: (isDeliveryActive: () => boolean) => TelegramPreparedPreviewDelivery<TReplyMarkup>;
-    finalizeMarkdown: (chatId: number, markdown: string, replyToMessageId?: number, options?: {
-        replyMarkup?: TReplyMarkup;
-        target?: TelegramTarget;
-    }) => Promise<boolean>;
-};
-export declare function createTelegramNativeMarkdownPreviewFinalizer<TReplyMarkup>(deps: {
-    getState: () => TelegramPreviewRuntimeState | undefined;
-    clear: (chatId: number, options?: {
-        awaitFlush?: boolean;
-        target?: TelegramTarget;
-    }) => Promise<void>;
-    discard?: () => void;
-    isDeliveryActive?: () => boolean;
-    sendMarkdownReply: (chatId: number, replyToMessageId: number | undefined, markdown: string, options?: {
-        replyMarkup?: TReplyMarkup;
-        target?: TelegramTarget;
-    }) => Promise<number | undefined>;
-}): (chatId: number, markdown: string, replyToMessageId?: number, options?: {
+type TelegramMarkdownFinalizer<TReplyMarkup> = (chatId: number, markdown: string, replyToMessageId?: number, options?: {
     replyMarkup?: TReplyMarkup;
     target?: TelegramTarget;
 }) => Promise<boolean>;
-export declare function createTelegramAssistantPreviewRuntime<TMessage, TReplyMarkup = TelegramPreviewReplyMarkup>(deps: TelegramAssistantPreviewRuntimeDeps<TMessage, TReplyMarkup>): TelegramAssistantPreviewRuntime<TMessage, TReplyMarkup>;
+export interface TelegramPreparedPreviewDelivery<TReplyMarkup = unknown> {
+    clearPreview: TelegramPreviewController["clear"];
+    setPreviewPendingText: TelegramPreviewController["setPendingText"];
+    finalizeMarkdownPreview: TelegramMarkdownFinalizer<TReplyMarkup>;
+}
+export type TelegramAssistantPreviewRuntime<TMessage, TReplyMarkup = TelegramPreviewReplyMarkup> = TelegramPreviewController & TelegramAssistantMessagePreviewHooks<TMessage> & {
+    prepareDelivery: (isDeliveryActive: () => boolean) => TelegramPreparedPreviewDelivery<TReplyMarkup>;
+    finalizeMarkdown: TelegramMarkdownFinalizer<TReplyMarkup>;
+};
+interface TelegramPreviewFlushRequest {
+    chatId: number;
+    target?: TelegramTarget;
+}
+interface TelegramPreviewMachineConfig {
+    maxDraftId: number;
+    maxMessageLength: number;
+    minDraftIntervalMs: number;
+}
+/** The whole preview state; only `transitionTelegramPreview` produces a new one. */
+export interface TelegramPreviewMachineState {
+    readonly segment: TelegramPreviewSegment | null;
+    /** Bumped by reset and invalidation; a result issued under an older generation is inert. */
+    readonly generation: number;
+    readonly nextSegmentId: number;
+    readonly nextDraftId: number;
+    readonly nextDraftAt: number;
+    /** Segment that owns the current generation's issued draft; old-generation requests do not block it. */
+    readonly inFlight: number | null;
+    /** The one coalesced flush request waiting behind an in-flight draft or an open publication. */
+    readonly pending: TelegramPreviewFlushRequest | null;
+    readonly publications: readonly number[];
+    /** The segment the throttle timer is armed for; the timer belongs to that segment alone. */
+    readonly timerSegmentId: number | null;
+}
+/** Impure inputs the runner samples at dispatch time, so transitions stay pure. */
+interface TelegramPreviewClock {
+    now: number;
+    canSend: boolean;
+}
+export type TelegramPreviewEvent = {
+    type: "reset";
+} | {
+    type: "invalidated";
+} | {
+    type: "segmentStarted";
+} | {
+    type: "segmentEnsured";
+} | {
+    type: "sealed";
+} | {
+    type: "discarded";
+} | {
+    type: "textSet";
+    text: string;
+} | {
+    type: "draftWindowOpened";
+    at: number;
+} | ({
+    type: "flushRequested";
+    request: TelegramPreviewFlushRequest;
+} & TelegramPreviewClock) | ({
+    type: "timerFired";
+    request: TelegramPreviewFlushRequest;
+    segmentId: number;
+} & TelegramPreviewClock) | ({
+    type: "draftSettled";
+    segmentId: number;
+    generation: number;
+    /** Present only when Telegram accepted the draft. */
+    text?: string;
+} & TelegramPreviewClock) | {
+    type: "publicationOpened";
+    id: number;
+} | ({
+    type: "publicationSettled";
+    id: number;
+} & TelegramPreviewClock);
+export type TelegramPreviewEffect = {
+    type: "sendDraft";
+    request: TelegramPreviewFlushRequest;
+    draftId: number;
+    text: string;
+    segmentId: number;
+    generation: number;
+} | {
+    type: "armTimer";
+    delay: number;
+    request: TelegramPreviewFlushRequest;
+    segmentId: number;
+} | {
+    type: "cancelTimer";
+} | {
+    type: "clearClosedGate";
+    request: TelegramPreviewFlushRequest;
+};
+export interface TelegramPreviewStep {
+    state: TelegramPreviewMachineState;
+    effects: readonly TelegramPreviewEffect[];
+}
+export declare function createTelegramPreviewMachineState(): TelegramPreviewMachineState;
+export declare function transitionTelegramPreview(state: TelegramPreviewMachineState, event: TelegramPreviewEvent, config: TelegramPreviewMachineConfig): TelegramPreviewStep;
+/** True while a draft request is in flight, or, when publications block, a pending request waits behind one. */
+export declare function isTelegramPreviewBusy(state: TelegramPreviewMachineState, blockedByPublication?: boolean): boolean;
 export declare function createTelegramPreviewController(deps: TelegramPreviewControllerDeps): TelegramPreviewController;
 /**
  * Returns true when the active turn is a Telegram Guest Mode query. A guest
@@ -164,26 +197,8 @@ export declare function createTelegramPreviewController(deps: TelegramPreviewCon
 export declare function shouldSuppressPreviewForGuestTurn(turn: {
     guestQueryId?: string;
 } | null | undefined): boolean;
+export declare function createTelegramAssistantPreviewRuntime<TMessage, TReplyMarkup = TelegramPreviewReplyMarkup>(deps: TelegramAssistantPreviewRuntimeDeps<TMessage, TReplyMarkup>): TelegramAssistantPreviewRuntime<TMessage, TReplyMarkup>;
 export declare function buildTelegramPreviewFinalText(state: TelegramPreviewState): string | undefined;
-export declare function createTelegramPreviewRuntimeState(): TelegramPreviewRuntimeState;
 export declare function allocateTelegramDraftId(currentDraftId: number, maxDraftId: number): number;
-interface TelegramNativeMarkdownPreviewSnapshot {
-    text: string;
-}
-export declare function shouldUseTelegramDraftPreview(_options: {
-    draftSupport: TelegramDraftSupport;
-    snapshot?: TelegramNativeMarkdownPreviewSnapshot;
-}): boolean;
-export declare function clearTelegramPreview(chatId: number, deps: TelegramPreviewRuntimeDeps, options?: {
-    awaitFlush?: boolean;
-    target?: TelegramTarget;
-    isDeliveryActive?: () => boolean;
-}): Promise<void>;
 export declare function getSafeTelegramRichMarkdownDraftPrefix(markdown: string, maxMessageLength: number): string | undefined;
-export declare function flushTelegramPreview(chatId: number, deps: TelegramPreviewRuntimeDeps, options?: {
-    target?: TelegramTarget;
-}): Promise<void>;
-export declare function finalizeTelegramPreview(chatId: number, deps: TelegramPreviewRuntimeDeps, options?: {
-    target?: TelegramTarget;
-}): Promise<boolean>;
 export {};

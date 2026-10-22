@@ -923,6 +923,80 @@ test("Guest attachment staging builds cached media results and always deletes st
   }
 });
 
+for (const item of [
+  { path: "photo.png", type: "photo", response: { message_id: 11, photo: [{ file_id: "photo-id" }] }, media: "photo-id" },
+  { path: "report.pdf", type: "document", response: { message_id: 11, document: { file_id: "doc-id" } }, media: "doc-id" },
+  { path: "audio.mp3", type: "audio", response: { message_id: 11, audio: { file_id: "audio-id" } }, media: "audio-id" },
+] as const) {
+  test(`Guest ACK attachment replaces the exact inline placeholder with cached ${item.type}`, async () => {
+    const events: unknown[] = [];
+    await deliverTelegramGuestCachedAttachment({
+      guestQueryId: "already-answered", guestInlineMessageId: "inline-1",
+      stagingChatId: 42, stagingTarget: { chatId: 42, threadId: 8 },
+      attachment: { path: item.path, fileName: item.path }, caption: "caption",
+      sendMultipart: async (method, fields) => { events.push([method, fields]); return item.response; },
+      answerGuestQuery: async () => assert.fail("Cannot answer the guest query twice"),
+      editGuestInlineMessage: async (id, content, options) => {
+        options?.assertAuthority?.();
+        events.push(["edit", id, content]);
+      },
+      deleteMessage: async (chat, message) => { events.push(["delete", chat, message]); },
+    });
+    assert.deepEqual(events, [
+      [`send${item.type[0]!.toUpperCase()}${item.type.slice(1)}`, { chat_id: "42", message_thread_id: "8" }],
+      ["edit", "inline-1", { media: { type: item.type, media: item.media, caption: "caption" } }],
+      ["delete", 42, 11],
+    ]);
+  });
+}
+
+for (const extension of ["ogg", "opus"]) {
+  test(`Guest ACK rejects ${extension} voice before queue mutation`, async () => {
+    const turn = { queuedAttachments: [], guestQueryId: "guest", guestInlineMessageId: "inline" };
+    await assert.rejects(queueTelegramOutboundAttachments({
+      activeTurn: turn, paths: [`/tmp/voice.${extension}`], maxAttachmentsPerTurn: 10,
+      statPath: async () => ({ isFile: () => true }),
+    }), /cannot replace.*voice note/);
+    assert.deepEqual(turn.queuedAttachments, []);
+  });
+}
+
+for (const phase of ["upload", "extract", "edit", "retired-upload", "retired-edit"] as const) {
+  test(`Guest ACK attachment handles ${phase} without a second answer or stale effects`, async () => {
+    const events: string[] = [];
+    let active = true;
+    const operation = deliverTelegramGuestCachedAttachment({
+      guestQueryId: "answered", guestInlineMessageId: "inline", stagingChatId: 42,
+      attachment: { path: "photo.png", fileName: "photo.png" },
+      isDeliveryActive: () => active,
+      sendMultipart: async () => {
+        events.push("upload");
+        if (phase === "upload") throw new Error("upload failed");
+        if (phase === "retired-upload") active = false;
+        return { message_id: 11, ...(phase === "extract" ? {} : { photo: [{ file_id: "file" }] }) };
+      },
+      editGuestInlineMessage: async (_id, _content, options) => {
+        if (phase === "retired-edit") active = false;
+        options?.assertAuthority?.();
+        events.push("edit");
+        if (phase === "edit") throw new TelegramApiCommitUnknownError("editMessageMedia", new Error("lost response"));
+      },
+      answerGuestQuery: async () => assert.fail("Query already answered"),
+      answerGuestText: async () => assert.fail("No second answer on failure"),
+      fallbackText: "fallback",
+      deleteMessage: async () => { events.push("delete"); },
+    });
+    if (phase.startsWith("retired")) {
+      await operation;
+      assert.deepEqual(events, ["upload"]);
+    } else {
+      await assert.rejects(operation, phase === "edit" ? TelegramApiCommitUnknownError : Error);
+      assert.deepEqual(events, phase === "upload" ? ["upload"]
+        : phase === "extract" ? ["upload", "delete"] : ["upload", "edit", "delete"]);
+    }
+  });
+}
+
 test("Guest attachment staging cleans up extraction and answer failures", async () => {
   for (const phase of ["extract", "answer"] as const) {
     const events: string[] = [];

@@ -605,9 +605,7 @@ function getTelegramStatusBarLabel(state) {
 }
 export function buildTelegramStatusBarText(theme, state) {
     const label = theme.fg("accent", getTelegramStatusBarLabel(state));
-    const queued = state.queuedStatus
-        ? theme.fg("warning", state.queuedStatus)
-        : "";
+    const queued = state.queuedStatus ? theme.fg("warning", state.queuedStatus) : "";
     if (!state.hasBotToken)
         return `${label} ${theme.fg("muted", "not configured")}${queued}`;
     if (state.pollingStopReason === "persistent-conflict" &&
@@ -949,6 +947,7 @@ function buildTelegramInboundWorkerDiagnosticLines(worker) {
 function countTelegramQueueLanes(items) {
     const counts = {
         control: 0,
+        steer: 0,
         priority: 0,
         default: 0,
     };
@@ -957,9 +956,9 @@ function countTelegramQueueLanes(items) {
     return counts;
 }
 function buildTelegramBridgeCompactStatusLines(state) {
-    const { control: controlQueueCount, priority: priorityQueueCount, default: defaultQueueCount, } = countTelegramQueueLanes(state.queuedItems);
+    const { control: controlQueueCount, priority: priorityQueueCount, default: defaultQueueCount, steer: steerQueueCount, } = countTelegramQueueLanes(state.queuedItems);
     const queueLine = `- queued turns: ${state.queuedItems.length}${state.queuedItems.length > 0
-        ? ` (control=${controlQueueCount}, priority=${priorityQueueCount}, default=${defaultQueueCount})`
+        ? ` (control=${controlQueueCount}${steerQueueCount > 0 ? `, steer=${steerQueueCount}` : ""}, priority=${priorityQueueCount}, default=${defaultQueueCount})`
         : ""}`;
     const executionState = state.pendingDispatch
         ? "pending dispatch"
@@ -1017,7 +1016,7 @@ export function buildTelegramBridgeStatusLines(state, options = {}) {
     return buildTelegramBridgeCompactStatusLines(state);
 }
 function buildTelegramBridgeDiagnosticStatusLines(state) {
-    const { control: controlQueueCount, priority: priorityQueueCount, default: defaultQueueCount, } = countTelegramQueueLanes(state.queuedItems);
+    const { control: controlQueueCount, priority: priorityQueueCount, default: defaultQueueCount, steer: steerQueueCount, } = countTelegramQueueLanes(state.queuedItems);
     return [
         "connection:",
         `- bot: ${formatTelegramBridgeBotStatus(state)}`,
@@ -1063,7 +1062,7 @@ function buildTelegramBridgeDiagnosticStatusLines(state) {
         "",
         "queue:",
         `- queued turns: ${state.queuedItems.length}`,
-        `- lanes: control=${controlQueueCount}, priority=${priorityQueueCount}, default=${defaultQueueCount}`,
+        `- lanes: control=${controlQueueCount}${steerQueueCount > 0 ? `, steer=${steerQueueCount}` : ""}, priority=${priorityQueueCount}, default=${defaultQueueCount}`,
         ...buildTelegramBusFollowerLines(state),
         ...buildTelegramLocalBusLines(state, { verbose: true }),
         ...buildTelegramTopicTargetDiagnosticLines(state),

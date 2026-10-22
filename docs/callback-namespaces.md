@@ -25,6 +25,10 @@ myext:page:2
 - Put only opaque ids or small enum values in payloads; do not store secrets, full prompts, or large state.
 - Treat callbacks as untrusted input. Validate namespace, action, and payload before executing side effects.
 
+## Queue Controls
+
+The Steer surface owns `queue:lane-set:<chat>:<message>:steer|priority|normal` and independent `queue:skip-set:<chat>:<message>:keep|skip`. Previously published `queue:prio-set` and `queue:prio` controls remain explicit Priority/Normal compatibility routes. Payloads only identify a current view; they cannot grant source/session authority or edit a protected pending/frozen item. Control lanes remain producer-owned.
+
 ## pi-telegram fallback
 
 If `pi-telegram` receives callback data that is not owned by its built-in prefixes and no built-in handler consumes it, it forwards the click to Pi as:

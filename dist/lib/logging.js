@@ -8,6 +8,82 @@ import { basename, dirname, join } from "node:path";
 import { withTelegramFileTransaction } from "./locks.js";
 import { resolveAgentDir, resolveTelegramPreviousSharedRuntimeLogPath, resolveTelegramProfileTempFilePath, resolveTelegramRuntimeLogPath, } from "./paths.js";
 import * as Status from "./status.js";
+/** Stable identity of one failure kind: errno when present, otherwise the failure text. */
+export function getTelegramFailureSignature(error) {
+    const code = error?.code;
+    if (typeof code === "string" && code)
+        return code;
+    return error instanceof Error ? error.message : String(error);
+}
+/**
+ * Consecutive identical failure runs for one diagnostic phase: a repeat extends the run instead of logging again,
+ * and a closing success or reset emits at most one outcome record. This never gates detection or recovery.
+ */
+export function createTelegramFailureRunLog(input) {
+    const getNowMs = input.getNowMs ?? Date.now;
+    let run;
+    const emit = (errorOrMessage, details) => {
+        try {
+            input.record?.(input.category, errorOrMessage, {
+                ...(input.context?.() ?? {}),
+                ...details,
+            });
+        }
+        catch {
+            // A diagnostic sink never converts a recorded failure into another failure.
+        }
+    };
+    return {
+        record(error, details) {
+            const signature = getTelegramFailureSignature(error);
+            const admitted = { ...(details ?? {}) };
+            if (run?.signature === signature) {
+                run.suppressed += 1;
+                Object.assign(run.details, admitted);
+                return false;
+            }
+            const previous = run;
+            run = { signature, suppressed: 0, startedAtMs: getNowMs(), details: admitted };
+            emit(error, {
+                ...admitted,
+                phase: input.failurePhase,
+                failureSignature: signature,
+                ...(previous
+                    ? {
+                        previousFailureSignature: previous.signature,
+                        previousFailedAttempts: previous.suppressed + 1,
+                        previousFailedForMs: getNowMs() - previous.startedAtMs,
+                    }
+                    : {}),
+            });
+            return true;
+        },
+        settled() {
+            const closed = run;
+            if (!closed)
+                return undefined;
+            run = undefined;
+            const summary = {
+                signature: closed.signature,
+                failedAttempts: closed.suppressed + 1,
+                suppressedFailures: closed.suppressed,
+                failedForMs: getNowMs() - closed.startedAtMs,
+            };
+            emit(`Telegram ${input.label} recovered after ${summary.failedAttempts} failed attempts.`, {
+                ...closed.details,
+                phase: input.outcomePhase,
+                failureSignature: summary.signature,
+                failedAttempts: summary.failedAttempts,
+                suppressedFailures: summary.suppressedFailures,
+                failedForMs: summary.failedForMs,
+            });
+            return summary;
+        },
+        reset() {
+            run = undefined;
+        },
+    };
+}
 const DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024;
 export function getTelegramRuntimeLogPath(agentDir = resolveAgentDir(), profileName) {
     return resolveTelegramProfileTempFilePath("logs", "jsonl", agentDir, profileName);
@@ -333,6 +409,10 @@ export function createTelegramRuntimeDiagnosticsRuntime(options = {}) {
     };
     return {
         events,
+        createFailureLog: (input) => createTelegramFailureRunLog({
+            ...input,
+            record: (category, errorOrMessage, details) => recordRuntimeEvent(category, errorOrMessage, details),
+        }),
         recordRuntimeEvent,
         bindStorage(ports) {
             getBotToken = ports.getBotToken;

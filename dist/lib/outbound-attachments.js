@@ -375,6 +375,9 @@ export async function queueTelegramOutboundAttachments(options) {
         maxAttachmentSizeBytes: options.maxAttachmentSizeBytes,
         statPath: options.statPath,
     });
+    if (options.activeTurn.guestInlineMessageId && pendingAttachments.some((attachment) => getTelegramGuestAttachmentTransport(attachment.path).fileField === "voice")) {
+        throw new Error("Telegram Guest Mode cannot replace an inline placeholder with a voice note; no attachment was queued. Use MP3 audio or a normal bot chat.");
+    }
     options.activeTurn.queuedAttachments.push(...pendingAttachments);
     const added = pendingAttachments.map((attachment) => attachment.path);
     return {
@@ -389,6 +392,16 @@ export async function queueTelegramOutboundAttachments(options) {
 }
 export async function deliverTelegramGuestCachedAttachment(options) {
     const transport = getTelegramGuestAttachmentTransport(options.attachment.path);
+    const isActive = () => options.isDeliveryActive?.() !== false;
+    const assertActive = () => {
+        if (!isActive())
+            throw new Error("Guest attachment delivery lost authority.");
+    };
+    if (!isActive())
+        return;
+    if (options.guestInlineMessageId && (!options.editGuestInlineMessage || transport.fileField === "voice")) {
+        throw new Error("Guest inline attachment editing is unavailable for this media.");
+    }
     let stagingMessageId;
     let answerAttempted = false;
     try {
@@ -397,6 +410,8 @@ export async function deliverTelegramGuestCachedAttachment(options) {
             ...getTelegramMultipartTargetFields(options.stagingTarget),
         }, transport.fileField, options.attachment.path, options.attachment.fileName));
         stagingMessageId = message.message_id;
+        if (!isActive())
+            return;
         const caption = options.caption
             ? Array.from(options.caption).slice(0, 1024).join("")
             : undefined;
@@ -446,11 +461,26 @@ export async function deliverTelegramGuestCachedAttachment(options) {
                 ...(caption ? { caption } : {}),
             };
         }
+        if (!isActive())
+            return;
         answerAttempted = true;
-        await options.answerGuestQuery(options.guestQueryId, result);
+        if (options.guestInlineMessageId && options.editGuestInlineMessage) {
+            if (result.type === "voice")
+                throw new Error("Voice notes cannot replace inline placeholders.");
+            const media = result.type === "photo" ? result.photo_file_id
+                : result.type === "audio" ? result.audio_file_id : result.document_file_id;
+            await options.editGuestInlineMessage(options.guestInlineMessageId, {
+                media: { type: result.type, media, ...(caption ? { caption } : {}) },
+            }, { assertAuthority: assertActive });
+        }
+        else {
+            await options.answerGuestQuery(options.guestQueryId, result);
+        }
     }
     catch (error) {
-        if (!answerAttempted && options.answerGuestText && options.fallbackText) {
+        if (!isActive())
+            return;
+        if (!options.guestInlineMessageId && !answerAttempted && options.answerGuestText && options.fallbackText) {
             answerAttempted = true;
             await options.answerGuestText(options.guestQueryId, options.fallbackText);
         }
@@ -459,7 +489,7 @@ export async function deliverTelegramGuestCachedAttachment(options) {
         }
     }
     finally {
-        if (stagingMessageId !== undefined) {
+        if (stagingMessageId !== undefined && isActive()) {
             try {
                 await options.deleteMessage(options.stagingChatId, stagingMessageId);
             }

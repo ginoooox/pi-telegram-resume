@@ -13,7 +13,7 @@ import { type TelegramBridgeStatusLineOptions } from "./status.ts";
 import { type TelegramApiCallOptions } from "./telegram-api.ts";
 import type { TelegramSessionReplacementIntent } from "./threads.ts";
 import { type TelegramDeferredSourceEvidence, type TelegramLiveSourceCompletionReadiness, type TelegramQueueAdmissionReceiptLike } from "./updates.ts";
-export type TelegramHeldCommandName = "status" | "abort" | "stop" | "next" | "continue";
+export type TelegramHeldCommandName = "status" | "start" | "help" | "abort" | "stop" | "next" | "continue";
 /** Commands-owned no-fold admission over the ordinary recipient queue; source reporting stays separate from removal. */
 export interface TelegramHeldTurnAdmission {
     assertCurrent(): void;
@@ -662,6 +662,8 @@ export interface TelegramSelectedCommandAdmission {
     /** Independent exact recipient/target lifetime, including inside captured menu transport adapters. */
     assertRecipientCurrent(): void;
     reportCompleted(): boolean;
+    /** Optional recipient release barrier after acceptance; rejection suppresses effects without replay. */
+    beforeEffects?(): Promise<void>;
 }
 export declare function createTelegramCommandHandler<TMessage extends TelegramCommandRuntimeMessage, TContext>(deps: TelegramCommandRuntimeDeps<TMessage, TContext>): ((commandName: string | undefined, message: TMessage, ctx: TContext, commandArgs?: string) => Promise<boolean>) & {
     /** Command-only producer execution; Routing must supply the captured plan and released exact-source authority. */

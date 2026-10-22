@@ -101,11 +101,13 @@ export interface TelegramActivityDispatcher {
 }
 /** @internal */
 export declare function createTelegramActivityDispatcher(deps?: {
+    captureDrain?: () => (() => void) | undefined;
     recordFailure?: (handlerId: string, event: TelegramActivityEvent, error: unknown) => void;
 }): TelegramActivityDispatcher;
 /** @internal */
 export declare function createTelegramActivityBridgeRuntime(deps: {
     generation: string;
+    captureDrain?: () => (() => void) | undefined;
     observeEvent?: (event: TelegramActivityEvent) => void;
     recordFailure?: (handlerId: string, event: TelegramActivityEvent, error: unknown) => void;
     now?: () => number;
@@ -207,7 +209,9 @@ export interface TelegramActivityPublicationRuntime {
     hasUnconfirmed: () => boolean;
     reset: () => void;
 }
-export declare function createTelegramActivityPublicationRuntime(): TelegramActivityPublicationRuntime;
+export declare function createTelegramActivityPublicationRuntime(deps?: {
+    captureDrain?: () => (() => void) | undefined;
+}): TelegramActivityPublicationRuntime;
 export interface TelegramAssistantOutputRuntime {
     start: () => void;
     beginTurn: () => void;

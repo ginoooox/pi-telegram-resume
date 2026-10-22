@@ -163,8 +163,12 @@ export declare function createGuestMarkdownReplyEditor(deps: {
     editGuestInlineMessage: (inlineMessageId: string, content: {
         richMessage?: TelegramInputRichMessage;
         text?: string;
+    }, options?: {
+        assertAuthority?: () => void;
     }) => Promise<void>;
-}): (inlineMessageId: string, markdown: string) => Promise<void>;
+}): (inlineMessageId: string, markdown: string, options?: {
+    assertAuthority?: () => void;
+}) => Promise<void>;
 /**
  * Guest Mode placeholder rotation: the early ACK is the first placeholder
  * frame and the runtime steps the remaining frames once per interval, moving

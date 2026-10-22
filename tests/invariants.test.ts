@@ -1,6 +1,7 @@
 /**
  * Regression tests for project architecture invariants
  * Guards import graph shape, shared-bucket bans, and polling SDK boundary rules
+ * Zones: shared utils, telegram, pi agent
  */
 
 import assert from "node:assert/strict";
@@ -40,6 +41,15 @@ function getProjectTypeScriptFiles(): string[] {
       .map((name) => join("tests", name)),
   ].sort();
 }
+
+test("Local operator design notes stay outside default Git and npm publication", () => {
+  const gitRules = readFileSync(join(PROJECT_ROOT, ".gitignore"), "utf8").split(/\r?\n/);
+  const npmRules = readFileSync(join(PROJECT_ROOT, "docs", ".npmignore"), "utf8").split(/\r?\n/);
+  assert.ok(gitRules.includes("/docs/prompt-overlay-design.md"));
+  assert.ok(npmRules.includes("prompt-overlay-design.md"));
+  assert.ok(!gitRules.some(rule => rule.startsWith("!") && rule.includes("prompt-overlay-design")));
+  assert.ok(!npmRules.some(rule => rule.startsWith("!") && rule.includes("prompt-overlay-design")));
+});
 
 test("Unreleased changelog respects the project release-entry budget", () => {
   const unreleased = changelogSource.match(
@@ -535,15 +545,16 @@ test("Automatic Workspace retirement stays disconnected from production composit
   assert.match(busLeaderSource, /!restoringWorkspace && deps\.runWithWorkspaceCapacity/u);
 });
 
-test("Runtime state domain stays free of local domain imports", () => {
+test("Runtime state domain imports only the leaf machine runner", () => {
   const localImportSpecifiers = getImportSpecifiers(
     join("lib", "runtime.ts"),
   ).filter((specifier) => specifier.startsWith("."));
-  assert.deepEqual(localImportSpecifiers, []);
+  // The runner imports nothing local (see the leaf test), so runtime stays free of domain logic transitively.
+  assert.deepEqual(localImportSpecifiers, ["./machine.ts"]);
 });
 
 test("Structural leaf domains stay free of local nominal imports", () => {
-  const leafFiles = ["polling.ts", "setup.ts", "status.ts"];
+  const leafFiles = ["machine.ts", "polling.ts", "setup.ts", "status.ts"];
   const localImportsByFile = Object.fromEntries(
     leafFiles.map((file) => [
       join("lib", file),
@@ -554,6 +565,7 @@ test("Structural leaf domains stay free of local nominal imports", () => {
   );
 
   assert.deepEqual(localImportsByFile, {
+    [join("lib", "machine.ts")]: [],
     [join("lib", "polling.ts")]: [],
     [join("lib", "setup.ts")]: [],
     [join("lib", "status.ts")]: [],

@@ -9,66 +9,339 @@ import test from "node:test";
 import {
   allocateTelegramDraftId,
   buildTelegramPreviewFinalText,
-  clearTelegramPreview,
   createTelegramAssistantPreviewRuntime,
-  createTelegramNativeMarkdownPreviewFinalizer,
-  createTelegramPreviewControllerRuntime,
-  createTelegramPreviewRuntimeState,
-  finalizeTelegramPreview,
-  flushTelegramPreview,
+  createTelegramPreviewController,
+  createTelegramPreviewMachineState,
   getSafeTelegramRichMarkdownDraftPrefix,
+  isTelegramPreviewBusy,
   shouldSuppressPreviewForGuestTurn,
-  shouldUseTelegramDraftPreview,
-  type TelegramPreviewRuntimeState,
+  transitionTelegramPreview,
+  type TelegramPreviewControllerDeps,
+  type TelegramPreviewEffect,
+  type TelegramPreviewEvent,
+  type TelegramPreviewMachineState,
 } from "../lib/preview.ts";
 import { createTelegramThreadTarget } from "../lib/target.ts";
 
-function createPreviewRuntimeHarness(state?: TelegramPreviewRuntimeState) {
-  let previewState = state;
-  let draftSupport: "unknown" | "supported" = "unknown";
-  let nextDraftId = 10;
+/** A controller without throttling whose draft and diagnostic effects land in one event log. */
+function createPreviewHarness(
+  overrides: Partial<TelegramPreviewControllerDeps> = {},
+) {
   const events: string[] = [];
-  return {
-    events,
-    getState: () => previewState,
-    getDraftSupport: () => draftSupport,
-    deps: {
-      getState: () => previewState,
-      setState: (nextState: TelegramPreviewRuntimeState | undefined) => {
-        previewState = nextState;
-      },
-      maxMessageLength: 100,
-      getDraftSupport: () => draftSupport,
-      setDraftSupport: (support: "unknown" | "supported") => {
-        draftSupport = support;
-      },
-      allocateDraftId: () => nextDraftId++,
-      sendDraft: async (
-        chatId: number,
-        draftId: number,
-        text?: string,
-        _options?: { message_thread_id?: number },
-      ) => {
-        events.push(`draft:${chatId}:${draftId}:${text}`);
-      },
-      canSend: undefined as undefined | (() => boolean),
-      recordRuntimeEvent: (
-        category: string,
-        _error: unknown,
-        details?: Record<string, unknown>,
-      ) => {
-        events.push(`${category}:${details?.phase}`);
-      },
+  const preview = createTelegramPreviewController({
+    minDraftIntervalMs: 0,
+    maxMessageLength: 100,
+    sendDraft: async (chatId, draftId, text) => {
+      events.push(`draft:${chatId}:${draftId}:${text}`);
     },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(`preview:${details?.phase}`);
+    },
+    ...overrides,
+  });
+  const start = (pendingText: string): void => {
+    preview.resetState();
+    preview.setPendingText(pendingText);
+  };
+  return { events, preview, start };
+}
+
+const MACHINE_CONFIG = {
+  maxDraftId: 100,
+  maxMessageLength: 100,
+  minDraftIntervalMs: 2000,
+};
+const AT = { now: 10_000, canSend: true };
+const REQUEST = { chatId: 7 };
+
+/** Folds events through the pure transition and returns the final state with every effect in order. */
+function runPreviewMachine(
+  events: TelegramPreviewEvent[],
+  state: TelegramPreviewMachineState = createTelegramPreviewMachineState(),
+): { state: TelegramPreviewMachineState; effects: TelegramPreviewEffect[] } {
+  const effects: TelegramPreviewEffect[] = [];
+  for (const event of events) {
+    const next = transitionTelegramPreview(state, event, MACHINE_CONFIG);
+    state = next.state;
+    effects.push(...next.effects);
+  }
+  return { state, effects };
+}
+
+const flushAt = (now = AT.now, canSend = true): TelegramPreviewEvent => ({
+  type: "flushRequested",
+  request: REQUEST,
+  now,
+  canSend,
+});
+
+test("Preview machine keeps one draft in flight and replays the coalesced request on settlement", () => {
+  const sent = runPreviewMachine([
+    { type: "reset" },
+    { type: "textSet", text: "first" },
+    flushAt(),
+    { type: "textSet", text: "second" },
+    flushAt(),
+    flushAt(),
+  ]);
+  assert.deepEqual(
+    sent.effects.map((effect) => effect.type),
+    ["sendDraft"],
+  );
+  assert.equal(isTelegramPreviewBusy(sent.state), true);
+  assert.deepEqual(sent.state.pending, REQUEST);
+  const settled = runPreviewMachine(
+    [
+      {
+        type: "draftSettled",
+        segmentId: 1,
+        generation: 1,
+        text: "first",
+        now: 12_000,
+        canSend: true,
+      },
+    ],
+    sent.state,
+  );
+  assert.equal(settled.state.segment?.lastSentText, "first");
+  assert.deepEqual(settled.effects, [
+    {
+      type: "sendDraft",
+      request: REQUEST,
+      draftId: 1,
+      text: "second",
+      segmentId: 1,
+      generation: 1,
+    },
+  ]);
+});
+
+test("Preview machine ignores draft results for a replaced segment or an older generation", () => {
+  const sent = runPreviewMachine([
+    { type: "reset" },
+    { type: "textSet", text: "old" },
+    flushAt(),
+  ]);
+  for (const replacement of [
+    { type: "segmentStarted" },
+    { type: "reset" },
+  ] as const) {
+    const { state } = runPreviewMachine(
+      [
+        replacement,
+        {
+          type: "draftSettled",
+          segmentId: 1,
+          generation: 1,
+          text: "old",
+          now: AT.now,
+          canSend: true,
+        },
+      ],
+      sent.state,
+    );
+    assert.equal(state.segment?.lastSentText, "");
+    assert.equal(state.inFlight, null);
+  }
+});
+
+test("Preview machine detaches predecessor dependencies and ignores their late settlements", () => {
+  const replacement = runPreviewMachine([
+    { type: "reset" },
+    { type: "textSet", text: "Old" },
+    flushAt(),
+    { type: "publicationOpened", id: 1 },
+    { type: "invalidated" },
+    { type: "reset" },
+    { type: "textSet", text: "Replacement" },
+    flushAt(),
+    { type: "publicationOpened", id: 2 },
+  ]);
+  assert.equal(replacement.state.inFlight, 2);
+  assert.deepEqual(replacement.state.publications, [2]);
+  for (const stale of [
+    { type: "draftSettled", segmentId: 1, generation: 1, text: "Old", ...AT },
+    { type: "publicationSettled", id: 1, ...AT },
+    { type: "timerFired", request: REQUEST, segmentId: 1, ...AT },
+  ] satisfies TelegramPreviewEvent[]) {
+    const result = runPreviewMachine([stale], replacement.state);
+    assert.equal(result.state, replacement.state);
+    assert.deepEqual(result.effects, [], "Predecessor completion has no replacement authority");
+  }
+  const throttled = runPreviewMachine([
+    { type: "reset" },
+    { type: "textSet", text: "Held replacement" },
+    { type: "draftWindowOpened", at: 12_000 },
+    flushAt(),
+  ], replacement.state);
+  const staleTimer = runPreviewMachine([
+    { type: "timerFired", request: REQUEST, segmentId: 1, now: 12_000, canSend: true },
+  ], throttled.state);
+  assert.equal(staleTimer.state, throttled.state, "A stale timer cannot clear the replacement timer's ownership");
+});
+
+test("Preview machine arms one throttle timer per segment and drops it with the segment", () => {
+  const throttled = runPreviewMachine([
+    { type: "reset" },
+    { type: "textSet", text: "Opening" },
+    { type: "draftWindowOpened", at: 12_000 },
+    flushAt(),
+    flushAt(11_000),
+  ]);
+  assert.deepEqual(throttled.effects, [
+    { type: "armTimer", delay: 2000, request: REQUEST, segmentId: 1 },
+  ]);
+  for (const ending of [
+    { type: "sealed" },
+    { type: "segmentStarted" },
+    { type: "discarded" },
+  ] as const) {
+    const { state, effects } = runPreviewMachine([ending], throttled.state);
+    assert.deepEqual(effects, [{ type: "cancelTimer" }]);
+    assert.equal(state.timerSegmentId, null);
+  }
+  const fired = runPreviewMachine(
+    [{ type: "timerFired", request: REQUEST, segmentId: 1, now: 12_000, canSend: true }],
+    throttled.state,
+  );
+  assert.equal(fired.effects[0]?.type, "sendDraft");
+});
+
+test("Preview machine holds requests behind open publications and clears through a closed gate", () => {
+  const blocked = runPreviewMachine([
+    { type: "reset" },
+    { type: "textSet", text: "Next" },
+    { type: "publicationOpened", id: 1 },
+    flushAt(),
+  ]);
+  assert.deepEqual(blocked.effects, []);
+  assert.equal(isTelegramPreviewBusy(blocked.state), true);
+  assert.equal(isTelegramPreviewBusy(blocked.state, false), false);
+  const released = runPreviewMachine(
+    [{ type: "publicationSettled", id: 1, ...AT }],
+    blocked.state,
+  );
+  assert.equal(released.effects[0]?.type, "sendDraft");
+  const closed = runPreviewMachine([
+    { type: "reset" },
+    { type: "textSet", text: "Hidden" },
+    flushAt(AT.now, false),
+  ]);
+  assert.deepEqual(closed.effects, [
+    { type: "clearClosedGate", request: REQUEST },
+  ]);
+});
+
+/** Small deterministic PRNG so a failing seed reproduces exactly. */
+function createSeededRandom(seed: number): () => number {
+  let value = seed >>> 0;
+  return () => {
+    value = (value + 0x6d2b79f5) >>> 0;
+    let mixed = Math.imul(value ^ (value >>> 15), 1 | value);
+    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed);
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4_294_967_296;
   };
 }
 
+test("Preview machine invariants hold across random event sequences", () => {
+  const texts = ["", "Hello", "**Bold** and *ita", "Done.", "```ts\nopen", "Longer answer text"];
+  for (let seed = 1; seed <= 2000; seed++) {
+    const random = createSeededRandom(seed);
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)]!;
+    let state = createTelegramPreviewMachineState();
+    let now = 10_000;
+    // The environment the runner provides: outstanding draft requests, the armed timer and open publications.
+    const drafts: Array<Extract<TelegramPreviewEffect, { type: "sendDraft" }>> = [];
+    let timer: Extract<TelegramPreviewEffect, { type: "armTimer" }> | undefined;
+    const publications: Array<{ id: number; generation: number }> = [];
+    let publicationIds = 0;
+    const trace: string[] = [];
+    for (let index = 0; index < 60; index++) {
+      now += Math.floor(random() * 1500);
+      const canSend = random() > 0.1;
+      const candidates: Array<() => TelegramPreviewEvent | undefined> = [
+        () => ({ type: "reset" }),
+        () => ({ type: "invalidated" }),
+        () => ({ type: "segmentStarted" }),
+        () => ({ type: "segmentEnsured" }),
+        () => ({ type: "sealed" }),
+        () => ({ type: "discarded" }),
+        () => ({ type: "textSet", text: pick(texts) }),
+        () => ({ type: "draftWindowOpened", at: now + 2000 }),
+        // Flush requests arrive regardless of segment state; the transition must reject them itself.
+        () => ({ type: "flushRequested", request: REQUEST, now, canSend }),
+        () => timer ? { type: "timerFired", request: timer.request, segmentId: timer.segmentId, now, canSend } : undefined,
+        () => {
+          const draft = drafts.shift();
+          if (!draft) return undefined;
+          return {
+            type: "draftSettled", segmentId: draft.segmentId, generation: draft.generation,
+            ...(random() > 0.2 ? { text: draft.text } : {}), now, canSend,
+          };
+        },
+        () => ({ type: "publicationOpened", id: (publicationIds += 1) }),
+        () => {
+          if (publications.length === 0) return undefined;
+          const { id } = publications.splice(Math.floor(random() * publications.length), 1)[0]!;
+          return { type: "publicationSettled", id, now, canSend };
+        },
+      ];
+      const event = pick(candidates)();
+      if (!event) continue;
+      if (event.type === "timerFired") timer = undefined;
+      if (event.type === "publicationOpened")
+        publications.push({ id: event.id, generation: state.generation });
+      trace.push(event.type);
+      const before = state;
+      const next = transitionTelegramPreview(before, event, MACHINE_CONFIG);
+      state = next.state;
+      const context = `seed ${seed}: ${trace.join(" > ")}`;
+      for (const effect of next.effects) {
+        if (effect.type === "sendDraft") {
+          assert.equal(drafts.filter((draft) => draft.generation === state.generation).length, 0, `generation single flight broken, ${context}`);
+          assert.equal(publications.filter((publication) => publication.generation === state.generation).length, 0, `draft sent behind a current publication, ${context}`);
+          assert.ok(canSend, `draft sent through a closed gate, ${context}`);
+          assert.equal(effect.segmentId, state.segment?.id, `draft for a non-current segment, ${context}`);
+          assert.equal(state.segment?.sealed, false, `draft for a sealed segment, ${context}`);
+          assert.ok(before.nextDraftAt <= now, `draft sent inside the throttle window, ${context}`);
+          assert.notEqual(effect.text, before.segment?.lastSentText, `unchanged draft resent, ${context}`);
+          drafts.push(effect);
+        } else if (effect.type === "armTimer") {
+          assert.equal(timer, undefined, `second timer armed, ${context}`);
+          timer = effect;
+        } else if (effect.type === "cancelTimer") {
+          assert.ok(timer, `cancelled a timer that was not armed, ${context}`);
+          timer = undefined;
+        }
+      }
+      assert.equal(state.inFlight, drafts.find((draft) => draft.generation === state.generation)?.segmentId ?? null,
+        `in-flight ownership drifted, ${context}`);
+      assert.equal(state.timerSegmentId, timer?.segmentId ?? null, `timer ownership drifted, ${context}`);
+      if (state.timerSegmentId !== null)
+        assert.equal(state.timerSegmentId, state.segment?.id, `timer outlived its segment, ${context}`);
+      if (state.pending !== null)
+        assert.ok(state.segment && !state.segment.sealed, `pending request without a live segment, ${context}`);
+      assert.deepEqual([...state.publications].sort(),
+        publications.filter((publication) => publication.generation === state.generation).map((publication) => publication.id).sort(),
+        `publication set drifted, ${context}`);
+      if (event.type === "draftSettled" && state.segment?.lastSentText !== before.segment?.lastSentText) {
+        assert.equal(event.segmentId, state.segment?.id, `stale segment result applied, ${context}`);
+        assert.equal(event.generation, state.generation, `stale generation result applied, ${context}`);
+      }
+    }
+  }
+});
+
 test("Preview helpers create draft-only state and allocate draft ids", () => {
-  assert.deepEqual(createTelegramPreviewRuntimeState(), {
-    mode: "draft",
-    pendingText: "",
-    lastSentText: "",
-  });
+  const { preview } = createPreviewHarness();
+  assert.equal(preview.getState(), undefined);
+  preview.resetState();
+  const state = preview.getState();
+  assert.equal(state?.mode, "draft");
+  assert.equal(state?.pendingText, "");
+  assert.equal(state?.lastSentText, "");
+  assert.equal(state?.draftId, undefined);
+  assert.equal(state?.sealed, false);
   assert.equal(allocateTelegramDraftId(0, 2), 1);
   assert.equal(allocateTelegramDraftId(1, 2), 2);
   assert.equal(allocateTelegramDraftId(2, 2), 1);
@@ -98,20 +371,6 @@ test("Preview final text prefers pending text then last sent draft text", () => 
       lastSentText: "   ",
     }),
     undefined,
-  );
-});
-
-test("Preview helpers always use native rich drafts", () => {
-  assert.equal(
-    shouldUseTelegramDraftPreview({ draftSupport: "unknown" }),
-    true,
-  );
-  assert.equal(
-    shouldUseTelegramDraftPreview({
-      draftSupport: "supported",
-      snapshot: { text: "ok" },
-    }),
-    true,
   );
 });
 
@@ -160,150 +419,117 @@ test("Native Markdown draft prefix keeps only structurally closed Markdown", () 
 });
 
 test("Preview runtime sends only safe native markdown draft prefixes", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    draftId: 10,
-    pendingText: "**Bold** and *ita",
-    lastSentText: "",
-  });
-  await flushTelegramPreview(7, harness.deps);
-  assert.deepEqual(harness.events, ["draft:7:10:**Bold** and"]);
-  assert.equal(harness.getState()?.lastSentText, "**Bold** and");
-  assert.equal(harness.getDraftSupport(), "supported");
+  const { events, preview, start } = createPreviewHarness();
+  start("**Bold** and *ita");
+  await preview.flush(7);
+  assert.deepEqual(events, ["draft:7:1:**Bold** and"]);
+  assert.equal(preview.getState()?.lastSentText, "**Bold** and");
+  assert.equal(preview.getState()?.draftId, 1);
 });
 
 test("Preview runtime sends draft previews into thread target", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    draftId: 10,
-    pendingText: "thread draft",
-    lastSentText: "",
-  });
   const sentOptions: unknown[] = [];
-  harness.deps.sendDraft = async (
-    _chatId: number,
-    _draftId: number,
-    _text?: string,
-    options?: { message_thread_id?: number },
-  ) => {
-    sentOptions.push(options);
-  };
-  await flushTelegramPreview(7, harness.deps, {
-    target: createTelegramThreadTarget(7, 42),
+  const { preview, start } = createPreviewHarness({
+    sendDraft: async (_chatId, _draftId, _text, options) => {
+      sentOptions.push(options);
+    },
   });
+  start("thread draft");
+  await preview.flush(7, { target: createTelegramThreadTarget(7, 42) });
   assert.deepEqual(sentOptions, [{ message_thread_id: 42 }]);
 });
 
 test("Preview runtime clears thread drafts in thread target", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    draftId: 10,
-    pendingText: "new draft",
-    lastSentText: "",
-  });
   const sentOptions: unknown[] = [];
-  harness.deps.sendDraft = async (
-    _chatId: number,
-    _draftId: number,
-    _text?: string,
-    options?: { message_thread_id?: number },
-  ) => {
-    sentOptions.push(options);
-  };
-  await clearTelegramPreview(7, harness.deps, {
-    target: createTelegramThreadTarget(7, 42),
+  const { preview, start } = createPreviewHarness({
+    sendDraft: async (_chatId, _draftId, _text, options) => {
+      sentOptions.push(options);
+    },
   });
-  assert.deepEqual(sentOptions, [{ message_thread_id: 42 }]);
+  start("new draft");
+  const target = createTelegramThreadTarget(7, 42);
+  await preview.flush(7, { target });
+  await preview.clear(7, { target });
+  assert.deepEqual(sentOptions, [
+    { message_thread_id: 42 },
+    { message_thread_id: 42 },
+  ]);
 });
 
 test("Preview runtime does not send thinking placeholder for unsafe draft tails", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    pendingText: "<!-- telegram_button label=Ok",
-    lastSentText: "",
-  });
-  await flushTelegramPreview(7, harness.deps);
-  assert.deepEqual(harness.events, []);
-  assert.equal(harness.getState()?.draftId, undefined);
-  assert.equal(harness.getState()?.lastSentText, "");
+  const { events, preview, start } = createPreviewHarness();
+  start("<!-- telegram_button label=Ok");
+  await preview.flush(7);
+  assert.deepEqual(events, []);
+  assert.equal(preview.getState()?.draftId, undefined);
+  assert.equal(preview.getState()?.lastSentText, "");
 });
 
 test("Preview runtime skips unchanged unsafe draft tails", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    pendingText: "**Bold** and *ita",
-    lastSentText: "**Bold** and",
-  });
-  await flushTelegramPreview(7, harness.deps);
-  assert.deepEqual(harness.events, []);
+  const { events, preview, start } = createPreviewHarness();
+  start("**Bold** and");
+  await preview.flush(7);
+  preview.setPendingText("**Bold** and *ita");
+  await preview.flush(7);
+  assert.deepEqual(events, ["draft:7:1:**Bold** and"]);
 });
 
 test("Preview runtime records draft failures without plain fallback", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    draftId: 10,
-    pendingText: "abcdef",
-    lastSentText: "",
+  const { events, preview, start } = createPreviewHarness({
+    sendDraft: async () => {
+      throw new Error("draft rejected partial markdown");
+    },
   });
-  harness.deps.sendDraft = async () => {
-    throw new Error("draft rejected partial markdown");
-  };
-  await flushTelegramPreview(7, harness.deps);
-  assert.deepEqual(harness.events, ["preview:draft"]);
-  assert.equal(harness.getState()?.mode, "draft");
-  assert.equal(harness.getDraftSupport(), "unknown");
+  start("abcdef");
+  await preview.flush(7);
+  assert.deepEqual(events, ["preview:draft"]);
+  assert.equal(preview.getState()?.mode, "draft");
+  assert.equal(preview.getState()?.lastSentText, "");
 });
 
 test("Preview runtime serializes overlapping flush requests", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    draftId: 44,
-    pendingText: "first",
-    lastSentText: "",
-  });
   let releaseDraft: (() => void) | undefined;
-  harness.deps.sendDraft = async (chatId, draftId, text) => {
-    harness.events.push(`draft:${chatId}:${draftId}:${text}`);
-    if (!releaseDraft) {
-      await new Promise<void>((resolve) => {
-        releaseDraft = resolve;
-      });
-    }
-  };
-  const firstFlush = flushTelegramPreview(7, harness.deps);
+  const events: string[] = [];
+  const { preview, start } = createPreviewHarness({
+    sendDraft: async (chatId, draftId, text) => {
+      events.push(`draft:${chatId}:${draftId}:${text}`);
+      if (!releaseDraft) {
+        await new Promise<void>((resolve) => {
+          releaseDraft = resolve;
+        });
+      }
+    },
+  });
+  start("first");
+  const firstFlush = preview.flush(7);
   await Promise.resolve();
-  const state = harness.getState();
-  assert.ok(state);
-  state.pendingText = "second";
-  const secondFlush = flushTelegramPreview(7, harness.deps);
+  preview.setPendingText("second");
+  const secondFlush = preview.flush(7);
+  assert.equal(preview.isFlushing(), true);
   releaseDraft?.();
   await Promise.all([firstFlush, secondFlush]);
-  assert.deepEqual(harness.events, ["draft:7:44:first", "draft:7:44:second"]);
-  assert.equal(harness.getState()?.lastSentText, "second");
+  assert.deepEqual(events, ["draft:7:1:first", "draft:7:1:second"]);
+  assert.equal(preview.getState()?.lastSentText, "second");
+  assert.equal(preview.isFlushing(), false);
 });
 
 test("Preview runtime clears active rich draft on explicit clear", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    draftId: 10,
-    pendingText: "new draft",
-    lastSentText: "",
-  });
-  await clearTelegramPreview(7, harness.deps);
-  assert.deepEqual(harness.events, ["draft:7:10:undefined"]);
-  assert.equal(harness.getState(), undefined);
+  const { events, preview, start } = createPreviewHarness();
+  start("new draft");
+  await preview.flush(7);
+  await preview.clear(7);
+  assert.deepEqual(events, ["draft:7:1:new draft", "draft:7:1:undefined"]);
+  assert.equal(preview.getState(), undefined);
 });
 
 test("Preview runtime optional send gate clears without sending new content", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    pendingText: "**hello**",
-    lastSentText: "",
+  const { events, preview, start } = createPreviewHarness({
+    canSend: () => false,
   });
-  harness.deps.canSend = () => false;
-  await flushTelegramPreview(7, harness.deps);
-  assert.deepEqual(harness.events, []);
-  assert.equal(harness.getState(), undefined);
+  start("**hello**");
+  await preview.flush(7);
+  assert.deepEqual(events, []);
+  assert.equal(preview.getState(), undefined);
 });
 
 test("Draft throttle holds the first frame for one interval then sends the latest snapshot without debounce starvation", async (t) => {
@@ -367,11 +593,8 @@ test("Final publication cancels the draft throttle timer without waiting for its
     preview.resetState();
     await preview.onMessageUpdate({ message: { text: "First" } }); await preview.flush(7);
     await preview.onMessageUpdate({ message: { text: "Queued tail" } }); await preview.flush(7);
-    const state = preview.getState()!;
-    assert.ok(state.flushTimer);
     assert.equal(await preview.finalizeMarkdown(7, "Complete answer", 21), true);
     assert.equal(Date.now(), 10_000);
-    assert.equal(state.flushTimer, undefined);
     t.mock.timers.tick(2000); await Promise.resolve();
     assert.deepEqual(effects, ["final"], "The held opening frame never shipped");
   } finally { preview.invalidate(); }
@@ -392,9 +615,7 @@ test("Replacing a throttled preview cancels old text and retains the interval wi
     await preview.onMessageUpdate({ message: { text: "First" } }); await preview.flush(7);
     t.mock.timers.tick(2000); await preview.flush(7);
     await preview.onMessageUpdate({ message: { text: "Obsolete" } }); await preview.flush(7);
-    const old = preview.getState()!;
     threadId = 43; preview.resetState();
-    assert.equal(old.flushTimer, undefined);
     await preview.onMessageUpdate({ message: { text: "Replacement" } }); await preview.flush(7);
     t.mock.timers.tick(2000); await preview.flush(7);
     assert.deepEqual(drafts, [{ text: "First", thread: 42 }, { text: "Replacement", thread: 43 }]);
@@ -454,48 +675,40 @@ test("Sealed preview ignores late updates while a replacement preview can stream
 });
 
 test("Native Markdown finalizer drains only the issued draft and suppresses queued and late drafts", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    draftId: 10,
-    pendingText: "draft body",
-    lastSentText: "",
-  });
+  const events: string[] = [];
   const releases: Array<() => void> = [];
   let sends = 0;
-  harness.deps.sendDraft = async (chatId, draftId, text) => {
-    harness.events.push(`draft-start:${chatId}:${draftId}:${text}`);
-    if (++sends === 1) await new Promise<void>((resolve) => {
-      releases.push(resolve);
-    });
-    harness.events.push(`draft-finish:${chatId}:${draftId}:${text}`);
-  };
-  const finalizeMarkdown = createTelegramNativeMarkdownPreviewFinalizer({
-    getState: harness.deps.getState,
-    clear: (chatId) => clearTelegramPreview(chatId, harness.deps),
-    discard: () => harness.deps.setState(undefined),
+  const preview = createTelegramAssistantPreviewRuntime<{ text: string }>({
+    getActiveTurn: () => ({ chatId: 7 }), isAssistantMessage: () => true,
+    getMessageText: (message) => message.text, minDraftIntervalMs: 0,
+    sendDraft: async (chatId, draftId, text) => {
+      events.push(`draft-start:${chatId}:${draftId}:${text}`);
+      if (++sends === 1) await new Promise<void>((resolve) => { releases.push(resolve); });
+      events.push(`draft-finish:${chatId}:${draftId}:${text}`);
+    },
     sendMarkdownReply: async (chatId, replyToMessageId, markdown) => {
-      harness.events.push(
-        `final:${chatId}:${replyToMessageId ?? "none"}:${markdown}`,
-      );
+      events.push(`final:${chatId}:${replyToMessageId ?? "none"}:${markdown}`);
       return 88;
     },
   });
-  const flush = flushTelegramPreview(7, harness.deps);
+  preview.resetState();
+  preview.setPendingText("draft body");
+  const flush = preview.flush(7);
   await Promise.resolve();
-  harness.getState()!.pendingText = "queued follow-up draft";
-  const followUp = flushTelegramPreview(7, harness.deps);
-  const finalize = finalizeMarkdown(7, "final body", 55);
-  const lateFlush = flushTelegramPreview(7, harness.deps);
+  preview.setPendingText("queued follow-up draft");
+  const followUp = preview.flush(7);
+  const finalize = preview.finalizeMarkdown(7, "final body", 55);
+  const lateFlush = preview.flush(7);
   await Promise.resolve();
-  assert.deepEqual(harness.events, ["draft-start:7:10:draft body"]);
+  assert.deepEqual(events, ["draft-start:7:1:draft body"]);
   releases.shift()?.();
   await Promise.all([flush, followUp, lateFlush, finalize]);
-  assert.deepEqual(harness.events, [
-    "draft-start:7:10:draft body",
-    "draft-finish:7:10:draft body",
+  assert.deepEqual(events, [
+    "draft-start:7:1:draft body",
+    "draft-finish:7:1:draft body",
     "final:7:55:final body",
   ]);
-  assert.equal(harness.getState(), undefined);
+  assert.equal(preview.getState(), undefined);
 });
 
 test("A deferred draft does not consume its latest text snapshot", async (t) => {
@@ -543,61 +756,52 @@ test("Prepared final rechecks delivery authority after its original draft flush"
     prepared.setPreviewPendingText("stale mutation");
     await prepared.clearPreview(7);
     assert.deepEqual(effects, ["draft"]);
-    assert.equal(preview.getState(), original);
+    assert.equal(preview.getState()?.id, original?.id);
     assert.equal(original?.pendingText, "Original draft.");
   } finally { release(); await result; preview.invalidate(); }
 });
 
 test("Native Markdown finalizer stops when preview generation changes during flush", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    draftId: 10,
-    pendingText: "old draft",
-    lastSentText: "",
-  });
   let release: (() => void) | undefined;
-  harness.deps.sendDraft = async () =>
-    new Promise<void>((resolve) => {
-      release = resolve;
-    });
   let finalSends = 0;
-  const finalizeMarkdown = createTelegramNativeMarkdownPreviewFinalizer({
-    getState: harness.deps.getState,
-    clear: (chatId) => clearTelegramPreview(chatId, harness.deps),
-    discard: () => harness.deps.setState(undefined),
+  const preview = createTelegramAssistantPreviewRuntime<{ text: string }>({
+    getActiveTurn: () => ({ chatId: 7 }), isAssistantMessage: () => true,
+    getMessageText: (message) => message.text, minDraftIntervalMs: 0,
+    sendDraft: async () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
     sendMarkdownReply: async () => {
       finalSends += 1;
       return 88;
     },
   });
-  const flush = flushTelegramPreview(7, harness.deps);
+  preview.resetState();
+  preview.setPendingText("old draft");
+  const flush = preview.flush(7);
   await Promise.resolve();
-  const finalize = finalizeMarkdown(7, "old final", 55);
+  const finalize = preview.finalizeMarkdown(7, "old final", 55);
   await Promise.resolve();
-  harness.deps.setState({
-    mode: "draft",
-    draftId: 11,
-    pendingText: "new draft",
-    lastSentText: "",
-  });
+  preview.resetState();
+  preview.setPendingText("new draft");
+  const replacement = preview.getState();
   release?.();
 
   assert.equal(await finalize, false);
   await flush;
   assert.equal(finalSends, 0);
-  assert.equal(harness.getState()?.draftId, 11);
+  assert.equal(preview.getState()?.id, replacement?.id);
+  assert.equal(preview.getState()?.pendingText, "new draft");
 });
 
 test("Plain preview finalization does not send fallback messages", async () => {
-  const harness = createPreviewRuntimeHarness({
-    mode: "draft",
-    draftId: 10,
-    pendingText: "final body",
-    lastSentText: "final",
-  });
-  assert.equal(await finalizeTelegramPreview(7, harness.deps), false);
-  assert.deepEqual(harness.events, ["draft:7:10:final body"]);
-  assert.equal(harness.getState(), undefined);
+  const { events, preview, start } = createPreviewHarness();
+  start("final");
+  await preview.flush(7);
+  preview.setPendingText("final body");
+  assert.equal(await preview.finalize(7), false);
+  assert.deepEqual(events, ["draft:7:1:final", "draft:7:1:final body"]);
+  assert.equal(preview.getState(), undefined);
 });
 
 test("Assistant preview rollover does not republish intermediate assistant text", async () => {
@@ -624,11 +828,9 @@ test("Assistant preview rollover does not republish intermediate assistant text"
       return 99;
     },
   });
-  runtime.setState({
-    mode: "draft",
-    pendingText: "**previous**",
-    lastSentText: "**previous**",
-  });
+  runtime.resetState();
+  runtime.setPendingText("**previous**");
+  await runtime.flush(7);
   await runtime.onMessageStart({ message: { role: "assistant" } });
   assert.deepEqual(events, []);
   assert.equal(runtime.getState()?.pendingText, "");
@@ -669,6 +871,132 @@ test("Preview rollover waits for admitted publication without holding the messag
     release(); preparation.settle(); await start; await runtime.flush(7); runtime.invalidate();
   }
 });
+
+for (const replacement of ["rollover", "reset"] as const) {
+  test(`Preview publication wait excludes later drafts after ${replacement}`, async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const drafts: string[] = [];
+    const preview = createTelegramAssistantPreviewRuntime<{ text: string }>({
+      getActiveTurn: () => ({ chatId: 7 }),
+      isAssistantMessage: () => true,
+      getMessageText: (message) => message.text,
+      minDraftIntervalMs: 0,
+      sendDraft: async (_chat, _id, text) => {
+        drafts.push(text!);
+        if (drafts.length === 1) await gate;
+      },
+      sendMarkdownReply: async () => 1,
+    });
+    preview.resetState();
+    preview.setPendingText("First draft");
+    const first = preview.flush(7);
+    const publication = preview.preparePublication()!;
+    let resolved = false;
+    const waiting = publication.wait().then(() => { resolved = true; });
+    let second: Promise<void> | undefined;
+    try {
+      assert.deepEqual(drafts, ["First draft"]);
+      if (replacement === "rollover")
+        await preview.onMessageStart({ message: { text: "" } });
+      else preview.resetState();
+      preview.setPendingText("Later draft");
+      second = preview.flush(7);
+      if (replacement === "rollover") {
+        assert.equal(resolved, false, "The preceding issued draft is still required");
+        assert.deepEqual(drafts, ["First draft"], "The later draft waits for publication settlement");
+      }
+      release();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(resolved, true, "Later pending work cannot extend an admitted publication's wait");
+      if (replacement === "rollover") assert.deepEqual(drafts, ["First draft"]);
+      publication.settle();
+      await second;
+      assert.deepEqual(drafts, ["First draft", "Later draft"]);
+    } finally {
+      release();
+      publication.settle();
+      await Promise.all([first, second, waiting]);
+      preview.invalidate();
+    }
+  });
+}
+
+test("Preview publication wait includes earlier publications but excludes later ones", async () => {
+  const { preview, start } = createPreviewHarness();
+  start("Answer");
+  const first = preview.preparePublication()!;
+  const second = preview.preparePublication()!;
+  let resolved = false;
+  const waiting = second.wait().then(() => { resolved = true; });
+  const later = preview.preparePublication()!;
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(resolved, false, "The second publication retains the first publication's boundary");
+    first.settle();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(resolved, true, "A later publication cannot become a predecessor");
+  } finally {
+    first.settle();
+    second.settle();
+    later.settle();
+    await waiting;
+    preview.invalidate();
+  }
+});
+
+for (const settlement of ["old-first", "new-first"] as const) {
+  test(`Preview replacement isolates draft and publication dependencies with ${settlement} settlement`, async () => {
+    const releases: Array<() => void> = [];
+    const gates = [0, 1].map(() => new Promise<void>((resolve) => { releases.push(resolve); }));
+    const drafts: string[] = [];
+    const finals: string[] = [];
+    const preview = createTelegramAssistantPreviewRuntime<{ text: string }>({
+      getActiveTurn: () => ({ chatId: 7 }),
+      isAssistantMessage: () => true,
+      getMessageText: (message) => message.text,
+      minDraftIntervalMs: 0,
+      sendDraft: async (_chat, _id, text) => {
+        drafts.push(text!);
+        await gates[drafts.length - 1];
+      },
+      sendMarkdownReply: async (_chat, _reply, markdown) => { finals.push(markdown); return 1; },
+    });
+    preview.resetState();
+    preview.setPendingText("Old draft");
+    const oldFlush = preview.flush(7);
+    const oldPublication = preview.preparePublication()!;
+    let newFlush: Promise<void> | undefined;
+    let final: Promise<boolean> | undefined;
+    try {
+      preview.invalidate();
+      preview.resetState();
+      preview.setPendingText("Replacement draft");
+      newFlush = preview.flush(7);
+      assert.deepEqual(drafts, ["Old draft", "Replacement draft"], "A new generation does not inherit an old send or publication");
+      final = preview.finalizeMarkdown(7, "Replacement answer");
+      oldPublication.settle();
+      if (settlement === "old-first") {
+        releases[0]!();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(preview.isFlushing(), true, "An old settlement cannot clear the replacement's in-flight draft");
+        assert.equal(preview.getState()?.lastSentText, "");
+        assert.deepEqual(finals, []);
+      }
+      releases[1]!();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(finals, ["Replacement answer"], "The replacement final waits only for its own generation");
+      assert.equal(await final, true);
+      assert.equal(preview.getState(), undefined);
+    } finally {
+      oldPublication.settle();
+      for (const release of releases) release();
+      await Promise.all([oldFlush, newFlush, final]);
+      preview.invalidate();
+    }
+    assert.deepEqual(finals, ["Replacement answer"], "Late predecessor settlement cannot publish or mutate replacement work");
+  });
+}
 
 for (const operation of ["final", "clear"] as const) {
   test(`Preview rollover carries issued draft authority into ${operation} without a new update`, async (t) => {
@@ -752,7 +1080,7 @@ test("Assistant preview runtime suppresses text preview for guest turns", async 
 
 test("Preview controller runtime binds Bot API draft transport", async () => {
   const events: string[] = [];
-  const runtime = createTelegramPreviewControllerRuntime({
+  const runtime = createTelegramPreviewController({
     sendDraft: async (chatId, draftId, text) => {
       events.push(`draft:${chatId}:${draftId}:${text}`);
     },

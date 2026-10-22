@@ -66,7 +66,6 @@ export function getTelegramSectionDiagnostics() {
     const registry = globalThis[SECTION_REGISTRY_KEY];
     return registry ? registry.getDiagnostics() : [];
 }
-// --- Registry ---
 const BACK_NAV_ROW = {
     text: "⬆️ Back",
 };

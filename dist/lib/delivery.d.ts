@@ -76,6 +76,7 @@ export interface TelegramDeliveryTransportOptions {
 /** @internal */
 export interface TelegramDeliveryRuntimeDeps extends TelegramDeliveryTargetResolverDeps {
     generation: string;
+    captureDrain?: () => (() => void) | undefined;
     renderView: (view: TelegramDeliveryView) => readonly TelegramDeliveryRenderedChunk[];
     sendChunk: (target: TelegramDeliveryTarget, chunk: TelegramDeliveryRenderedChunk, options: TelegramDeliveryTransportOptions) => Promise<number>;
     editChunk: (target: TelegramDeliveryTarget, messageId: number, chunk: TelegramDeliveryRenderedChunk, options: TelegramDeliveryTransportOptions) => Promise<void>;
@@ -86,6 +87,7 @@ export interface TelegramDeliveryRuntimeDeps extends TelegramDeliveryTargetResol
 /** @internal */
 export interface TelegramBridgeDeliveryRuntimeDeps {
     generation: string;
+    captureDrain?: () => (() => void) | undefined;
     getTargetPolicyView: () => TelegramDeliveryTargetPolicyView;
     getActiveTurnTarget: () => TelegramDeliveryTarget | undefined;
     isTransportActive?: () => boolean;
@@ -114,6 +116,7 @@ export declare function createTelegramBridgeDeliveryLifecycleHooks<TTransportSta
 export interface TelegramDeliveryTargetPolicyView {
     canDeliver: boolean;
     ownsDirect: boolean;
+    threaded?: boolean;
     allowedChatId?: number;
     followerTarget?: TelegramDeliveryTarget;
     leaderTarget?: TelegramDeliveryTarget;
@@ -127,6 +130,7 @@ export interface TelegramDeliveryTargetPolicyRuntime {
 /** @internal */
 export declare function createTelegramDeliveryTargetPolicyRuntime(deps: {
     ownsDirect(): boolean;
+    isThreadedMode?(): boolean;
     isFollowerRegistered(): boolean;
     getAllowedChatId(): number | undefined;
     getFollowerTarget(): TelegramDeliveryTarget | undefined;

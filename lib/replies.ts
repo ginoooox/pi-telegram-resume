@@ -1033,13 +1033,14 @@ export function createGuestMarkdownReplyEditor(deps: {
   editGuestInlineMessage: (
     inlineMessageId: string,
     content: { richMessage?: TelegramInputRichMessage; text?: string },
+    options?: { assertAuthority?: () => void },
   ) => Promise<void>;
 }) {
-  return async (inlineMessageId: string, markdown: string) => {
+  return async (inlineMessageId: string, markdown: string, options?: { assertAuthority?: () => void }) => {
     const [richMarkdown = markdown] = splitTelegramNativeMarkdown(markdown);
     await deps.editGuestInlineMessage(inlineMessageId, {
       richMessage: { markdown: richMarkdown },
-    });
+    }, options);
   };
 }
 

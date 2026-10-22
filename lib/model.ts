@@ -4,6 +4,7 @@
  * Owns model identity, thinking levels, scoped resolution, current-model state, and in-flight model switching
  */
 
+import * as Machine from "./machine.ts";
 import {
   truncateTelegramQueueSummary,
   type PendingTelegramTurn,
@@ -368,32 +369,9 @@ export function sortScopedModels<TModel extends MenuModel = MenuModel>(
 
 // --- In-Flight Model Switching ---
 
-export interface PendingModelSwitchStore<TSelection> {
-  get: () => TSelection | undefined;
-  set: (selection: TSelection | undefined) => void;
-  clear: () => void;
-  has: () => boolean;
-}
-
 export interface TelegramInFlightModelSwitchState {
   isIdle: boolean;
   hasAbortHandler: boolean;
-}
-
-export function createPendingModelSwitchStore<
-  TSelection,
->(): PendingModelSwitchStore<TSelection> {
-  let selection: TSelection | undefined;
-  return {
-    get: () => selection,
-    set: (nextSelection) => {
-      selection = nextSelection;
-    },
-    clear: () => {
-      selection = undefined;
-    },
-    has: () => selection !== undefined,
-  };
 }
 
 export function canRestartAgentRunForTelegramModelSwitch(
@@ -414,21 +392,6 @@ export function shouldTriggerPendingTelegramModelSwitchAbort(state: {
     state.hasAbortHandler &&
     state.activeToolExecutions === 0
   );
-}
-
-export function restartTelegramModelSwitchContinuation<
-  TTurn,
-  TSelection,
->(state: {
-  activeTurn: TTurn | undefined;
-  abort: (() => void) | undefined;
-  selection: TSelection;
-  queueContinuation: (turn: TTurn, selection: TSelection) => void;
-}): boolean {
-  if (!state.activeTurn || !state.abort) return false;
-  state.queueContinuation(state.activeTurn, state.selection);
-  state.abort();
-  return true;
 }
 
 export function buildTelegramModelSwitchContinuationText<
@@ -554,8 +517,6 @@ export function createTelegramModelSwitchContinuationQueueRuntime<
 
 export interface TelegramModelSwitchControllerDeps<TContext, TSelection> {
   isIdle: (ctx: TContext) => boolean;
-  getPendingModelSwitch: () => TSelection | undefined;
-  setPendingModelSwitch: (selection: TSelection | undefined) => void;
   getActiveTurn: () => PendingTelegramTurn | undefined;
   getAbortHandler: () => (() => void) | undefined;
   hasAbortHandler: () => boolean;
@@ -570,6 +531,8 @@ export interface TelegramModelSwitchControllerDeps<TContext, TSelection> {
 
 export interface TelegramModelSwitchController<TContext, TSelection> {
   canOfferInFlightSwitch: (ctx: TContext) => boolean;
+  /** A staged switch waits for its abort; queue dispatch and live-work observation treat it as pending control. */
+  hasPendingSwitch: () => boolean;
   stagePendingSwitch: (
     selection: TSelection,
     ctx: TContext,
@@ -610,8 +573,6 @@ export function createTelegramModelSwitchControllerRuntime<
 ): TelegramModelSwitchController<TContext, TSelection> {
   return createTelegramModelSwitchController({
     isIdle: deps.isIdle,
-    getPendingModelSwitch: deps.getPendingModelSwitch,
-    setPendingModelSwitch: deps.setPendingModelSwitch,
     getActiveTurn: deps.getActiveTurn,
     getAbortHandler: deps.getAbortHandler,
     hasAbortHandler: deps.hasAbortHandler,
@@ -626,31 +587,163 @@ export function createTelegramModelSwitchControllerRuntime<
   });
 }
 
+/** The whole model-switch state; only `transitionTelegramModelSwitch` produces a new one. */
+export interface TelegramModelSwitchMachineState<TSelection> {
+  /** One staged switch: the selection and the turn its continuation answers move and clear together. */
+  readonly pending: {
+    readonly selection: TSelection;
+    /** The active Telegram turn at staging, or the model menu's own target for a local run. */
+    readonly turn?: TelegramModelSwitchContinuationSource;
+  } | null;
+}
+
+/** Facts owned by other domains, sampled by the shell when the event is dispatched. */
+interface TelegramModelSwitchRunFacts {
+  activeTurn?: TelegramModelSwitchContinuationSource;
+  hasAbortHandler: boolean;
+  activeToolExecutions: number;
+}
+
+export type TelegramModelSwitchEvent<TSelection> =
+  | {
+      type: "staged";
+      selection: TSelection;
+      turn?: TelegramModelSwitchContinuationSource;
+    }
+  | ({ type: "abortRequested" } & TelegramModelSwitchRunFacts)
+  | {
+      type: "restartRequested";
+      selection: TSelection;
+      turn?: TelegramModelSwitchContinuationSource;
+      hasAbortHandler: boolean;
+    }
+  | { type: "cleared" };
+
+export type TelegramModelSwitchEffect<TSelection> =
+  | {
+      type: "queueContinuation";
+      turn: TelegramModelSwitchContinuationSource;
+      selection: TSelection;
+    }
+  | { type: "abort" };
+
+export interface TelegramModelSwitchStep<
+  TSelection,
+> extends Machine.TelegramMachineStep<
+  TelegramModelSwitchMachineState<TSelection>,
+  TelegramModelSwitchEffect<TSelection>
+> {
+  /** `abortRequested` / `restartRequested`: the run was stopped for a continuation. */
+  result: boolean;
+}
+
+export function createTelegramModelSwitchMachineState<
+  TSelection,
+>(): TelegramModelSwitchMachineState<TSelection> {
+  return { pending: null };
+}
+
+/** The continuation is queued before the abort, so the stopped run always has its successor waiting. */
+const restartFor = <TSelection>(
+  turn: TelegramModelSwitchContinuationSource,
+  selection: TSelection,
+): TelegramModelSwitchStep<TSelection> => ({
+  state: { pending: null },
+  effects: [{ type: "queueContinuation", turn, selection }, { type: "abort" }],
+  result: true,
+});
+
+/**
+ * Pure model-switch transition. A staged switch fires only once no tool runs and an abort handler exists; any restart
+ * or clear consumes the staged switch too, so a stale selection can never abort the continuation run it started.
+ */
+export function transitionTelegramModelSwitch<TSelection>(
+  state: TelegramModelSwitchMachineState<TSelection>,
+  event: TelegramModelSwitchEvent<TSelection>,
+): TelegramModelSwitchStep<TSelection> {
+  const unchanged = { state, effects: [], result: false };
+  switch (event.type) {
+    case "staged":
+      return {
+        state: {
+          pending: {
+            selection: event.selection,
+            ...(event.turn ? { turn: event.turn } : {}),
+          },
+        },
+        effects: [],
+        result: false,
+      };
+    case "abortRequested": {
+      const pending = state.pending;
+      const turn = pending?.turn ?? event.activeTurn;
+      if (
+        !pending ||
+        !turn ||
+        !shouldTriggerPendingTelegramModelSwitchAbort({
+          hasPendingModelSwitch: true,
+          hasContinuationTurn: true,
+          hasAbortHandler: event.hasAbortHandler,
+          activeToolExecutions: event.activeToolExecutions,
+        })
+      )
+        return unchanged;
+      return restartFor(turn, pending.selection);
+    }
+    case "restartRequested":
+      return event.turn && event.hasAbortHandler
+        ? restartFor(event.turn, event.selection)
+        : unchanged;
+    case "cleared":
+      return { state: { pending: null }, effects: [], result: false };
+  }
+}
+
+/**
+ * The shell around `transitionTelegramModelSwitch`: it samples the active turn, abort handler and tool count into
+ * events, and runs the continuation and abort effects with the caller's context and the handler it sampled.
+ */
 export function createTelegramModelSwitchController<TContext, TSelection>(
   deps: TelegramModelSwitchControllerDeps<TContext, TSelection>,
 ): TelegramModelSwitchController<TContext, TSelection> {
-  let pendingContinuationTurn:
-    TelegramModelSwitchContinuationSource | undefined;
-  const triggerPendingAbort = (ctx: TContext): boolean => {
-    const turn = pendingContinuationTurn ?? deps.getActiveTurn();
-    if (
-      !shouldTriggerPendingTelegramModelSwitchAbort({
-        hasPendingModelSwitch: !!deps.getPendingModelSwitch(),
-        hasContinuationTurn: !!turn,
-        hasAbortHandler: deps.hasAbortHandler(),
-        activeToolExecutions: deps.getActiveToolExecutions(),
-      })
-    ) {
-      return false;
+  // The context and abort handler of the call being dispatched; effects run synchronously inside that dispatch.
+  let call: { ctx: TContext; abort?: () => void } | undefined;
+  const machine = Machine.createTelegramMachineRunner<
+    TelegramModelSwitchMachineState<TSelection>,
+    TelegramModelSwitchEvent<TSelection>,
+    TelegramModelSwitchEffect<TSelection>,
+    TelegramModelSwitchStep<TSelection>
+  >({
+    initial: createTelegramModelSwitchMachineState<TSelection>(),
+    transition: transitionTelegramModelSwitch,
+    run(effect) {
+      if (!call) return;
+      if (effect.type === "queueContinuation")
+        deps.queueContinuation(effect.turn, effect.selection, call.ctx);
+      else call.abort?.();
+    },
+  });
+  const dispatchFor = (
+    ctx: TContext,
+    abort: (() => void) | undefined,
+    event: TelegramModelSwitchEvent<TSelection>,
+  ): boolean => {
+    const preceding = call;
+    call = { ctx, abort };
+    try {
+      return machine.dispatch(event).result;
+    } finally {
+      call = preceding;
     }
-    const selection = deps.getPendingModelSwitch();
+  };
+  const triggerPendingAbort = (ctx: TContext): boolean => {
     const abort = deps.getAbortHandler();
-    if (!selection || !turn || !abort) return false;
-    pendingContinuationTurn = undefined;
-    deps.setPendingModelSwitch(undefined);
-    deps.queueContinuation(turn, selection, ctx);
-    abort();
-    return true;
+    return dispatchFor(ctx, abort, {
+      type: "abortRequested",
+      activeTurn: deps.getActiveTurn(),
+      hasAbortHandler: deps.hasAbortHandler() && !!abort,
+      activeToolExecutions: deps.getActiveToolExecutions(),
+    });
   };
   return {
     canOfferInFlightSwitch: (ctx) =>
@@ -658,9 +751,14 @@ export function createTelegramModelSwitchController<TContext, TSelection>(
         isIdle: deps.isIdle(ctx),
         hasAbortHandler: deps.hasAbortHandler(),
       }),
+    hasPendingSwitch: () => machine.state.pending !== null,
     stagePendingSwitch: (selection, ctx, continuationTurn) => {
-      pendingContinuationTurn = deps.getActiveTurn() ?? continuationTurn;
-      deps.setPendingModelSwitch(selection);
+      const turn = deps.getActiveTurn() ?? continuationTurn;
+      machine.dispatch({
+        type: "staged",
+        selection,
+        ...(turn ? { turn } : {}),
+      });
       try {
         deps.updateStatus(ctx);
       } finally {
@@ -668,22 +766,19 @@ export function createTelegramModelSwitchController<TContext, TSelection>(
       }
     },
     clearPendingSwitch: () => {
-      pendingContinuationTurn = undefined;
-      deps.setPendingModelSwitch(undefined);
+      machine.dispatch({ type: "cleared" });
     },
     queueContinuation: deps.queueContinuation,
     triggerPendingAbort,
     restartInterruptedTurn: (selection, ctx, continuationTurn) => {
-      const restarted = restartTelegramModelSwitchContinuation({
-        activeTurn: deps.getActiveTurn() ?? continuationTurn,
-        abort: deps.getAbortHandler(),
+      const abort = deps.getAbortHandler();
+      const turn = deps.getActiveTurn() ?? continuationTurn;
+      return dispatchFor(ctx, abort, {
+        type: "restartRequested",
         selection,
-        queueContinuation: (turn, nextSelection) => {
-          deps.queueContinuation(turn, nextSelection, ctx);
-        },
+        ...(turn ? { turn } : {}),
+        hasAbortHandler: !!abort,
       });
-      if (restarted) pendingContinuationTurn = undefined;
-      return restarted;
     },
   };
 }

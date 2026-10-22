@@ -23,6 +23,118 @@ import {
 } from "./paths.ts";
 import * as Status from "./status.ts";
 
+/** Sink shape shared with the runtime event recorder this domain already owns. */
+export type TelegramFailureRecordSink = (
+  category: string,
+  errorOrMessage: unknown,
+  details: Record<string, unknown>,
+) => void;
+
+export interface TelegramFailureRunSummary {
+  signature: string;
+  failedAttempts: number;
+  suppressedFailures: number;
+  failedForMs: number;
+}
+
+export interface TelegramFailureRunLog {
+  /** Records one failure; a repeated identical failure only extends the current run and returns false. */
+  record: (error: unknown, details?: Record<string, unknown>) => boolean;
+  /** Closes the run after a success, emitting its single outcome record. */
+  settled: () => TelegramFailureRunSummary | undefined;
+  /** Ends the run without an outcome record, for a stop or replacement that reports its own outcome. */
+  reset: () => void;
+}
+
+export interface TelegramFailureRunLogInput {
+  category: string;
+  failurePhase: string;
+  outcomePhase: string;
+  /** Human-readable subject for the outcome record, e.g. `follower heartbeat`. */
+  label: string;
+  record?: TelegramFailureRecordSink;
+  /** Static context reapplied to every record of this phase, e.g. a session or profile key. */
+  context?: () => Record<string, unknown>;
+  getNowMs?: () => number;
+}
+
+/** Stable identity of one failure kind: errno when present, otherwise the failure text. */
+export function getTelegramFailureSignature(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  if (typeof code === "string" && code) return code;
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Consecutive identical failure runs for one diagnostic phase: a repeat extends the run instead of logging again,
+ * and a closing success or reset emits at most one outcome record. This never gates detection or recovery.
+ */
+export function createTelegramFailureRunLog(
+  input: TelegramFailureRunLogInput,
+): TelegramFailureRunLog {
+  const getNowMs = input.getNowMs ?? Date.now;
+  let run: { signature: string; suppressed: number; startedAtMs: number; details: Record<string, unknown> } | undefined;
+  const emit = (errorOrMessage: unknown, details: Record<string, unknown>): void => {
+    try {
+      input.record?.(input.category, errorOrMessage, {
+        ...(input.context?.() ?? {}),
+        ...details,
+      });
+    } catch {
+      // A diagnostic sink never converts a recorded failure into another failure.
+    }
+  };
+  return {
+    record(error, details) {
+      const signature = getTelegramFailureSignature(error);
+      const admitted = { ...(details ?? {}) };
+      if (run?.signature === signature) {
+        run.suppressed += 1;
+        Object.assign(run.details, admitted);
+        return false;
+      }
+      const previous = run;
+      run = { signature, suppressed: 0, startedAtMs: getNowMs(), details: admitted };
+      emit(error, {
+        ...admitted,
+        phase: input.failurePhase,
+        failureSignature: signature,
+        ...(previous
+          ? {
+              previousFailureSignature: previous.signature,
+              previousFailedAttempts: previous.suppressed + 1,
+              previousFailedForMs: getNowMs() - previous.startedAtMs,
+            }
+          : {}),
+      });
+      return true;
+    },
+    settled() {
+      const closed = run;
+      if (!closed) return undefined;
+      run = undefined;
+      const summary: TelegramFailureRunSummary = {
+        signature: closed.signature,
+        failedAttempts: closed.suppressed + 1,
+        suppressedFailures: closed.suppressed,
+        failedForMs: getNowMs() - closed.startedAtMs,
+      };
+      emit(`Telegram ${input.label} recovered after ${summary.failedAttempts} failed attempts.`, {
+        ...closed.details,
+        phase: input.outcomePhase,
+        failureSignature: summary.signature,
+        failedAttempts: summary.failedAttempts,
+        suppressedFailures: summary.suppressedFailures,
+        failedForMs: summary.failedForMs,
+      });
+      return summary;
+    },
+    reset() {
+      run = undefined;
+    },
+  };
+}
+
 type TelegramLogPathInput = string | (() => string);
 
 interface TelegramRuntimeJsonlEvent {
@@ -391,6 +503,10 @@ interface TelegramRuntimeDiagnosticsRuntime<TContext> {
     error: unknown,
     details?: Record<string, unknown>,
   ): void;
+  /** A phase-scoped failure log whose records travel through this runtime's own event pipeline. */
+  createFailureLog(
+    input: Omit<TelegramFailureRunLogInput, "record">,
+  ): TelegramFailureRunLog;
   bindStorage(ports: {
     getBotToken(): string | undefined;
     getProfileName(): string | undefined;
@@ -498,6 +614,12 @@ export function createTelegramRuntimeDiagnosticsRuntime<TContext>(
   };
   return {
     events,
+    createFailureLog: (input) =>
+      createTelegramFailureRunLog({
+        ...input,
+        record: (category, errorOrMessage, details) =>
+          recordRuntimeEvent(category, errorOrMessage, details),
+      }),
     recordRuntimeEvent,
     bindStorage(ports) {
       getBotToken = ports.getBotToken;

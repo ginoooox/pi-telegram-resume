@@ -24,6 +24,7 @@ interface TelegramQueueMenuRuntime<Context> {
     handleCallbackQuery: (query: TelegramQueueMenuCallbackQuery, ctx: Context) => Promise<boolean>;
 }
 export declare function createTelegramQueueMenuRuntime<Context, TModel extends MenuModel = MenuModel>(deps: {
+    hasPendingDispatch?: () => boolean;
     telegramQueueStore: Queue.TelegramQueueStateStore<Context>;
     queueMutationRuntime: Queue.TelegramQueueMutationController<Context>;
     sendInteractiveMessage: TelegramMenuMessageRuntimeDeps["sendInteractiveMessage"];

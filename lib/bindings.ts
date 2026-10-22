@@ -209,6 +209,10 @@ export interface TelegramQueueBindingRuntime<TContext> {
   requestNextDispatchAnnouncement: () => void;
   cancelNextDispatchAnnouncement: () => void;
   watchdog: Queue.TelegramQueueDispatchWatchdogRuntime<TContext>;
+  onTurnEnd: (
+    event: Pick<Pi.TurnEndEvent, "turnIndex" | "outcome">,
+    ctx: TContext,
+  ) => Pi.TurnEndEventResult | undefined;
 }
 
 export function createTelegramQueueBindingRuntime<TContext>(deps: {
@@ -217,8 +221,8 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
   lifecycle: Pick<
     Runtime.TelegramBridgeRuntime["lifecycle"],
     "isCompactionInProgress" | "hasDispatchPending"
-  >;
-  activeTurn: Pick<Queue.TelegramActiveTurnStore, "has">;
+  > & Partial<Pick<Runtime.TelegramBridgeRuntime["lifecycle"], "getActiveToolExecutions">>;
+  activeTurn: Pick<Queue.TelegramActiveTurnStore, "has"> & Partial<Pick<Queue.TelegramActiveTurnStore, "get">>;
   admission: {
     getSettlement: () =>
       | {
@@ -228,7 +232,7 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
           ) => boolean;
           isItemReady: (item: Queue.TelegramQueueItem<TContext>) => boolean;
           onPromptHandedOff?: (
-            item: Queue.PendingTelegramTurn,
+            item: Pick<Queue.PendingTelegramTurn, "admissionReceipts">,
             ctx: TContext,
           ) => boolean;
           onControlSettled: (
@@ -249,6 +253,8 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
   promptDispatch: Runtime.TelegramPromptDispatchRuntime<TContext>;
   isIdle: (ctx: TContext) => boolean;
   hasPendingMessages: (ctx: TContext) => boolean;
+  isContextCurrent?: (ctx: TContext) => boolean;
+  isContextAborted?: (ctx: TContext) => boolean;
   updateStatus: (ctx: TContext, error?: string) => void;
   sendTextReply: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendTextReply"];
   sendUserMessage: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendUserMessage"];
@@ -268,6 +274,10 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     const settlement = deps.admission.getSettlement();
     if (!settlement) return false;
     return settlement.onItemsDiscarded(durableItems, ctx) === true;
+  };
+  const settlePromptPacket = (items: readonly Queue.PendingTelegramTurn[], ctx: TContext): boolean => {
+    const receipts = items.flatMap(item => item.admissionReceipts ?? []);
+    return receipts.length === 0 || deps.admission.getSettlement()?.onPromptHandedOff?.({ admissionReceipts: receipts }, ctx) === true;
   };
   const mutation = Queue.createTelegramQueueMutationController({
     ...deps.store,
@@ -309,6 +319,13 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
       if (!settlement?.onPromptHandedOff) return false;
       return settlement.onPromptHandedOff(item, ctx) === true;
     },
+    steerDispatch: {
+      commitPacket: settlePromptPacket,
+      isContextCurrent: (ctx: TContext) => deps.isContextCurrent?.(ctx) === true,
+      canSubmit: (ctx: TContext) => deps.isContextAborted?.(ctx) === false &&
+        deps.isIdle(ctx) && !deps.hasPendingMessages(ctx) && !deps.lifecycle.isCompactionInProgress() &&
+        !deps.activeTurn.has() && (deps.lifecycle.getActiveToolExecutions?.() ?? 0) === 0,
+    },
     onControlSettled(item, ctx) {
       deps.admission.getSettlement()?.onControlSettled(item, ctx);
     },
@@ -323,8 +340,32 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     ...deps.promptDispatch,
     sendUserMessage: deps.sendUserMessage,
   });
+  const steer = Queue.createTelegramSteerBoundaryRuntime({
+    ...deps.store,
+    getGeneration: deps.deferredDispatch.getGeneration,
+    isContextCurrent: (ctx: TContext) => deps.isContextCurrent?.(ctx) === true,
+    isBlocked: (ctx: TContext) =>
+      deps.isContextAborted?.(ctx) !== false || !deps.deferredDispatch.isBound() ||
+      deps.isIdle(ctx) || deps.hasPendingMessages(ctx) ||
+      deps.lifecycle.isCompactionInProgress() || deps.lifecycle.hasDispatchPending() ||
+      (deps.lifecycle.getActiveToolExecutions?.() ?? 0) > 0 ||
+      (deps.activeTurn.has() && !deps.activeTurn.get?.()),
+    isItemReady(item: Queue.TelegramQueueItem<TContext>) {
+      return deps.transportStamp.isActive(item.transportStamp) &&
+        !deps.admission.hasPendingQueueMutationForItem(item) &&
+        (deps.admission.getSettlement()?.isItemReady(item) ?? (item.admissionReceipts?.length ?? 0) === 0);
+    },
+    isItemCurrent: (item) => deps.transportStamp.isActive(item.transportStamp) &&
+      !deps.admission.hasPendingQueueMutationForItem(item),
+    getActiveTurn: () => deps.activeTurn.get?.(),
+    commitPacket: settlePromptPacket,
+    discardItem: (item, ctx) => settleDiscardedItems([item], ctx),
+    updateStatus: deps.updateStatus,
+    recordRuntimeEvent: deps.recordRuntimeEvent,
+  });
   return {
     mutation,
+    onTurnEnd: steer.onTurnEnd,
     dispatchNext: dispatch.dispatchNext,
     requestNextDispatchAnnouncement: dispatch.requestNextDispatchAnnouncement,
     cancelNextDispatchAnnouncement: dispatch.cancelNextDispatchAnnouncement,
@@ -654,6 +695,7 @@ export interface TelegramActivityBindingRuntime {
 /** Compose public activity fanout, verbosity, and assistant output ordering. */
 export function createTelegramActivityBindingRuntime<TTransportStamp>(deps: {
   generation: string;
+  captureDrain?: () => (() => void) | undefined;
   assistantOutput: Omit<
     Parameters<
       typeof createTelegramAssistantOutputBindingRuntime<TTransportStamp>
@@ -669,7 +711,7 @@ export function createTelegramActivityBindingRuntime<TTransportStamp>(deps: {
     "captureAuthority" | "isAuthorityActive" | "recordFailure" | "enqueue"
   >;
 }): TelegramActivityBindingRuntime {
-  const publication = Activity.createTelegramActivityPublicationRuntime();
+  const publication = Activity.createTelegramActivityPublicationRuntime({ captureDrain: deps.captureDrain });
   const assistantOutputBinding = createTelegramAssistantOutputBindingRuntime({
     ...deps.assistantOutput,
     enqueue: publication.enqueue,
@@ -690,6 +732,7 @@ export function createTelegramActivityBindingRuntime<TTransportStamp>(deps: {
     });
   const activityRuntime = Activity.createTelegramActivityBridgeRuntime({
     generation: deps.generation,
+    captureDrain: deps.captureDrain,
     observeEvent(event) {
       assistantOutputBinding.observeEvent(event);
       activityVerbosityRuntime.accept(event);
@@ -1000,12 +1043,7 @@ export function registerTelegramCommandsAndTools({
               );
             }
             await configStore.load();
-            const latestProfile =
-              configStore.getStoredConfig().profiles?.[profileName];
-            configStore.setProfile(profileName, {
-              ...profile,
-              threadDisplayMode: latestProfile?.threadDisplayMode,
-            });
+            configStore.setProfile(profileName, profile);
             configStore.activateProfile(profileName);
             await onTransportChanged?.();
             await persistConfig(configStore.get());
@@ -1133,7 +1171,7 @@ interface TelegramLifecycleBindingDeps {
   shutdownGenerativeAppLiveSurfaces?: () => void;
   resolveAutomaticThreadCleanupEnabled?: () => boolean | Promise<boolean>;
   buttonActionStore: OutboundHandlers.TelegramButtonActionStore;
-  callMultipart: OutboundHandlers.TelegramVoiceReplySenderDeps["sendMultipart"];
+  callMultipart: (...args: Parameters<TelegramApi.TelegramBridgeApiRuntime["callMultipart"]>) => Promise<unknown>;
   sendChatAction: NonNullable<
     OutboundHandlers.TelegramVoiceReplySenderDeps["sendChatAction"]
   >;
@@ -1154,11 +1192,13 @@ interface TelegramLifecycleBindingDeps {
   >["sendTextReply"] &
     NonNullable<OutboundHandlers.TelegramVoiceReplySenderDeps["sendTextReply"]>;
   dispatchNextQueuedTelegramTurn: (ctx: Pi.ExtensionContext) => void;
+  onSteerTurnEnd?: TelegramQueueBindingRuntime<Pi.ExtensionContext>["onTurnEnd"];
   onPromptHandedOff?: (
     turn: Queue.PendingTelegramTurn,
     ctx: Pi.ExtensionContext,
   ) => void;
   answerGuestQuery: TelegramApi.TelegramBridgeApiRuntime["answerGuestQuery"];
+  editGuestInlineMessage?: TelegramApi.TelegramBridgeApiRuntime["editGuestInlineMessage"];
   deleteMessage: TelegramApi.TelegramBridgeApiRuntime["deleteMessage"];
   sendGuestReply: NonNullable<
     Queue.TelegramAgentEndHookRuntimeDeps<
@@ -1196,6 +1236,7 @@ interface TelegramLifecycleBindingDeps {
   }) => void;
   canSendAgentActivity: (ctx: Pi.ExtensionContext) => boolean;
   isSessionContextActive: (ctx: Pi.ExtensionContext) => boolean;
+  getSessionGeneration?: () => number;
   isTurnTransportActive?: (turn: Queue.PendingTelegramTurn) => boolean;
   updateStatus: TelegramBridgeStatusUpdater;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
@@ -1233,8 +1274,10 @@ export function registerTelegramLifecycleRuntimeHooks({
   sendMarkdownReply,
   sendTextReply,
   dispatchNextQueuedTelegramTurn,
+  onSteerTurnEnd,
   onPromptHandedOff,
   answerGuestQuery,
+  editGuestInlineMessage,
   deleteMessage,
   sendGuestReply,
   editGuestReply,
@@ -1246,6 +1289,7 @@ export function registerTelegramLifecycleRuntimeHooks({
   recordMessageOwnership,
   canSendAgentActivity,
   isSessionContextActive = () => true,
+  getSessionGeneration,
   isTurnTransportActive,
   updateStatus,
   recordRuntimeEvent,
@@ -1276,6 +1320,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     turn: Queue.PendingTelegramTurn,
     attachment: Queue.QueuedAttachment,
     caption?: string,
+    options?: { isDeliveryActive?: () => boolean },
   ): Promise<void> => {
     const stagingTarget = proactivePushTargetGetter();
     const stagingChatId = stagingTarget?.chatId;
@@ -1286,11 +1331,19 @@ export function registerTelegramLifecycleRuntimeHooks({
     }
     await OutboundAttachments.deliverTelegramGuestCachedAttachment({
       guestQueryId: turn.guestQueryId!,
+      guestInlineMessageId: turn.guestInlineMessageId,
+      editGuestInlineMessage,
+      isDeliveryActive: options?.isDeliveryActive,
       stagingChatId,
       stagingTarget,
       attachment,
       caption,
-      sendMultipart: callMultipart,
+      sendMultipart: (method, fields, fileField, path, name) =>
+        callMultipart(method, fields, fileField, path, name, {
+          assertAuthority() {
+            if (options?.isDeliveryActive?.() === false) throw new Error("Guest attachment upload lost authority.");
+          },
+        }),
       answerGuestQuery: (guestQueryId, result) =>
         answerGuestQuery(guestQueryId, undefined, { result }),
       answerGuestText: (guestQueryId, text) =>
@@ -1491,7 +1544,7 @@ export function registerTelegramLifecycleRuntimeHooks({
       promptDispatchRuntime.startTypingLoop(
         ctx,
         turn?.chatId ?? target?.chatId,
-        { target },
+        { target, ensure: true },
       ) !== false
     );
   };
@@ -1500,6 +1553,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     const turn = activeTurnRuntime.get();
     promptDispatchRuntime.startTypingLoop(ctx, turn?.chatId, {
       target: turn?.target,
+      ensure: true,
     });
   };
   let observedAutomaticCompaction = false;
@@ -1550,6 +1604,8 @@ export function registerTelegramLifecycleRuntimeHooks({
   const messageActivityTypingHooks =
     Lifecycle.createTelegramMessageActivityTypingHooks({
       hasActiveTurn: activeTurnRuntime.has,
+      isContextActive: isSessionContextActive,
+      getSessionGeneration,
       startTypingLoop: startActiveTurnTypingLoop,
       onMessageStart: previewRuntime.onMessageStart,
       onMessageUpdate: previewRuntime.onMessageUpdate,
@@ -1560,6 +1616,12 @@ export function registerTelegramLifecycleRuntimeHooks({
     isSessionActive: isSessionContextActive,
     ...sessionLifecycleRuntime,
     ...agentLifecycleHooks,
+    ...(onSteerTurnEnd ? {
+      onTurnEnd(event: Pi.TurnEndEvent, ctx: Pi.ExtensionContext) {
+        const result = onSteerTurnEnd(event, ctx);
+        return result ? { ...result, entries: [...event.entries, ...(result.entries ?? [])] } : undefined;
+      },
+    } : {}),
     onInput(event) {
       activityRuntime.recordInputSource(event.source ?? "unknown");
     },
@@ -1638,9 +1700,11 @@ export function registerTelegramLifecycleRuntimeHooks({
     },
     async onAgentStart(event, ctx) {
       if (!isSessionContextActive(ctx)) return;
+      const generation = getSessionGeneration?.();
       agentWorkActive = true;
       cancelPendingFinalPublication();
       await agentStartWithDedupReset(event, ctx);
+      if (!isSessionContextActive(ctx) || (getSessionGeneration && !Object.is(getSessionGeneration(), generation))) return;
       const turn = activeTurnRuntime.get();
       activityRuntime.onAgentStart(turn?.target, turn?.replyToMessageId);
       startAgentActivityTypingLoop(ctx);

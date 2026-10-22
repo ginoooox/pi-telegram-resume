@@ -36,7 +36,7 @@ export interface ResolvedTelegramTimeConfig {
     timezone: string;
 }
 export type TelegramThreadDisplayMode = "letters" | "names" | "directories" | "directory-snake" | "directory-title";
-export declare function resolveTelegramThreadDisplayMode(config: Pick<TelegramConfig, "threadDisplayMode">): TelegramThreadDisplayMode;
+export declare function resolveTelegramThreadDisplayMode(config: Pick<TelegramConfig, "threads">): TelegramThreadDisplayMode;
 export declare function setTelegramThreadDisplayMode(store: TelegramConfigStore, mode: TelegramThreadDisplayMode, isCurrent: () => boolean): Promise<void>;
 export type TelegramAssistantRenderingMode = "rich" | "html";
 export type TelegramActivityVerbosity = "quiet" | "thinking" | "tools" | "verbose";
@@ -49,8 +49,6 @@ export interface TelegramConfig {
     botId?: number;
     /** @deprecated persisted identity belongs in profiles.default; retained for effective/legacy views */
     allowedUserId?: number;
-    /** Effective view; persisted under profiles.<name>. */
-    threadDisplayMode?: TelegramThreadDisplayMode;
     inboundHandlers?: TelegramInboundHandlerConfig[];
     attachmentHandlers?: TelegramInboundHandlerConfig[];
     outboundHandlers?: TelegramOutboundHandlerConfig[];
@@ -76,22 +74,23 @@ export interface TelegramConfig {
     threads?: {
         /** Delete this instance's bound Telegram thread on graceful Pi quit. */
         automaticCleanup?: boolean;
+        /** Automatic Thread title strategy shared by every profile; absent or invalid resolves to `letters`. */
+        displayMode?: TelegramThreadDisplayMode;
     };
     /** Canonical bot/session profiles, including profiles.default. */
     profiles?: Record<string, TelegramBotProfile>;
 }
 /**
- * Per-profile bot/session identity and Thread display preference.
+ * Per-profile bot identity and paired owner only.
  * Stored under `profiles.<name>` in telegram.json.
- * Shared bridge settings (inboundHandlers, outboundHandlers, voice, time,
- * assistant) stay at the top level.
+ * Shared bridge settings (handlers, assistant, voice, time, threads) stay at
+ * the top level and never leak into profiles.
  */
 export interface TelegramBotProfile {
     botToken: string;
     botUsername?: string;
     botId?: number;
     allowedUserId?: number;
-    threadDisplayMode?: TelegramThreadDisplayMode;
 }
 export declare function isValidTelegramProfileName(name: string): boolean;
 /** List defined profile names. */

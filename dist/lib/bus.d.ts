@@ -36,6 +36,9 @@ export declare function createTelegramBusProcessRuntime(input: {
 export declare function createTelegramBusAuthSecret(): string;
 export declare const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION: "durable-follower-admission-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF: "queue-handoff-v1";
+/** Unspent Steer lane codec; independent from baseline receipt handoff support. */
+export declare const TELEGRAM_BUS_CAPABILITY_QUEUE_STEER: "queue-steer-v1";
+export declare const TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY: "explicit-connect-recovery-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE: "input-custody-reference-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME: "workspace-thread-rename-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE: "thread-display-mode-v1";
@@ -43,6 +46,9 @@ export declare const TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT: "director
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT: "workspace-follower-auto-connect-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT: "session-replacement-intent-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE: "workspace-restore-v1";
+/** Shared Workspace readers understand independent pre-dispatch input/cleanup state. */
+export declare const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND: "live-rebind-pre-dispatch-reader-v2";
+export declare const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION: "live-rebind-pre-dispatch-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE: "live-thread-rebind-save-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY: "live-thread-rebind-apply-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE: "live-thread-rebind-settle-v1";
@@ -53,6 +59,9 @@ export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET: "live-thre
 /** Every live rebinding needs the save/apply/settle trio; held command selections additionally need these two. */
 export declare const TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES: readonly ["live-thread-rebind-save-v1", "live-thread-rebind-apply-v1", "live-thread-rebind-settle-v1"];
 export declare const TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES: readonly ["live-thread-rebind-command-set-v1", "selected-menu-delivery-v1"];
+/** Start/help are restricted menu aliases, negotiated separately from the original held-command set. */
+export declare const TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES: "held-menu-aliases-v1";
+export declare function getTelegramBusHeldCommandCapabilities(name: string): readonly string[];
 export interface TelegramBusSelectedCommandInput {
     name: string;
     target: TelegramTarget & {
@@ -189,6 +198,7 @@ export declare function createTelegramBusProtocolIdentity(input: {
 }): TelegramBusProtocolIdentity;
 export declare function createTelegramCurrentBusProtocolIdentity(capabilities?: readonly string[]): TelegramBusProtocolIdentity;
 export declare function hasTelegramBusCapability(identity: TelegramBusProtocolIdentity | undefined, capability: string): boolean;
+export declare function hasTelegramBusSteerQueueHandoffCapability(identity: TelegramBusProtocolIdentity | undefined): boolean;
 export declare function getTelegramInputCustodyPeerReadiness(followers: readonly Pick<TelegramBusFollowerView, "registrationGeneration" | "protocol">[]): ("ready" | "legacy" | "unknown")[];
 /** Both peers advertise every required capability over a compatible protocol; reads only the two identities. */
 export declare function hasTelegramBusSharedCapabilities(local: TelegramBusProtocolIdentity, remote: TelegramBusProtocolIdentity | undefined, required: readonly string[]): boolean;
@@ -239,7 +249,6 @@ export declare function getTelegramFollowerTargetOwnership(input: {
     recipientBindingKey: string;
     protocolIdentity: TelegramBusProtocolIdentity;
 } | undefined;
-export declare function markTelegramBusAggregateDelivery<T extends Record<string, unknown>>(body: T): T;
 export declare function markTelegramBusCrossTargetDelivery<T extends Record<string, unknown>>(body: T): T;
 export declare function stripTelegramBusApiMetadata<T extends Record<string, unknown>>(body: T): T;
 export declare function isTelegramFollowerApiCallAllowed(input: {
@@ -322,6 +331,7 @@ export declare function createTelegramBusFollowerSourceReferenceDeliveryIdentity
 export type TelegramBusEnvelope = ({
     kind: "follower.register";
     requestId: string;
+    recoverConnection?: true;
     registration: TelegramBusInstanceRegistration;
 } | {
     kind: "follower.restoreWorkspace";
@@ -460,7 +470,7 @@ export type TelegramBusEnvelope = ({
     recipientBindingKey: string;
     operationId: string;
     sourceUpdateIds: number[];
-    mode: "release" | "discard" | "observe" | "observe-command";
+    mode: "release" | "discard" | "observe" | "observe-held" | "observe-command";
     oldTarget?: TelegramTarget & {
         threadId: number;
     };
@@ -668,6 +678,8 @@ export declare function createTelegramBusForeignOwnedUpdateForwarder<TContext, T
         message: TMessage;
         ownership: TelegramBusForwardOwnership;
         ctx: TContext;
+        /** Process-local source/recipient lifetime; never part of the wire envelope. */
+        assertAuthority?: () => void;
     }) => Promise<TelegramBusForeignUpdateSettlement>;
     forwardEditedMessage: (input: {
         message: TMessage;
@@ -720,7 +732,7 @@ export declare function createTelegramBusLiveRebindController(deps: {
         update_id: number;
     } & Record<string, unknown>)[];
 } | {
-    mode: "apply" | "inspect" | "release" | "discard" | "observe" | "observe-command";
+    mode: "apply" | "inspect" | "release" | "discard" | "observe" | "observe-held" | "observe-command";
     sourceUpdateIds: number[];
     slot: string;
     target: TelegramTarget & {

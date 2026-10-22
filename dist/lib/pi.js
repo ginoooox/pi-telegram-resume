@@ -8,6 +8,9 @@ import { readdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { SettingsManager, } from "@earendil-works/pi-coding-agent";
+export function setExtensionSessionName(api, name) {
+    api.setSessionName(name);
+}
 export async function listPiSessions(ctx) {
     const dir = ctx.sessionManager.getSessionDir();
     let files;
@@ -180,6 +183,9 @@ export function getExtensionContextSessionId(ctx) {
 }
 export function isExtensionContextIdle(ctx) {
     return ctx.isIdle();
+}
+export function isExtensionContextAbortRequested(ctx) {
+    return ctx.signal?.aborted === true;
 }
 export function hasExtensionContextPendingMessages(ctx) {
     return ctx.hasPendingMessages();

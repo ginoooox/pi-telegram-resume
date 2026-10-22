@@ -4,7 +4,6 @@
  * Owns the public extension delivery contract, authorized scope resolution, operational rendering adapter, per-target serialization, chunk reconciliation, generation-fenced logical handles, and process-local runtime membrane; composes the established reply renderer with bus-aware Telegram API ports and excludes bot clients, Pi contexts, and consumer-extension policy
  */
 
-import { markTelegramBusAggregateDelivery } from "./bus.ts";
 import {
   assertTelegramInlineKeyboardCallbackData,
   type TelegramInlineKeyboardMarkup,
@@ -134,6 +133,7 @@ export interface TelegramDeliveryTransportOptions {
 /** @internal */
 export interface TelegramDeliveryRuntimeDeps extends TelegramDeliveryTargetResolverDeps {
   generation: string;
+  captureDrain?: () => (() => void) | undefined;
   renderView: (
     view: TelegramDeliveryView,
   ) => readonly TelegramDeliveryRenderedChunk[];
@@ -166,6 +166,7 @@ export interface TelegramDeliveryRuntimeDeps extends TelegramDeliveryTargetResol
 /** @internal */
 export interface TelegramBridgeDeliveryRuntimeDeps {
   generation: string;
+  captureDrain?: () => (() => void) | undefined;
   getTargetPolicyView: () => TelegramDeliveryTargetPolicyView;
   getActiveTurnTarget: () => TelegramDeliveryTarget | undefined;
   isTransportActive?: () => boolean;
@@ -295,6 +296,7 @@ function classifyTelegramDeliveryTransportError(error: unknown): {
 export interface TelegramDeliveryTargetPolicyView {
   canDeliver: boolean;
   ownsDirect: boolean;
+  threaded?: boolean;
   allowedChatId?: number;
   followerTarget?: TelegramDeliveryTarget;
   leaderTarget?: TelegramDeliveryTarget;
@@ -310,6 +312,7 @@ export interface TelegramDeliveryTargetPolicyRuntime {
 /** @internal */
 export function createTelegramDeliveryTargetPolicyRuntime(deps: {
   ownsDirect(): boolean;
+  isThreadedMode?(): boolean;
   isFollowerRegistered(): boolean;
   getAllowedChatId(): number | undefined;
   getFollowerTarget(): TelegramDeliveryTarget | undefined;
@@ -324,6 +327,7 @@ export function createTelegramDeliveryTargetPolicyRuntime(deps: {
       return {
         canDeliver: ownsDirect || deps.isFollowerRegistered(),
         ownsDirect,
+        threaded: deps.isThreadedMode?.() === true,
         allowedChatId: deps.getAllowedChatId(),
         followerTarget: deps.getFollowerTarget(),
         leaderTarget: deps.getLeaderTarget(),
@@ -338,25 +342,25 @@ export function createTelegramDeliveryTargetPolicyRuntime(deps: {
   };
 }
 
+function isThreadedDelivery(view: TelegramDeliveryTargetPolicyView): boolean {
+  return view.threaded === true || view.followerTarget?.threadId !== undefined || view.leaderTarget?.threadId !== undefined;
+}
+
 /** @internal */
 export function resolveTelegramDeliveryInstanceTarget(
   view: TelegramDeliveryTargetPolicyView,
 ): TelegramDeliveryTarget | undefined {
   if (!view.canDeliver) return undefined;
-  return (
-    view.followerTarget ??
-    view.leaderTarget ??
-    (view.allowedChatId === undefined
-      ? undefined
-      : { chatId: view.allowedChatId })
-  );
+  const target = view.followerTarget ?? view.leaderTarget ??
+    (view.allowedChatId === undefined ? undefined : { chatId: view.allowedChatId });
+  return target && (!isThreadedDelivery(view) || target.threadId !== undefined) ? target : undefined;
 }
 
 /** @internal */
 export function resolveTelegramDeliveryAggregateTarget(
   view: TelegramDeliveryTargetPolicyView,
 ): TelegramDeliveryTarget | undefined {
-  return !view.canDeliver || view.allowedChatId === undefined
+  return !view.canDeliver || view.allowedChatId === undefined || isThreadedDelivery(view)
     ? undefined
     : { chatId: view.allowedChatId };
 }
@@ -373,7 +377,7 @@ export function isTelegramDeliveryExplicitTargetAuthorized(
   ) {
     return false;
   }
-  if (candidate.threadId === undefined) return true;
+  if (candidate.threadId === undefined) return !isThreadedDelivery(view);
   if (view.followerTarget) {
     return areDeliveryTargetsEqual(candidate, view.followerTarget);
   }
@@ -427,13 +431,27 @@ function resolveTelegramDeliveryTarget(
   return { ok: true, value: cloneTarget(target) };
 }
 
-function createTelegramDeliveryTargetQueue() {
+/** Observation cannot turn failed delivery into success or borrow a newer queue lifetime. */
+function captureDeliveryDrainObserver(capture?: () => (() => void) | undefined): () => void {
+  try {
+    const notify = capture?.();
+    return () => {
+      try {
+        const emitted: unknown = notify?.();
+        if (emitted) void Promise.resolve(emitted).catch(() => undefined);
+      } catch { /* Observer failure is inert. */ }
+    };
+  } catch { return () => {}; }
+}
+
+function createTelegramDeliveryTargetQueue(captureDrain?: () => (() => void) | undefined) {
   const queues = new Map<string, Promise<void>>();
   async function run<T>(
     target: TelegramDeliveryTarget,
     operation: () => Promise<T>,
   ): Promise<T> {
     const key = targetKey(target);
+    const notifyDrained = captureDeliveryDrainObserver(captureDrain);
     const previous = queues.get(key) ?? Promise.resolve();
     const current = previous.then(operation, operation);
     const settled = current.then(
@@ -444,7 +462,7 @@ function createTelegramDeliveryTargetQueue() {
     try {
       return await current;
     } finally {
-      if (queues.get(key) === settled) queues.delete(key);
+      if (queues.get(key) === settled) { queues.delete(key); notifyDrained(); }
     }
   }
   return {
@@ -482,7 +500,10 @@ export function createTelegramDeliveryRuntime(
     TelegramDeliveryHandle,
     { target: TelegramDeliveryTarget; messageIds: readonly number[] }
   >();
-  const targetQueue = createTelegramDeliveryTargetQueue();
+  const targetQueue = createTelegramDeliveryTargetQueue(() => {
+    const notify = deps.captureDrain?.();
+    return () => active ? notify?.() : undefined;
+  });
   const runForTarget = targetQueue.run;
   const render = (
     view: TelegramDeliveryView,
@@ -735,9 +756,17 @@ export function createTelegramBridgeDeliveryRuntime(
       throw new TelegramDeliveryTransportGenerationError();
     }
   };
+  const assertOutputTarget = (target: TelegramDeliveryTarget): void => {
+    if (isThreadedDelivery(getPolicyView()) && target.threadId === undefined)
+      throw new Error("Telegram All is input-only in Threaded Mode.");
+  };
   return createTelegramDeliveryRuntime({
     generation: deps.generation,
-    getActiveTurnTarget: deps.getActiveTurnTarget,
+    captureDrain: deps.captureDrain,
+    getActiveTurnTarget() {
+      const target = deps.getActiveTurnTarget();
+      return target && (!isThreadedDelivery(getPolicyView()) || target.threadId !== undefined) ? target : undefined;
+    },
     getInstanceTarget() {
       return resolveTelegramDeliveryInstanceTarget(getPolicyView());
     },
@@ -763,6 +792,7 @@ export function createTelegramBridgeDeliveryRuntime(
     },
     async sendChunk(target, chunk, options) {
       assertTransportActive();
+      assertOutputTarget(target);
       const sent = await withTelegramReplyParameters(
         target.chatId,
         options.replyToMessageId,
@@ -780,11 +810,7 @@ export function createTelegramBridgeDeliveryRuntime(
               ? { reply_markup: options.replyMarkup }
               : {}),
           };
-          return deps.api.sendMessage(
-            target.threadId === undefined
-              ? markTelegramBusAggregateDelivery(body)
-              : body,
-          );
+          return deps.api.sendMessage(body);
         },
       );
       assertTransportActive();
@@ -797,6 +823,7 @@ export function createTelegramBridgeDeliveryRuntime(
     },
     async editChunk(target, messageId, chunk, options) {
       assertTransportActive();
+      assertOutputTarget(target);
       await deps.api.editMessageText({
         chat_id: target.chatId,
         message_id: messageId,
@@ -814,6 +841,7 @@ export function createTelegramBridgeDeliveryRuntime(
     },
     async sendChatAction(target, action) {
       assertTransportActive();
+      assertOutputTarget(target);
       await deps.api.sendChatAction(target.chatId, action, {
         message_thread_id: target.threadId,
       });

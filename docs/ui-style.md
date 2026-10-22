@@ -58,7 +58,7 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `☑️` | Activate / choose this item | Model detail activation action, generated button-only choice heading | Positive selection cue; use `🟢 Active` for already-current state. |
 | `⛔️` | Cancel source routing | `⛔️ Cancel routing` chooser action and the `Routing cancelled` toast | Not an abort of active Pi work. Private retention remains mandatory; disposable-tab removal stays bound to exact eligible target authority and follows only once every input in the tab is resolved. |
 | `❌` | No / cancel / terminal failure | Confirmation cancel buttons and terminal failure notices | Do not use for a recoverable operation failure that leaves session state intact. |
-| `🗑` | Delete / defer removal | Destructive confirmations and removal reaction | In the queue menu, reversible Keep/Skip selectors replace immediate deletion. |
+| `🗑` | Delete | Destructive confirmations | Not a queue reaction shortcut; queue menus use reversible Keep/Skip selectors. |
 
 ### Informational Feedback
 
@@ -74,37 +74,34 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | Emoji | Meaning | Canonical surfaces | Notes |
 | --- | --- | --- | --- |
 | `🟢` | Current/active/enabled `On` | Current option in vertical lists, active state rows, active `On` toggle | One marker per selected list value; inactive list values stay unmarked. |
-| `🟡` | Active `Off` or elevated/filter state | Active `Off` toggle, Priority/Scoped active tab | Yellow means intentionally not-normal or off/default-caution, not error. |
+| `🟡` | Active Steer, `Off`, or filter state | Steer queue selector, active `Off` toggle, Scoped active tab | Yellow distinguishes early insertion or off/filter state, not error. |
 | `🔴` | Active destructive/deferred disposition | Active queue `Skip` selector | Red distinguishes a prompt that will be discarded at dispatch from reversible neutral or elevated state. |
-| `🟣` | Normal/default active tab | Normal priority tab, All/default scope tab, active page picker | Use for neutral active tabs. |
+| `🟣` | Active Priority lane or neutral navigation tab | Priority queue selector, All/default scope tab, active page picker | Queue lane meaning is distinct from neutral navigation. |
+| `🔵` | Active Normal queue lane | Normal queue selector | Blue distinguishes ordinary queued tasks from Steer and Priority. |
 | `⚫️` | Inactive placeholder | Inactive toggle values and inactive tabs | Keeps row width stable. |
 | `⬆️` | Navigate upward | `⬆️ Main menu`, `⬆️ Back` | Always first row in submenus. |
 
 ### Queue Reaction Shortcuts
 
-Queue reactions are shortcut controls for waiting turns. Preserve their semantics across Telegram reactions, queue-menu rows, status previews, and tests. Positive emoji control the Priority/Normal lane; negative emoji control Keep/Skip. These categories are independent, may coexist, and mutate only their own dimension. Crossing lanes appends the prompt at the destination FIFO tail; changing Keep/Skip or changing emoji within one category preserves lane position. Skip wins only when dispatch reaches the prompt.
+Queue reactions are shortcut controls for waiting turns. Preserve their semantics across Telegram reactions, queue-menu rows, status previews, and tests. Effective positive intent controls Steer/Priority/Normal; negative emoji control Keep/Skip. Fire selects Steer, dominates other positive reactions, and removing it falls back to remaining Priority aliases or Normal. Only changed effective intent overrides a menu choice; decorative changes and weaker positives under fire preserve lane/order. These categories are independent, may coexist, and mutate only their own dimension. Crossing lanes appends the prompt at the destination FIFO tail; changing Keep/Skip or changing emoji within one category preserves lane position. Skip wins only when dispatch reaches the prompt.
 
 Skipped queue ordinals strike only the numeric position. Detail HTML closes `<s>` before the period; list-button labels place a hair-space boundary between the combining-struck number and the plain period so Telegram font overhang cannot visually strike punctuation.
 
 Queue item detail renders two independent selector rows:
 
-- `🟡 Priority` / `⚫️ Normal` or `⚫️ Priority` / `🟣 Normal` selects the lane.
+- `Normal` / `Priority` / `Steer` selects the lane in one horizontal row, increasing intervention from left to right. Active values are `🔵 Normal`, `🟣 Priority`, or `🟡 Steer`; inactive values use `⚫️`. Control is producer-owned, not a selectable lane.
 - `🟢 Keep` / `⚫️ Skip` or `⚫️ Keep` / `🔴 Skip` selects dispatch disposition.
 
-The menu may clear internal Skip but cannot remove a reaction created by the user through Telegram's Bot API.
+The menu may clear internal Skip but cannot remove a reaction created by the user through Telegram's Bot API. Frozen attempts and the Pi-owned pending head expose inspection/Back only, with no success or model-use claim. An over-capacity idle Steer item remains editable and offers Priority/Normal rather than splitting its source group. Published legacy Priority/Normal callbacks remain explicit lane selections.
 
 | Emoji | Meaning | Canonical surfaces | Notes |
 | --- | --- | --- | --- |
 | `👍` | Promote to priority | Queue reaction shortcut | Normalized from variants like `👍️`. |
-| `⚡` | Promote to priority / fast lane | Queue reaction shortcut, priority fallback badge | Also used as the default priority badge when no specific priority emoji is stored. |
-| `❤` / `❤️` | Promote to priority | Queue reaction shortcut | Normalize display consistently where code normalizes reactions. |
-| `🕊` / `🕊️` | Promote to priority | Queue reaction shortcut | Soft/peaceful promotion gesture. |
-| `🔥` | Promote to priority | Queue reaction shortcut | Urgent/hot promotion gesture. |
+| `⚡` | Producer-owned Control marker | Control queue rows | Not a positive-reaction alias or command classifier; old stored Priority badges project `👍` without changing lane authority. |
+| `🔥` | Select Steer | Queue reaction shortcut and Steer badge | Dominates `👍`; not immediate issuance or model-use proof. |
 | `👎` | Defer removal of waiting turn | Queue reaction shortcut and queue emoji marker | Reversible until the marked turn reaches dispatch; not negative feedback to the agent. |
-| `👻` | Defer removal of waiting turn | Queue reaction shortcut and queue emoji marker | Disappear/remove metaphor. |
-| `💔` | Defer removal of waiting turn | Queue reaction shortcut and queue emoji marker | Reversible cancel metaphor. |
-| `💩` | Defer removal of waiting turn | Queue reaction shortcut and queue emoji marker | Reversible reject metaphor. |
-| `🗑` | Defer removal | Queue reaction shortcut and queue emoji marker | Like Skip, the reaction remains reversible until dispatch reaches the marked turn. |
+
+Only `👍`, `👎`, and `🔥` are queue reaction shortcuts. Every other reaction is decorative, including the retired aliases. Retained queue state uses canonical badges without changing lane, disposition or receipt authority.
 
 ### Decorative Or Local-Example Emoji
 
@@ -183,15 +180,16 @@ Rules:
 - Use Capitalized labels.
 - Always show an indicator on every tab to avoid horizontal label shift.
 - Use active tab color to convey semantics:
-  - `🟣` for the default / normal state (All models, Normal priority).
-  - `🟡` for an elevated or filtered state (Scoped models, Priority).
+  - `🟣` for a default navigation scope (All models) or the current Priority lane choice.
+  - `🟡` for the current Steer lane choice or a filtered scope (Scoped models).
+  - `🔵` for the current Normal queue lane choice, independently of Keep/Skip.
   - `🟣` for neutral navigation controls (page picker).
 - Mark inactive tabs with `⚫️`.
 
 Examples:
 
 - `🟡 Scoped` / `⚫️ All`
-- `⚫️ Priority` / `🟣 Normal`
+- `⚫️ Priority` / `🔵 Normal`
 
 ## Option Lists
 
@@ -236,9 +234,9 @@ Examples:
 
 ## Route Chooser
 
-A message (or All-tab command) held in an unbound or temporary tab gets one route chooser.
+A message (or All-tab command) held in an unbound or temporary tab gets one route chooser. In Threaded Mode every input sent from `All` gets one, text, voice notes, files and stickers alike, and an album gets one chooser for the whole album. If no routing Thread can be prepared, retain the input without an All notice.
 
-- Root text: bold heading `🚦 Route this message:` (or `🚦 Route <code>/start</code>:` for a command), a blank line, then the italic note `The choice expires in 60 minutes.` When Reroute is the only possible action (an All-tab command without a temporary tab), the italic note says `To restore a Pi instead, send a message in a new tab.` instead.
+- Root text: bold heading `🚦 Route this message:` (or `🚦 Route <code>/start</code>:` for a command), a blank line, then the italic note `The choice expires in 60 minutes.`
 - Root buttons, one per row and only when available: `🔀 Reroute: send it to a Pi thread`, `🔁 Restore: move a Pi into this tab`, `⛔️ Cancel routing`. The `🚦` heading echoes these three choices, with `⛔️` as the red stop.
 - Submenus start with `⬆️ Back`, which restores the root with its exact original text. Headings are bold: `🔀 Reroute this message to:` / `🔀 Reroute <code>/start</code> to:` name the root's subject, and `🔁 Restore a Pi into this tab:` names a command only when there is one (`🔁 Restore a Pi into this tab for <code>/start</code>:`). Every target button below is a thread, written `🧵 <display title>`.
 - Cancel appears only at the root.
@@ -251,6 +249,8 @@ A message (or All-tab command) held in an unbound or temporary tab gets one rout
 ## Pi Connection Notices
 
 Pi TUI connection notices use plain text: a short known cause and one recovery action. Unknown failures use a generic connection-failed notice with `/telegram-status --debug`; never interpolate raw exceptions, credentials, stack traces or Pi lifecycle guidance. Technical evidence belongs in the redacted runtime recorder. Failed disconnect must retain the instruction to keep Pi open; do not also rethrow the same error as a second Pi banner. These TUI notices are distinct from Telegram bot message cards below.
+
+The compact TUI status bar shows one `+N` counter in yellow `warning` for total waiting work across Normal, Priority, Steer and Control, hidden when zero. Custom themes control the exact hue. It excludes the pending dispatched head, Skip and frozen attempts; active work never adds to the counter. Queue state and dispatch precedence are unchanged.
 
 The compact TUI status bar preserves the acknowledged Thread display title and its casing, including manual `/name` overrides. Names equal to `Telegram`, `Leader` or `Follower` are ordinary titles, not fallback markers. Connection states, including disconnected and error, do not replace a supplied title; only an absent or empty title uses the generic `telegram` label.
 

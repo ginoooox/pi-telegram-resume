@@ -6,7 +6,7 @@
 import { getTelegramTargetKey } from "./target.js";
 import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError, } from "./telegram-api.js";
 import * as ThreadReconciler from "./thread-reconciler.js";
-import { commitTelegramWorkspaceProvisionBinding, createTelegramCleanupTargetProtection, getTelegramTargetFromApiBody, getTelegramThreadOwnerKey, isSameTelegramProcessInstance, isTelegramTopicTargetStaleError, provisionOwnBusTopic, } from "./threads.js";
+import { commitTelegramWorkspaceProvisionBinding, createTelegramCleanupTargetProtection, getTelegramTargetFromApiBody, getTelegramThreadOwnerKey, isSameTelegramProcessInstance, isTelegramTopicTargetStaleError, provisionOwnBusTopic, resetTelegramConnectionProvisioning, } from "./threads.js";
 import { createTelegramWorkspaceAdmissionOperationId, runWithTelegramWorkspaceAdmissionsAsync, } from "./workspace-admission.js";
 import { normalizeTelegramWorkspacePath } from "./workspace-identity.js";
 import { TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.js";
@@ -463,11 +463,21 @@ export async function ensureTelegramLeaderThreadBinding(deps) {
         ...(deps.telegramProfile ? { telegramProfile: deps.telegramProfile } : {}),
     };
     const leaderProfileKey = getTelegramThreadOwnerKey(leaderOwner);
+    if (deps.forceFreshUnnamed) {
+        await resetTelegramConnectionProvisioning({
+            store: deps.topicTargetStore, owner: "leader", instanceId: deps.instanceId,
+            profileKey: leaderProfileKey, isCurrent: () => {
+                assertLeaderEpoch("connect-recovery");
+                return true;
+            }, recordEvent: deps.recordEvent,
+        });
+    }
     const legacyLeaderRecord = deps.topicTargetStore.getByProfileKey(leaderProfileKey);
     let capacityUnavailable = false;
     const workspaceIdentity = normalizedLeaderCwd
         ? deps.topicTargetStore.claimWorkspaceIdentity(normalizedLeaderCwd, deps.instanceId, legacyLeaderRecord?.instanceId, {
             sessionId: deps.sessionId,
+            provisionProfileKey: leaderProfileKey,
             onCapacityUnavailable() {
                 capacityUnavailable = true;
             },

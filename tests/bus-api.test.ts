@@ -9,9 +9,73 @@ import test from "node:test";
 import { createTelegramBusAwareApiRuntime, createTelegramSelectedMenuTextApi } from "../lib/bus-api.ts";
 import { createTelegramExtensionSectionRegistry, handleTelegramSectionCallback, type TelegramSectionRuntimeDeps } from "../lib/sections.ts";
 import { createTelegramBusLeaderApiProxy } from "../lib/bus-leader.ts";
-import { callTelegram, createTelegramApiClient, createTelegramBridgeApiRuntime, type TelegramBridgeApiRuntime, type TelegramApiCallOptions } from "../lib/telegram-api.ts";
+import { callTelegram, createTelegramApiClient, createTelegramBridgeApiRuntime, setTelegramApiHttpsFetchForTesting, type TelegramBridgeApiRuntime, type TelegramApiCallOptions } from "../lib/telegram-api.ts";
 import { captureTelegramStaleTargetRequestRecovery, type TelegramSyncState } from "../lib/sync.ts";
 import type { TelegramTopicTargetRecord } from "../lib/threads.ts";
+import { createTelegramTypingLoop, createTelegramTypingLoopStarter } from "../lib/runtime.ts";
+import { createTelegramSessionContextStore } from "../lib/lifecycle.ts";
+import { createPassthroughFailureLog } from "./fixtures/failure-log.ts";
+
+for (const direct of [true, false]) for (const threaded of [true, false]) for (const failure of ["http", "network"] as const) {
+  test(`Typing cannot replay HTTP after its captured generation ends (direct=${direct}, threaded=${threaded}, failure=${failure})`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const context = createTelegramSessionContextStore<object>(), ctx = {}, typing = createTelegramTypingLoop();
+    context.set(ctx); const calls: unknown[] = [], payloads: unknown[] = [], errors: unknown[] = [];
+    let finish!: () => void; const settled = new Promise<void>(resolve => { finish = resolve; });
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (_input, init) => {
+      calls.push(JSON.parse(String(init?.body)));
+      if (calls.length === 1) {
+        context.set(ctx); typing.stop();
+        if (failure === "network") throw new TypeError("fetch failed");
+        return new Response(JSON.stringify({ ok: false, error_code: 500, description: "fixture retry" }), { status: 500 });
+      }
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
+    };
+    const restoreHttps = setTelegramApiHttpsFetchForTesting(globalThis.fetch);
+    const directRuntime = createTelegramBridgeApiRuntime({ client: createTelegramApiClient(() => "123:fixture", { isThreadedMode: () => threaded }),
+      tempDir: "/tmp", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {} });
+    const proxy = createTelegramBusLeaderApiProxy({ call: directRuntime.call, callMultipart: directRuntime.callMultipart, downloadFile: directRuntime.downloadFile });
+    const api = createTelegramBusAwareApiRuntime({ directRuntime, ownsDirect: () => direct,
+      async callFollowerApi(method, args, localOptions) {
+        localOptions?.assertAuthority?.();
+        const wire = structuredClone(args); payloads.push(wire);
+        return proxy(method, wire);
+      } });
+    const start = createTelegramTypingLoopStarter({
+      failureLog: createPassthroughFailureLog(error => errors.push(error)),
+      typing, getDefaultChatId: () => 7,
+      isContextActive: context.isCurrent, getSessionGeneration: context.getGeneration, getTransportAuthority: () => "unchanged", isThreadedMode: () => threaded,
+      async sendTypingAction(chatId, options) { try { return await api.sendTypingAction(chatId, options); } finally { finish(); } },
+      updateStatus() {}, recordRuntimeEvent(_category, error) { errors.push(error); } });
+    const target = { chatId: 7, ...(threaded ? { threadId: 42 } : {}) };
+    try {
+      start(ctx, 7, { target });
+      // Drain the actual sender's outcome, not just the core's forgotten in-flight state after stop.
+      await settled; await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(calls.length, 1); assert.equal(typing.stop(), false); assert.deepEqual(errors, []);
+      assert.deepEqual(calls[0], { chat_id: 7, action: "typing", ...(threaded ? { message_thread_id: 42 } : {}) });
+      assert.deepEqual(payloads, direct ? [] : [["sendChatAction", calls[0], { maxAttempts: 1, retrySafety: "non-idempotent" }]]);
+      start(ctx, 7, { target }); for (let turn = 0; turn < 30; turn++) await new Promise<void>(resolve => setImmediate(resolve));
+      t.mock.timers.tick(3000); await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(calls.length, 2, "Fresh context owns its own attempt; old failure cannot stop the replacement");
+      assert.equal(typing.stop(), true);
+    } finally { typing.stop(); restoreHttps(); globalThis.fetch = previousFetch; }
+  });
+}
+
+for (const threaded of [true, false]) test(`Queued direct typing issuance rechecks its local context guard (threaded=${threaded})`, async () => {
+  let current = true, fetches = 0;
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => { fetches++; return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }); };
+  const directRuntime = createTelegramBridgeApiRuntime({ client: createTelegramApiClient(() => "123:fixture", { isThreadedMode: () => threaded }),
+    tempDir: "/tmp", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {} });
+  const api = createTelegramBusAwareApiRuntime({ directRuntime, ownsDirect: () => true, callFollowerApi: async () => assert.fail("No follower") });
+  try {
+    const task = api.sendTypingAction(7, { ...(threaded ? { message_thread_id: 42 } : {}), assertAuthority() { if (!current) throw new Error("Context ended"); } });
+    current = false; await assert.rejects(task); assert.equal(fetches, 0);
+  } finally { globalThis.fetch = previousFetch; }
+});
 
 test("Selected text API preparation proves availability without activating the future recipient", async () => {
   let assertions = 0;
@@ -450,6 +514,30 @@ test("Bus-aware API runtime keeps the guest ACK experiment on direct transport",
   assert.deepEqual(busCalls, []);
 });
 
+test("Guest inline media edit forwards its guard only through current direct ownership", async () => {
+  let owns = true;
+  let edits = 0;
+  const guard = { assertAuthority() {} };
+  const content = { media: { type: "document" as const, media: "cached-id" } };
+  const runtime = createTelegramBusAwareApiRuntime({
+    directRuntime: {
+      ...createDirectRuntime([]),
+      editGuestInlineMessage: async (id, received, options) => {
+        assert.equal(id, "inline");
+        assert.equal(received, content);
+        assert.equal(options, guard);
+        edits++;
+      },
+    },
+    ownsDirect: () => owns,
+    callFollowerApi: async () => assert.fail("Inline ownership cannot fall back to follower transport"),
+  });
+  await runtime.editGuestInlineMessage("inline", content, guard);
+  owns = false;
+  await assert.rejects(runtime.editGuestInlineMessage("inline", content, guard), /requires direct transport ownership/);
+  assert.equal(edits, 1);
+});
+
 test("Bus-aware polling methods fail closed without direct ownership", async () => {
   const directCalls: unknown[] = [];
   const busCalls: unknown[] = [];
@@ -558,6 +646,7 @@ test("Bus-aware API runtime routes follower outbound calls through the leader", 
       args: [
         "sendChatAction",
         { chat_id: 1, action: "typing", message_thread_id: 5 },
+        { maxAttempts: 1, retrySafety: "non-idempotent" },
       ],
     },
     {
@@ -665,6 +754,7 @@ test("Bus-aware API runtime applies follower default thread to scoped actions", 
       args: [
         "sendChatAction",
         { chat_id: 1, action: "typing", message_thread_id: 5 },
+        { maxAttempts: 1, retrySafety: "non-idempotent" },
       ],
     },
     {
@@ -683,7 +773,7 @@ test("Bus-aware API runtime applies follower default thread to scoped actions", 
     },
     {
       method: "call",
-      args: ["sendChatAction", { chat_id: 2, action: "typing" }],
+      args: ["sendChatAction", { chat_id: 2, action: "typing" }, { maxAttempts: 1, retrySafety: "non-idempotent" }],
     },
   ]);
 });

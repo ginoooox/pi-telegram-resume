@@ -248,12 +248,31 @@ await test("explicit default profile keeps canonical unsuffixed paths", () => {
 });
 
 await test("Diagnostic display paths are shared across default and named profiles", () => {
+  const agentDir = join(homedir(), ".pi", "agent");
   const expected = {
     state: "~/.pi/agent/tmp/pi-telegram/state.json",
     logs: "~/.pi/agent/tmp/pi-telegram/logs.jsonl",
   };
   for (const profile of [undefined, "default", "work"]) {
-    assert.deepEqual(getTelegramDiagnosticsDisplayPaths(profile), expected);
+    assert.deepEqual(getTelegramDiagnosticsDisplayPaths(profile, agentDir), expected);
+  }
+});
+
+await test("Diagnostic display paths follow a non-default agent dir", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pi-telegram-display-paths-")));
+  try {
+    const display = getTelegramDiagnosticsDisplayPaths("work", dir);
+    for (const path of [display.state, display.logs]) {
+      assert.ok(path.startsWith("~/") || path.startsWith(join(dir, "tmp", "pi-telegram")), path);
+      assert.ok(!path.startsWith("~/.pi/agent/"), "never another profile's default files");
+    }
+    // Windows may resolve the temp directory outside the resolved home directory, so a display path is
+    // compared separator-neutral: only the exact agent directory and file names are asserted.
+    const normalizedDisplay = (value: string): string => value.split("\\").join("/");
+    assert.ok(normalizedDisplay(display.state).endsWith("tmp/pi-telegram/state.json"), display.state);
+    assert.ok(normalizedDisplay(display.logs).endsWith("tmp/pi-telegram/logs.jsonl"), display.logs);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

@@ -364,7 +364,7 @@ function parseTelegramVoiceCompactActionPayload(
 function parseTelegramAdaptiveActionPayloadRows(
   source: string,
   parseCompactPayload: TelegramCompactActionPayloadParser,
-  options: { allowTrailing?: boolean; maxCompactAtoms?: number } = {},
+  options: { allowTrailing?: boolean; maxCompactAtoms?: number; allowMatrixGroups?: boolean } = {},
 ): { rows: Record<string, unknown>[][]; end: number } | undefined {
   let offset = 0;
   const isStructuralWhitespace = (character: string | undefined): boolean =>
@@ -512,21 +512,29 @@ function parseTelegramAdaptiveActionPayloadRows(
     return undefined;
   };
 
-  const parseVerticalSequence = (): Record<string, unknown>[][] | undefined => {
+  const parseTopLevelRows = (): Record<string, unknown>[][] | undefined => {
     const rows: Record<string, unknown>[][] = [];
     while (offset < source.length) {
       skipWhitespace();
-      if (source[offset] !== "{") break;
-      const cell = parseCell();
-      if (!cell) return undefined;
-      rows.push([cell]);
+      const character = source[offset];
+      if (character === "{") {
+        const cell = parseCell();
+        if (!cell) return undefined;
+        rows.push([cell]);
+      } else if (character === "[" && options.allowMatrixGroups) {
+        const matrix = parseMatrix();
+        if (!matrix) return undefined;
+        rows.push(...matrix);
+      } else {
+        break;
+      }
       if (!consumeOptionalSeparator()) return undefined;
     }
     return rows.length > 0 ? rows : undefined;
   };
 
   skipWhitespace();
-  const rows = source[offset] === "{" ? parseVerticalSequence() : parseMatrix();
+  const rows = parseTopLevelRows();
   if (!rows) return undefined;
   skipWhitespace();
   if (!options.allowTrailing && offset !== source.length) return undefined;
@@ -581,7 +589,7 @@ export function parseTelegramButtonPayloadRows(
   return parseTelegramAdaptiveActionPayloadRows(
     source.trim(),
     parseTelegramButtonCompactActionPayload,
-    { maxCompactAtoms: 4 },
+    { maxCompactAtoms: 4, allowMatrixGroups: true },
   )?.rows;
 }
 
@@ -596,7 +604,7 @@ export function parseTelegramActionPayloadRows(
       parseTelegramAdaptiveActionPayloadRows(
         content.slice(offset),
         parseTelegramButtonCompactActionPayload,
-        { allowTrailing: true, maxCompactAtoms: 4 },
+        { allowTrailing: true, maxCompactAtoms: 4, allowMatrixGroups: true },
       )?.rows,
   );
   if (!scanned) return undefined;

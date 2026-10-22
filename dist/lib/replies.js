@@ -578,11 +578,11 @@ export function createGuestMarkdownReplySender(deps) {
  * chat/message pair.
  */
 export function createGuestMarkdownReplyEditor(deps) {
-    return async (inlineMessageId, markdown) => {
+    return async (inlineMessageId, markdown, options) => {
         const [richMarkdown = markdown] = splitTelegramNativeMarkdown(markdown);
         await deps.editGuestInlineMessage(inlineMessageId, {
             richMessage: { markdown: richMarkdown },
-        });
+        }, options);
     };
 }
 /**

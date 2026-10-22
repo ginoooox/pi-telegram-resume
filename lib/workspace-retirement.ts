@@ -146,6 +146,8 @@ export function captureTelegramWorkspaceJournalProtectionSources(input: {
       path: string,
     ) => () => TelegramWorkspaceJournalReader | undefined;
   };
+  /** Snapshot-scoped reuse of binding-independent (shared/discovered) source reads. */
+  sharedSourceReads?: Map<string, TelegramWorkspaceJournalProtectionSource>;
 }): TelegramWorkspaceJournalProtectionCapture {
   const sources: TelegramWorkspaceJournalProtectionSource[] = [];
   let complete =
@@ -155,26 +157,43 @@ export function captureTelegramWorkspaceJournalProtectionSources(input: {
     scope: TelegramWorkspaceJournalProtectionSource["scope"],
     resolve: () => TelegramWorkspaceJournalReader | undefined,
   ): void => {
+    const sharedKey =
+      scope.kind === "shared"
+        ? "shared"
+        : scope.kind === "discovered"
+          ? `discovered:${scope.path}`
+          : undefined;
+    let source =
+      sharedKey === undefined
+        ? undefined
+        : input.sharedSourceReads?.get(sharedKey);
+    if (!source) {
+      source = readSource(scope, resolve);
+      if (sharedKey !== undefined)
+        input.sharedSourceReads?.set(sharedKey, source);
+    }
+    if (source.kind === "unknown") complete = false;
+    sources.push(source);
+  };
+  const readSource = (
+    scope: TelegramWorkspaceJournalProtectionSource["scope"],
+    resolve: () => TelegramWorkspaceJournalReader | undefined,
+  ): TelegramWorkspaceJournalProtectionSource => {
     try {
       const binding = resolve();
-      if (!binding) {
-        complete = false;
-        sources.push({ kind: "unknown", scope });
-        return;
-      }
+      if (!binding) return { kind: "unknown", scope };
       const read = binding.readForProtection ?? binding.journal.read;
       const snapshot = input.withJournalReference
         ? input.withJournalReference(binding, read)
         : read();
-      sources.push({
+      return {
         kind: "available",
         scope,
         entries: snapshot.entries,
         ...(snapshot.exists === undefined ? {} : { exists: snapshot.exists }),
-      });
+      };
     } catch {
-      complete = false;
-      sources.push({ kind: "unknown", scope });
+      return { kind: "unknown", scope };
     }
   };
   capture({ kind: "shared" }, input.resolveLeader);
@@ -586,10 +605,12 @@ interface TelegramWorkspaceProtectionObserverDeps {
 }
 
 export interface TelegramWorkspaceProtectionObserver {
-  capture: (
+  capture: ((
     binding: TelegramWorkspaceThreadBinding,
     options?: { requireBindingProvenance?: boolean },
-  ) => TelegramWorkspaceExternalProtectionEvidence;
+  ) => TelegramWorkspaceExternalProtectionEvidence) & {
+    withSnapshot?: <T>(capture: () => T) => T;
+  };
   captureJournalSources: (
     binding: TelegramWorkspaceThreadBinding,
   ) => TelegramWorkspaceJournalProtectionCapture;
@@ -602,9 +623,39 @@ export interface TelegramWorkspaceProtectionObserver {
 export function createTelegramWorkspaceProtectionObserver(
   deps: TelegramWorkspaceProtectionObserverDeps,
 ): TelegramWorkspaceProtectionObserver {
+  // One occupancy snapshot probes every binding synchronously; namespace and shared/discovered
+  // journal reads are binding-independent, so read them once per snapshot instead of per binding.
+  // Never widen this beyond one synchronous capture: post-fence rechecks need fresh evidence.
+  let snapshot:
+    | {
+        namespace?: { value?: TelegramJournalNamespaceInspection; error?: unknown };
+        reads: Map<string, TelegramWorkspaceJournalProtectionSource>;
+      }
+    | undefined;
+  const inspectNamespace = (): TelegramJournalNamespaceInspection | undefined => {
+    if (!snapshot) return deps.inspectJournalNamespace?.();
+    if (!snapshot.namespace) {
+      try {
+        snapshot.namespace = { value: deps.inspectJournalNamespace?.() };
+      } catch (error) {
+        snapshot.namespace = { error };
+      }
+    }
+    if ("error" in snapshot.namespace) throw snapshot.namespace.error;
+    return snapshot.namespace.value;
+  };
+  const withSnapshot = <T>(run: () => T): T => {
+    if (snapshot) return run();
+    snapshot = { reads: new Map() };
+    try {
+      return run();
+    } finally {
+      snapshot = undefined;
+    }
+  };
   const captureJournalSources: TelegramWorkspaceProtectionObserver["captureJournalSources"] =
     (candidate) => {
-      const namespace = deps.inspectJournalNamespace?.();
+      const namespace = inspectNamespace();
       if (
         deps.inspectJournalNamespace &&
         (!namespace ||
@@ -658,12 +709,13 @@ export function createTelegramWorkspaceProtectionObserver(
               },
             }
           : {}),
+        ...(snapshot ? { sharedSourceReads: snapshot.reads } : {}),
       });
     };
-  const capture: TelegramWorkspaceProtectionObserver["capture"] = function (
-    binding,
-    options,
-  ) {
+  const captureOne = function (
+    binding: TelegramWorkspaceThreadBinding,
+    options?: { requireBindingProvenance?: boolean },
+  ): TelegramWorkspaceExternalProtectionEvidence {
     return captureTelegramWorkspaceExternalProtection({
       binding,
       requireBindingProvenance: options?.requireBindingProvenance,
@@ -714,7 +766,7 @@ export function createTelegramWorkspaceProtectionObserver(
     });
   };
   return {
-    capture,
+    capture: Object.assign(captureOne, { withSnapshot }),
     captureJournalSources,
     getJournalWriterProtection:
       deps.getJournalWriterProtection ?? (() => "unknown"),

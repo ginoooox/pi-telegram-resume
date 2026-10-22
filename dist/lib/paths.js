@@ -111,10 +111,25 @@ export function getTelegramProfilePathSuffix(profileName) {
 export function resolveTelegramProfileTempFilePath(baseName, extension, agentDir = resolveAgentDir(), profileName) {
     return join(resolveTelegramTempDir(agentDir), `${baseName}${getTelegramProfilePathSuffix(profileName)}.${extension}`);
 }
-export function getTelegramDiagnosticsDisplayPaths(_profileName) {
+/** Shared state/log paths for every profile, under the resolved agent dir (honors `PI_CODING_AGENT_DIR`). */
+export function getTelegramDiagnosticsDisplayPaths(_profileName, agentDir = resolveAgentDir()) {
+    // Storage paths are canonical, so also match a canonical home (e.g. /home -> /var/home).
+    const homes = [homedir()];
+    try {
+        homes.push(realpathSync(homes[0]));
+    }
+    catch {
+        /* An unreadable home only loses the ~ abbreviation. */
+    }
+    const display = (path) => {
+        const home = homes.find((candidate) => path === candidate || path.startsWith(`${candidate}${sep}`));
+        return home
+            ? `~${path.slice(home.length).split(sep).join("/")}`
+            : path;
+    };
     return {
-        state: "~/.pi/agent/tmp/pi-telegram/state.json",
-        logs: "~/.pi/agent/tmp/pi-telegram/logs.jsonl",
+        state: display(resolveTelegramStatePath(agentDir)),
+        logs: display(resolveTelegramRuntimeLogPath(agentDir)),
     };
 }
 /** Durable Workspace admission ledger (<agentDir>/tmp/pi-telegram/workspace-admission[.<profile>].json). */

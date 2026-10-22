@@ -259,7 +259,9 @@ export interface TelegramLockedPollingRuntime<TContext extends TelegramLockConte
     captureTransportAuthority: (ctx: TContext) => (() => boolean) | undefined;
     onPersistentConflict: (ctx: TContext, count: number) => Promise<void>;
     onSessionStart: (_event: unknown, ctx: TContext) => Promise<void>;
-    registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;
+    registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry, options?: {
+        recoverConnection?: boolean;
+    }) => boolean | undefined | Promise<boolean | undefined>;
     restoreFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;
     stopFollowerRegistration?: () => void;
 }
@@ -274,7 +276,9 @@ interface TelegramLockedPollingRuntimeDeps<TContext extends TelegramLockContext>
     formatStartBlockedMessage?: (ctx: TContext) => string;
     startPolling: (ctx: TContext, options?: TelegramLockedPollingStartOptions) => void | Promise<void>;
     stopPolling: () => Promise<void>;
-    registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;
+    registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry, options?: {
+        recoverConnection?: boolean;
+    }) => boolean | undefined | Promise<boolean | undefined>;
     restoreFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;
     stopFollowerRegistration?: () => void;
     /** Threaded Mode takeover evidence after failed follower registration; replaces the retired file heartbeat. */
