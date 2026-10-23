@@ -1712,6 +1712,47 @@ test("Status HTML builder binds active model lookup", () => {
   assert.doesNotMatch(html, /<b>Tokens:<\/b>/s);
 });
 
+test("Status HTML reads the current Pi session name on each render and escapes HTML", () => {
+  const buildStatusHtml = createTelegramStatusHtmlBuilder({
+    getActiveModel: () => undefined,
+  });
+  let name = "调试 <Pi> & Telegram";
+  const ctx = {
+    sessionManager: { getEntries: () => [], getSessionName: () => name },
+    getContextUsage: () => undefined,
+    isIdle: () => true,
+    modelRegistry: { isUsingOAuth: () => false },
+  };
+  assert.match(
+    buildStatusHtml(ctx),
+    /<b>Session:<\/b> <code>调试 &lt;Pi&gt; &amp; Telegram<\/code>/u,
+  );
+  name = "Renamed session";
+  const renamedHtml = buildStatusHtml(ctx);
+  assert.match(renamedHtml, /<b>Session:<\/b> <code>Renamed session<\/code>/u);
+  assert.doesNotMatch(renamedHtml, /调试/u);
+});
+
+test("Status HTML shows an unnamed fallback for empty names and older contexts", () => {
+  const buildStatusHtml = createTelegramStatusHtmlBuilder({
+    getActiveModel: () => undefined,
+  });
+  for (const sessionManager of [
+    { getEntries: () => [] },
+    ...[undefined, "", "   "].map((name) => ({
+      getEntries: () => [], getSessionName: () => name,
+    })),
+  ]) {
+    const html = buildStatusHtml({
+      sessionManager,
+      getContextUsage: () => undefined,
+      isIdle: () => true,
+      modelRegistry: { isUsingOAuth: () => false },
+    });
+    assert.match(html, /<b>Session:<\/b> <code>Unnamed<\/code>/u);
+  }
+});
+
 test("Status HTML separates token and cache telemetry", () => {
   const buildStatusHtml = createTelegramStatusHtmlBuilder({
     getActiveModel: () => ({ contextWindow: 1000 }),

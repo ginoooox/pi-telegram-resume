@@ -58,14 +58,14 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `☑️` | Activate / choose this item | Model detail activation action, generated button-only choice heading | Positive selection cue; use `🟢 Active` for already-current state. |
 | `⛔️` | Cancel source routing | `⛔️ Cancel routing` chooser action and the `Routing cancelled` toast | Not an abort of active Pi work. Private retention remains mandatory; disposable-tab removal stays bound to exact eligible target authority and follows only once every input in the tab is resolved. |
 | `❌` | No / cancel / terminal failure | Confirmation cancel buttons and terminal failure notices | Do not use for a recoverable operation failure that leaves session state intact. |
-| `🗑` | Delete | Destructive confirmations | Not a queue reaction shortcut; queue menus use reversible Keep/Skip selectors. |
+| `🗑` | Delete | Destructive confirmations and historical-session cleanup entrypoints | Not a queue reaction shortcut; queue menus use reversible Keep/Skip selectors. |
 
 ### Informational Feedback
 
 | Emoji | Meaning | Canonical surfaces | Notes |
 | --- | --- | --- | --- |
 | `💤` | Nothing active | No-active-turn notices | Neutral idle result, not an error. |
-| `✅` | Completed successfully | Compaction and other completion notices | Use only after the operation has completed. |
+| `✅` | Completed successfully / finish cleanup | Compaction and other completion notices; the session cleanup `✅ 完成` control | Use only after the operation has completed. |
 | `🚫` | Unavailable, denied, or cancelled operation | Missing capability/auth notices, access denial, and compaction cancellation | Callback toasts carry no emoji. |
 | `⚠️` | Recoverable operation failure | Compaction failure notice | The attempted operation failed, but the original session state remains usable. |
 
@@ -311,3 +311,5 @@ Buttons:
 ## Callback Ownership
 
 UI style does not change callback ownership. Callback prefixes remain owned by their feature domain and must be listed in callback namespace documentation when they become public collision risks.
+
+Saved-session choices in `/resume` and `/delete` use one Native Rich callback link per row in `<tg-button-row align="left">`. This places session names against a common left edge; ordinary footer keyboards have no alignment field. Navigation and `✅ 完成` use the same explicit alignment. Native controls replace the body on edits and carry no duplicate footer keyboard. `/resume` is a paged chooser rather than a numbered text list; exact-name and ID-prefix commands remain available.

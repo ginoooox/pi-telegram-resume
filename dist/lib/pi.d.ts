@@ -8,7 +8,12 @@ import { type AgentEndEvent, type AgentSettledEvent, type AgentStartEvent, type 
 export type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, ExtensionAPI, ExtensionCommandContext, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionShutdownEvent, SessionStartEvent, SessionInfo, SlashCommandInfo, TurnEndEvent, TurnEndEventResult, UIPromptEndEvent, UIPromptStartEvent, };
 export declare function setExtensionSessionName(api: Pick<ExtensionAPI, "setSessionName">, name: string): void;
 export type PiSessionSummary = Pick<SessionInfo, "id" | "cwd" | "path" | "modified"> & Partial<Pick<SessionInfo, "name">>;
+/** Both /resume and /delete use the same disposable, transcript-free summary index. */
 export declare function listPiSessions(ctx: ExtensionContext): Promise<PiSessionSummary[]>;
+/** Move one unchanged historical session to a private, non-enumerated recycle folder. */
+export declare function trashPiSession(ctx: ExtensionContext, id: string, expectedModified: number, assertCurrent: () => void, listActiveSessions?: () => readonly {
+    sessionId?: string;
+}[]): Promise<void>;
 export interface SessionCompactFailedEvent {
     type: "session_compact_failed";
     reason: "manual" | "threshold" | "overflow";

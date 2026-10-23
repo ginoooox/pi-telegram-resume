@@ -1,8 +1,18 @@
 # Changelog
 
+## Local additions (unreleased)
+
+- Replace the numbered Telegram `/resume` list with a clickable paged selector, preserving exact-name and unique ID-prefix switching. Session choices in `/resume` and `/delete` now use explicitly left-aligned Native Rich callback rows, and callback switches retain the original durable source and idle/queue gates.
+
+- `sessions`: Share a private summary index between `/resume` and `/delete`, scan only appended metadata on normal growth, and reuse the cleanup list for paging/cancel; fresh source headers and file-state checks still gate deletion.
+
+- `sessions`: Add `/delete` for continuous, paginated historical-session cleanup with confirmation, cancel, completion count and a persistent finish control; move unchanged files to a recoverable private folder and protect current sessions, stale panels and duplicate clicks.
+
 > Each release keeps at most 8 outcome records of at most 512 characters.
 
 ## Unreleased
+
+- `Status`: Show the current Pi session name in the Telegram status panel, with an `Unnamed` fallback; reopening the panel reflects renames and session switches.
 
 - `Fork integration`: Preserve workspace-scoped `/resume` and Pi-session `/rename` while adopting upstream command sequencing, shared held menus and session lifecycle fixes.
 - `Model refresh`: Await asynchronous model-registry refresh before reading available models, so newly configured models appear after the menu cache refreshes.

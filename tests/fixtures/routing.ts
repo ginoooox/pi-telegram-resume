@@ -41,6 +41,8 @@ export interface TestUpdate extends Updates.TelegramUpdateFlow {
 }
 
 export interface RouteHarnessOptions {
+  sessionDeletion?: Pick<Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>, "listSessions" | "trashSession" | "getSessionId" | "getCwd">;
+  sessionResume?: Pick<Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>, "listSessions" | "requestResumeSession" | "getSessionId" | "getCwd">;
   config?: unknown;
   configStore?: Routing.TelegramInboundRouteRuntimeDeps<
     TestMessage, TestCallbackQuery, TestContext, TestModel
@@ -245,6 +247,8 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
       persistAllowedUserId: async () => true,
       persist: async () => undefined,
     },
+    ...options.sessionDeletion,
+    ...options.sessionResume,
     callApi: options.callApi,
     workspaceRestoreRecipient: options.workspaceRestoreRecipient,
     getWorkspaceRestoreStore: options.getWorkspaceRestoreStore,

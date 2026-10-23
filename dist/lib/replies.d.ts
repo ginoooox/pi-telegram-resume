@@ -76,6 +76,7 @@ export interface TelegramReplyTransport<TReplyMarkup> {
     }) => Promise<number | undefined>;
     editRenderedMessage: (chatId: number, messageId: number, chunks: TelegramRenderedChunk[], options?: TelegramReplyTargetOptions & {
         replyMarkup?: TReplyMarkup;
+        richMessage?: TelegramInputRichMessage;
     }) => Promise<number | undefined>;
 }
 export declare function buildTelegramReplyTransport<TReplyMarkup>(deps: TelegramReplyDeliveryDeps<TReplyMarkup>): TelegramReplyTransport<TReplyMarkup>;
@@ -84,6 +85,7 @@ export declare function sendTelegramRenderedChunks<TReplyMarkup>(chatId: number,
 }): Promise<number | undefined>;
 export declare function editTelegramRenderedMessage<TReplyMarkup>(chatId: number, messageId: number, chunks: TelegramRenderedChunk[], deps: TelegramReplyDeliveryDeps<TReplyMarkup>, options?: TelegramReplyTargetOptions & {
     replyMarkup?: TReplyMarkup;
+    richMessage?: TelegramInputRichMessage;
 }): Promise<number | undefined>;
 export interface TelegramTextReplyOptions extends TelegramReplyTargetOptions {
     parseMode?: "HTML";
@@ -127,8 +129,12 @@ export interface TelegramRenderedMessageRuntime<TReplyMarkup> {
     sendMarkdownReply: (chatId: number, replyToMessageId: number | undefined, markdown: string, options?: TelegramReplyTargetOptions & {
         replyMarkup?: TReplyMarkup;
     }) => Promise<number | undefined>;
-    editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: TelegramRenderMode, replyMarkup: TReplyMarkup, options?: TelegramReplyTargetOptions) => Promise<void>;
-    sendInteractiveMessage: (chatId: number, text: string, mode: TelegramRenderMode, replyMarkup: TReplyMarkup, options?: TelegramReplyTargetOptions) => Promise<number | undefined>;
+    editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: TelegramRenderMode, replyMarkup: TReplyMarkup, options?: TelegramReplyTargetOptions & {
+        richMessage?: TelegramInputRichMessage;
+    }) => Promise<void>;
+    sendInteractiveMessage: (chatId: number, text: string, mode: TelegramRenderMode, replyMarkup: TReplyMarkup, options?: TelegramReplyTargetOptions & {
+        richMessage?: TelegramInputRichMessage;
+    }) => Promise<number | undefined>;
     sendSectionRichMessage: (chatId: number, message: TelegramInputRichMessage, options?: TelegramReplyTargetOptions) => Promise<number>;
 }
 export interface TelegramRenderedMessageDeliveryRuntime<TReplyMarkup> extends TelegramRenderedMessageRuntime<TReplyMarkup> {

@@ -287,12 +287,14 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     answerCallbackQuery: (callbackQueryId: string, text?: string, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
     editInteractiveMessage?: (chatId: number, messageId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: Menu.TelegramReplyMarkup, options?: {
         target?: Queue.TelegramQueueTarget;
+        richMessage?: TelegramInputRichMessage;
         assertAuthority?: TelegramApiCallOptions["assertAuthority"];
     }) => Promise<void>;
     editMessageReplyMarkup?: (chatId: number, messageId: number, replyMarkup: OutboundHandlers.TelegramOutboundButtonMarkup) => Promise<void>;
     sendInteractiveMessage?: (chatId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: Menu.TelegramReplyMarkup, options?: {
         target?: Queue.TelegramQueueTarget;
         replyToMessageId?: number;
+        richMessage?: TelegramInputRichMessage;
         assertAuthority?: TelegramApiCallOptions["assertAuthority"];
     }) => Promise<number | undefined>;
     deleteMessage?: (chatId: number, messageId: number) => Promise<void>;
@@ -327,6 +329,7 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     requestNewSession?: (source: unknown) => void;
     setSessionName?: (ctx: TContext, name: string) => void;
     listSessions?: (ctx: TContext) => Promise<readonly Commands.TelegramSessionChoice[]>;
+    trashSession?: (ctx: TContext, id: string, modified: number, assertCurrent: () => void) => Promise<void>;
     getSessionId?: (ctx: TContext) => string;
     getCwd?: (ctx: TContext) => string;
     requestResumeSession?: (source: unknown, sessionId: string) => void;

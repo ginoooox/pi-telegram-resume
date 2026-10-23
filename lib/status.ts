@@ -118,7 +118,10 @@ export type TelegramStatusLineProvider = (
 ) => TelegramStatusLineProviderResult | undefined;
 
 export interface TelegramStatusContext {
-  sessionManager: { getEntries(): TelegramStatusSessionEntry[] };
+  sessionManager: {
+    getEntries(): TelegramStatusSessionEntry[];
+    getSessionName?(): string | undefined;
+  };
   getContextUsage(): TelegramContextUsage | undefined;
   isIdle?: () => boolean;
   hasPendingMessages?: () => boolean;
@@ -1872,6 +1875,12 @@ function buildStatusHtml(
       `${buildStatusSummary(ctx)}${buildTelegramStatusRoleSuffix(bridgeStatus)}`,
     ),
   ];
+  lines.push(
+    buildStatusRow(
+      "Session",
+      ctx.sessionManager.getSessionName?.()?.trim() || "Unnamed",
+    ),
+  );
   const usageSummary = buildUsageSummary(stats);
   const cacheSummary = buildCacheSummary(stats);
   const costSummary = buildCostSummary(stats, usesSubscription);

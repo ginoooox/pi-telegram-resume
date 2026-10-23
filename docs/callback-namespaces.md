@@ -20,10 +20,14 @@ myext:page:2
 
 - Use a stable extension-owned namespace, preferably the package or extension name without scope punctuation.
 - Keep the namespace lowercase ASCII: `a-z`, `0-9`, `_`, `-`.
-- Do not use `pi-telegram` owned prefixes: `compact:`, `new:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `settings:`, `section:`, `reroute:`, `reroutemenu:`, `rerouteroot:`, `reroutenew:`, `rerouterestore:`, `reroutecancel:`. The `reroute*` family belongs to exact-source unbound Thread choosers; `reroutecancel:` retains an eligible owner's original before cancelling its routing authority. Its `review:` branch owns Status recovery for protected cancellation attempts; `history:` remains reserved only to reject retired historical-review controls. Action payloads carry a fresh bounded view nonce and an index, never caller-supplied journal paths or source authority. Current app navigation uses `menu:`; `status:` remains reserved for legacy/owned status callbacks but is not emitted by current UI. `compact:` and `new:` are owned by their destructive-action confirmation dialogs. `section:` is owned by the Extension Sections platform (0.10.0+), documented in [Extension Sections](./sections.md). `settings:` is owned for the built-in Settings submenu.
+- Do not use `pi-telegram` owned prefixes: `compact:`, `new:`, `sessiondelete:`, `sessionresume:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `settings:`, `section:`, `reroute:`, `reroutemenu:`, `rerouteroot:`, `reroutenew:`, `rerouterestore:`, `reroutecancel:`. The `reroute*` family belongs to exact-source unbound Thread choosers; `reroutecancel:` retains an eligible owner's original before cancelling its routing authority. Its `review:` branch owns Status recovery for protected cancellation attempts; `history:` remains reserved only to reject retired historical-review controls. Action payloads carry a fresh bounded view nonce and an index, never caller-supplied journal paths or source authority. Current app navigation uses `menu:`; `status:` remains reserved for legacy/owned status callbacks but is not emitted by current UI. `compact:` and `new:` are owned by their destructive-action confirmation dialogs. `section:` is owned by the Extension Sections platform (0.10.0+), documented in [Extension Sections](./sections.md). `settings:` is owned for the built-in Settings submenu.
 - Keep the full `callback_data` within Telegram's 64-byte limit.
 - Put only opaque ids or small enum values in payloads; do not store secrets, full prompts, or large state.
 - Treat callbacks as untrusted input. Validate namespace, action, and payload before executing side effects.
+
+## Session Cleanup
+
+`sessiondelete:<view nonce>:select|confirm|list|page|done[:index]` belongs to the continuous `/delete` panel. The bounded opaque view nonce binds the current exact target/message and Pi session/workspace. Indices select only the rendered snapshot; confirmation retains the exact selected ID and modification time. Every render replaces the nonce, duplicate/in-flight clicks cannot issue a second move, and completion invalidates the panel. Callback payloads never contain filesystem paths.
 
 ## Queue Controls
 
@@ -50,3 +54,5 @@ section:<token>:<action>[:<payload>]
 ```
 
 The token maps back to the full section identity inside the section registry. Section authors should not hand-roll `section:` callbacks outside the section context helpers, and ordinary layered extensions should continue using their own namespace plus update handlers or the `[callback]` fallback.
+
+`sessionresume:<view nonce>:select|page|done[:index]` belongs to the clickable `/resume` panel. It shares the exact-target/message/session/workspace, expiry, busy and rotating-nonce fences of `/delete`, while selected IDs remain server-side snapshot metadata. Selection independently checks fresh workspace membership and idle/queue state, removes its native controls and schedules the existing session action with the original callback execution carrier; completion of that durable update still precedes the public Pi switch. `confirm` is never a resume operation.

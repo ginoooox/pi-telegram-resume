@@ -1194,6 +1194,9 @@ export default function (pi) {
             Pi.setExtensionSessionName(pi, name);
         },
         listSessions: Pi.listPiSessions,
+        trashSession(ctx, id, modified, assertCurrent) {
+            return Pi.trashPiSession(ctx, id, modified, assertCurrent, telegramBusFollowerRegistry.list);
+        },
         getSessionId(ctx) {
             return ctx.sessionManager.getSessionId();
         },
@@ -1201,44 +1204,12 @@ export default function (pi) {
             return ctx.cwd;
         },
         requestResumeSession(source, sessionId) {
-            const updateId = Updates.getTelegramUpdateExecutionFence(source)?.updateId;
-            if (updateId === undefined)
-                throw new Error("Telegram session resume requires durable update authority.");
-            const message = source;
-            if (typeof message.chat?.id !== "number" || typeof message.message_id !== "number")
-                throw new Error("Telegram session resume target is unavailable.");
-            const target = {
-                chatId: message.chat.id,
-                messageId: message.message_id,
-                ...(typeof message.message_thread_id === "number"
-                    ? { threadId: message.message_thread_id }
-                    : {}),
-            };
+            const { updateId, target } = Commands.getTelegramSessionActionSource(source);
             if (!sessionActionsRuntime.scheduleResumeAfterUpdate(updateId, target, sessionId))
                 throw new Error("A Telegram session replacement is already pending.");
         },
         requestNewSession(source) {
-            const updateId = Updates.getTelegramUpdateExecutionFence(source)?.updateId;
-            if (updateId === undefined) {
-                throw new Error("Telegram session replacement requires durable update authority.");
-            }
-            const callbackMessage = source && typeof source === "object" && "message" in source
-                ? source.message
-                : source;
-            const messageTarget = callbackMessage;
-            const target = typeof messageTarget?.chat?.id === "number" &&
-                typeof messageTarget.message_id === "number"
-                ? {
-                    chatId: messageTarget.chat.id,
-                    messageId: messageTarget.message_id,
-                    ...(typeof messageTarget.message_thread_id === "number"
-                        ? { threadId: messageTarget.message_thread_id }
-                        : {}),
-                }
-                : undefined;
-            if (!target) {
-                throw new Error("Telegram session replacement target is unavailable.");
-            }
+            const { updateId, target } = Commands.getTelegramSessionActionSource(source);
             if (!sessionActionsRuntime.scheduleAfterUpdate(updateId, target)) {
                 throw new Error("A Telegram session replacement is already pending.");
             }

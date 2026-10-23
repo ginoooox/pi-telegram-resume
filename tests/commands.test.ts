@@ -35,6 +35,9 @@ import {
   createTelegramCommandTargetRuntime,
   createTelegramSessionActionAssembly,
   createTelegramSessionActionRuntime,
+  createTelegramSessionDeletionRuntime,
+  createTelegramSessionResumeRuntime,
+  getTelegramSessionActionSource,
   settleTelegramSessionReplacement,
   TELEGRAM_INTERNAL_COMMAND_DESCRIPTION,
   TELEGRAM_INTERNAL_COMMAND_NAME,
@@ -377,6 +380,7 @@ test("Command helpers expose Telegram bot command definitions", () => {
     { command: "compact", description: "🗜 Compact current session" },
     { command: "new", description: "🆕 Start a new session" },
     { command: "resume", description: "↩️ Resume a Pi session" },
+    { command: "delete", description: "🗑 Delete saved Pi sessions" },
     { command: "rename", description: "✏️ Rename Pi session" },
     {
       command: "continue",
@@ -573,9 +577,9 @@ test("Command helpers register extension Telegram bot commands when visible", as
   });
   assert.deepEqual(calls, [
     [
-      ...TELEGRAM_BOT_COMMANDS.slice(0, 7),
+      ...TELEGRAM_BOT_COMMANDS.slice(0, TELEGRAM_BOT_COMMANDS.length - 2),
       { command: "fresh", description: "🆕 Start fresh" },
-      ...TELEGRAM_BOT_COMMANDS.slice(7),
+      ...TELEGRAM_BOT_COMMANDS.slice(TELEGRAM_BOT_COMMANDS.length - 2),
     ],
   ]);
   dispose();
@@ -2562,71 +2566,43 @@ test("/rename targets the active Pi session without invoking Thread naming", asy
   assert.deepEqual(names, ["release"]);
 });
 
-test("/resume lists numbered sessions and resolves names, stable numbers, and IDs", async () => {
+test("/resume opens a fenced native selector and keeps exact names, numeric names and ID prefixes", async () => {
   const f = createFencedCommandTargetFixture();
-  const id = "12345678-1234-1234-1234-123456789abc";
-  const otherId = "abcdef01-1234-1234-1234-123456789abc";
-  const scheduled: string[] = [];
-  const responses: string[] = [];
-  let sessions = [
+  const id = "12345678-1234-1234-1234-123456789abc", otherId = "abcdef01-1234-1234-1234-123456789abc";
+  const scheduled: string[] = [], responses: string[] = []; let opened = 0;
+  const sessions = [
     { id, cwd: "/repo", modified: new Date(2000), name: "Previous <work>" },
-    { id: otherId, cwd: "/repo", modified: new Date(1000), name: "Other" },
-    { id: "ffffffff-1234-1234-1234-123456789abc", cwd: "/elsewhere", modified: new Date(3000) },
+    { id: otherId, cwd: "/repo", modified: new Date(1000), name: "1" },
+    { id: "ffffffff-1234-1234-1234-123456789abc", cwd: "/elsewhere", modified: new Date(3000), name: "Foreign" },
   ];
-  f.deps.listSessions = async () => sessions;
-  f.deps.getSessionId = () => "current";
-  f.deps.getCwd = () => "/repo";
+  f.deps.listSessions = async () => sessions; f.deps.getSessionId = () => "current"; f.deps.getCwd = () => "/repo";
   f.deps.requestResumeSession = (_message, selected) => scheduled.push(selected);
   f.deps.sendTextReply = async (_chat, _reply, text) => { responses.push(text); };
+  f.deps.openSessionResume = async (message, ctx, options) => {
+    options?.assertAuthority?.(); assert.equal(message, f.message); assert.equal(ctx, f.ctx); opened++;
+  };
   const command = createTelegramCommandHandlerTargetRuntime(f.deps);
-  assert.equal(await command("resume", f.message, f.ctx, "1"), true);
-  assert.match(responses.at(-1)!, /Run \/resume again/);
-  assert.equal(await command("resume", f.message, f.ctx, ""), true);
-  assert.match(responses.at(-1)!, /\n1\. Previous &lt;work&gt;/);
-  assert.match(responses.at(-1)!, /\n2\. Other/);
-  assert.doesNotMatch(responses.at(-1)!, /<code>\/resume/);
-  assert.doesNotMatch(responses.at(-1)!, /ffffffff/);
-  sessions = [
-    { ...sessions[0]!, modified: new Date(1000) },
-    { ...sessions[1]!, modified: new Date(3000) },
-    sessions[2]!,
-  ];
-  assert.equal(await command("resume", f.message, f.ctx, "1"), true);
-  assert.deepEqual(scheduled, [id], "A newer session must not reorder an already displayed number");
-  assert.equal(await command("resume", f.message, f.ctx, " previous <WORK> "), true);
-  assert.deepEqual(scheduled, [id, id]);
-  assert.equal(await command("resume", f.message, f.ctx, "abcdef01"), true);
-  assert.deepEqual(scheduled, [id, id, otherId]);
-  assert.equal(await command("resume", f.message, f.ctx, "unknown"), true);
-  assert.deepEqual(scheduled, [id, id, otherId]);
+  assert.equal(await command("resume", f.message, f.ctx, ""), true); assert.equal(opened, 1); assert.deepEqual(responses, []);
+  await command("resume", f.message, f.ctx, " previous <WORK> ");
+  await command("resume", f.message, f.ctx, "abcdef01");
+  await command("resume", f.message, f.ctx, id);
+  await command("resume", f.message, f.ctx, "1");
+  assert.deepEqual(scheduled, [id, otherId, id, otherId]);
+  await command("resume", f.message, f.ctx, "2");
+  assert.match(responses.at(-1)!, /not found/); assert.equal(scheduled.length, 4, "Display ordinals do not select a session");
+  await command("resume", f.message, f.ctx, "Foreign"); assert.equal(scheduled.length, 4);
+  f.revoke(); await assert.rejects(command("resume", f.message, f.ctx, ""), /authority revoked/); assert.equal(opened, 1);
 });
 
-test("/resume numbers expire with their target, current session, or missing destination", async () => {
-  const f = createFencedCommandTargetFixture();
-  const id = "12345678-1234-1234-1234-123456789abc";
-  const responses: string[] = [], scheduled: string[] = [];
-  let sessions = [{ id, cwd: "/repo", modified: new Date(), name: "Saved" }];
-  let currentId = "current";
-  f.deps.assertExecutionCurrent = () => {};
-  f.deps.listSessions = async () => sessions;
-  f.deps.getSessionId = () => currentId;
-  f.deps.getCwd = () => "/repo";
-  f.deps.requestResumeSession = (_message, selected) => scheduled.push(selected);
+test("/resume fails closed when its selector is unavailable or Pi becomes busy during name lookup", async () => {
+  const f = createFencedCommandTargetFixture(), responses: string[] = []; let pending = false, scheduled = 0;
   f.deps.sendTextReply = async (_chat, _reply, text) => { responses.push(text); };
+  f.deps.getSessionId = () => "current"; f.deps.getCwd = () => "/repo";
+  f.deps.listSessions = async () => { pending = true; return [{ id: "history", cwd: "/repo", name: "Saved", modified: new Date(1000) }]; };
+  f.deps.hasPendingMessages = () => pending; f.deps.requestResumeSession = () => { scheduled++; };
   const command = createTelegramCommandHandlerTargetRuntime(f.deps);
-  await command("resume", f.message, f.ctx, "");
-  const otherThread = { ...f.message, message_thread_id: 42 };
-  await command("resume", otherThread, f.ctx, "1");
-  assert.match(responses.at(-1)!, /Run \/resume again/);
-  sessions = [];
-  await command("resume", f.message, f.ctx, "1");
-  assert.match(responses.at(-1)!, /no longer available/);
-  sessions = [{ id, cwd: "/repo", modified: new Date(), name: "Saved" }];
-  await command("resume", f.message, f.ctx, "");
-  currentId = "different";
-  await command("resume", f.message, f.ctx, "1");
-  assert.match(responses.at(-1)!, /Run \/resume again/);
-  assert.deepEqual(scheduled, []);
+  await command("resume", f.message, f.ctx, ""); assert.match(responses.at(-1)!, /unavailable/);
+  await command("resume", f.message, f.ctx, "Saved"); assert.match(responses.at(-1)!, /busy/); assert.equal(scheduled, 0);
 });
 
 async function withControlCommandSurface(surface: "selected" | "held", f: ReturnType<typeof createFencedCommandTargetFixture>, name: "stop" | "next",
@@ -6020,4 +5996,281 @@ test("/rename validates its session name without touching the Thread title", () 
     assert.equal(stored, "Release notes");
   }
   assert.ok("name" in parseSessionRename("A".repeat(80)));
+});
+
+function createSessionDeletionFixture(count = 2, kind: "delete" | "resume" = "delete") {
+  const ctx = { id: "current", cwd: "/repo", active: true };
+  let sessions = Array.from({ length: count }, (_, i) => ({ id: `history-${i}`, cwd: "/repo",
+    name: `Session ${i} <test>`, modified: new Date(1700000000000 - i * 1000) }));
+  const panels: { html: string; markup: { inline_keyboard: { text: string; callback_data: string }[][] }; richMessage?: { html?: string } }[] = [];
+  const answers: (string | undefined)[] = [], trashed: string[] = [];
+  let scanHook: (() => Promise<void>) | undefined;
+  let moveHook: (() => Promise<void>) | undefined;
+  let editHook: (() => void) | undefined;
+  const scheduled: { id: string; source: unknown }[] = [];
+  const state = { idle: true, pending: false, turn: false, dispatch: false, queued: false, compacting: false };
+  const deps: Parameters<typeof createTelegramSessionDeletionRuntime<typeof ctx>>[0] = {
+    async listSessions() {
+      await scanHook?.();
+      return [...sessions, { id: "current", cwd: "/repo", name: "Protected", modified: new Date() },
+        { id: "foreign", cwd: "/elsewhere", name: "Foreign", modified: new Date() }];
+    },
+    async trashSession(_ctx, id, modified, assertCurrent) {
+      await moveHook?.(); assertCurrent();
+      const item = sessions.find(s => s.id === id);
+      if (!item || item.modified.getTime() !== modified) throw new Error("Changed");
+      trashed.push(id); sessions = sessions.filter(s => s.id !== id);
+    },
+    getSessionId: c => c.id, getCwd: c => c.cwd, isContextActive: c => c.active,
+    async sendInteractiveMessage(chat, html, mode, markup, options) {
+      options?.assertAuthority?.(); assert.equal(chat, 7); assert.equal(mode, "html");
+      assert.deepEqual(options?.target, { chatId: 7, threadId: 41 });
+      panels.push({ html, markup, richMessage: options?.richMessage }); return 20;
+    },
+    async editInteractiveMessage(chat, message, html, mode, markup, options) {
+      options?.assertAuthority?.(); assert.deepEqual([chat, message, mode], [7, 20, "html"]);
+      assert.deepEqual(options?.target, { chatId: 7, threadId: 41 });
+      editHook?.(); panels.push({ html, markup, richMessage: options?.richMessage });
+    },
+    async answerCallbackQuery(_id, text) { answers.push(text); },
+  };
+  const runtime = kind === "delete" ? createTelegramSessionDeletionRuntime(deps) : createTelegramSessionResumeRuntime({ ...deps,
+    isIdle: () => state.idle, hasPendingMessages: () => state.pending, hasActiveTelegramTurn: () => state.turn,
+    hasDispatchPending: () => state.dispatch, hasQueuedTelegramItems: () => state.queued, isCompactionInProgress: () => state.compacting,
+    requestResumeSession: (source, id) => { scheduled.push({ source, id }); },
+  });
+  const button = (text: string) => {
+    const found = panels.at(-1)!.markup.inline_keyboard.flat().find(b => b.text.includes(text));
+    assert.ok(found, `Missing button: ${text}`); assert.ok(Buffer.byteLength(found.callback_data) <= 64); return found.callback_data;
+  };
+  const query = (data: string) => ({ id: "click", data, message: { chat: { id: 7 }, message_id: 20, message_thread_id: 41 } });
+  const click = (text: string) => runtime.handleCallback(query(button(text)), ctx);
+  return { runtime, ctx, panels, answers, trashed, deps, button, query, click, scheduled, state,
+    remove: () => { sessions = []; }, setEditHook: (hook: () => void) => { editHook = hook; },
+    open: () => runtime.open({ chatId: 7, threadId: 41 }, ctx),
+    change: () => { sessions[0]!.modified = new Date(1900000000000); },
+    setScanHook: (hook: () => Promise<void>) => { scanHook = hook; },
+    setMoveHook: (hook: () => Promise<void>) => { moveHook = hook; },
+  };
+}
+
+test("/delete enters its native panel with execution authority", async () => {
+  const f = createFencedCommandTargetFixture(); let opened = 0;
+  f.deps.openSessionDeletion = async (_message, ctx, options) => {
+    options?.assertAuthority?.(); assert.equal(ctx, f.ctx); opened++;
+  };
+  const command = createTelegramCommandHandlerTargetRuntime(f.deps);
+  assert.equal(await command("delete", f.message, f.ctx, ""), true);
+  assert.equal(opened, 1);
+  f.revoke();
+  await assert.rejects(command("delete", f.message, f.ctx, ""), /authority revoked/);
+  assert.equal(opened, 1);
+});
+
+test("session deletion stays in one panel across multiple deletes and closes only on Done", async () => {
+  const f = createSessionDeletionFixture(); await f.open();
+  assert.equal(f.panels[0]!.markup.inline_keyboard.flat().length, 3);
+  assert.doesNotMatch(f.panels[0]!.markup.inline_keyboard.flat().map(b => b.text).join(" "), /Protected|Foreign/);
+  await f.click("Session 0");
+  assert.match(f.panels.at(-1)!.html, /Session 0 &lt;test&gt;/);
+  const oldConfirm = f.button("Confirm delete");
+  await f.click("Confirm delete");
+  assert.deepEqual(f.trashed, ["history-0"]);
+  assert.ok(f.button("Session 1")); assert.ok(f.button("完成"));
+  await f.runtime.handleCallback(f.query(oldConfirm), f.ctx);
+  assert.deepEqual(f.trashed, ["history-0"]);
+  await f.click("Session 1"); await f.click("Confirm delete");
+  assert.match(f.panels.at(-1)!.html, /No other saved sessions/);
+  const done = f.button("完成"); await f.click("完成");
+  assert.match(f.panels.at(-1)!.html, /Deleted 2 session/);
+  assert.deepEqual(f.panels.at(-1)!.markup.inline_keyboard, []);
+  await f.runtime.handleCallback(f.query(done), f.ctx);
+  assert.match(f.answers.at(-1)!, /expired/);
+});
+
+test("session deletion supports cancel, pagination and page clamping after the final page empties", async () => {
+  const f = createSessionDeletionFixture(9); await f.open();
+  await f.click("Next"); assert.match(f.panels.at(-1)!.html, /Page 2\/2/);
+  await f.click("Session 8"); await f.click("Cancel");
+  assert.deepEqual(f.trashed, []); assert.ok(f.button("Session 8"));
+  await f.click("Session 8"); await f.click("Confirm delete");
+  assert.match(f.panels.at(-1)!.html, /Page 1\/1/); assert.ok(f.button("完成"));
+});
+
+test("session deletion rejects another target, message, stale view, session and workspace", async () => {
+  const f = createSessionDeletionFixture(); await f.open(); const data = f.button("Session 0");
+  for (const mutation of [
+    (q: ReturnType<typeof f.query>) => { q.message.chat.id = 8; },
+    (q: ReturnType<typeof f.query>) => { q.message.message_thread_id = 42; },
+    (q: ReturnType<typeof f.query>) => { q.message.message_id = 21; },
+  ]) { const q = f.query(data); mutation(q); await f.runtime.handleCallback(q, f.ctx); }
+  assert.equal(f.panels.length, 1);
+  await f.open(); await f.runtime.handleCallback(f.query(data), f.ctx);
+  assert.equal(f.panels.length, 2);
+  f.ctx.id = "changed"; await f.click("Session 0"); assert.equal(f.panels.length, 2);
+  f.ctx.id = "current"; f.ctx.cwd = "/other"; await f.click("Session 0"); assert.equal(f.panels.length, 2);
+  f.ctx.cwd = "/repo"; f.ctx.active = false; await f.click("Session 0");
+  assert.equal(f.panels.length, 2); assert.deepEqual(f.trashed, []);
+});
+
+test("session deletion refreshes after a changed file and requires a new confirmation", async () => {
+  const f = createSessionDeletionFixture(); await f.open(); await f.click("Session 0");
+  const confirm = f.button("Confirm delete"); f.change(); await f.click("Confirm delete");
+  assert.deepEqual(f.trashed, []); assert.match(f.panels.at(-1)!.html, /could not be completed/);
+  await f.runtime.handleCallback(f.query(confirm), f.ctx); assert.deepEqual(f.trashed, []);
+  await f.click("Session 0"); await f.click("Confirm delete"); assert.equal(f.trashed.length, 1);
+});
+
+test("session deletion fences duplicate confirmations and revalidates after awaited disposition", async () => {
+  const f = createSessionDeletionFixture(); await f.open(); await f.click("Session 0");
+  let resume!: () => void;
+  f.setMoveHook(() => new Promise<void>(resolve => { resume = resolve; }));
+  const query = f.query(f.button("Confirm delete"));
+  const first = f.runtime.handleCallback(query, f.ctx);
+  await new Promise(resolve => setImmediate(resolve));
+  await f.runtime.handleCallback(query, f.ctx);
+  assert.deepEqual(f.trashed, []);
+  f.ctx.active = false; resume(); await first;
+  assert.deepEqual(f.trashed, []);
+});
+
+test("session deletion never grants filesystem authority from malformed or expired callback data", async () => {
+  const f = createSessionDeletionFixture(); await f.open();
+  for (const suffix of [":select:../../x", ":confirm:1", ":page", ":unknown"]) {
+    const data = f.button("完成").replace(":done", suffix);
+    await f.runtime.handleCallback(f.query(data), f.ctx);
+  }
+  const now = Date.now;
+  try { Date.now = () => now() + 16 * 60_000; await f.click("Session 0"); }
+  finally { Date.now = now; }
+  assert.deepEqual(f.trashed, []); assert.equal(f.panels.length, 1);
+});
+
+
+test("deletion pagination, cancel and consecutive successful moves never rescan the open list", async () => {
+  const f = createSessionDeletionFixture(9); let scans = 0;
+  f.setScanHook(async () => { scans++; });
+  await f.open(); await f.click("Next"); await f.click("Session 8"); await f.click("Cancel");
+  await f.click("Session 8"); await f.click("Confirm delete");
+  assert.match(f.panels.at(-1)!.html, /Page 1\/1/);
+  await f.click("Session 0"); await f.click("Confirm delete"); await f.click("完成");
+  assert.deepEqual(f.trashed, ["history-8", "history-0"]);
+  assert.match(f.panels.at(-1)!.html, /Deleted 2 session/);
+  assert.equal(scans, 1);
+});
+
+test("a changed deletion selection refreshes once and the next confirmed move reuses that recovered snapshot", async () => {
+  const f = createSessionDeletionFixture(); let scans = 0;
+  f.setScanHook(async () => { scans++; });
+  await f.open(); await f.click("Session 0"); f.change(); await f.click("Confirm delete");
+  assert.deepEqual(f.trashed, []); assert.equal(scans, 2);
+  await f.click("Session 0"); await f.click("Confirm delete");
+  assert.deepEqual(f.trashed, ["history-0"]); assert.equal(scans, 2);
+});
+
+for (const kind of ["delete", "resume"] as const) {
+  test(`${kind} session choices use escaped native callback rows aligned left without a duplicate footer`, async () => {
+    const f = createSessionDeletionFixture(9, kind); await f.open();
+    const rich = f.panels.at(-1)!.richMessage?.html; assert.ok(rich);
+    assert.match(rich, /<tg-button-row align="left">/); assert.doesNotMatch(rich, /align="center"|<test>/);
+    assert.match(rich, /Session 0 &lt;test&gt;/); assert.doesNotMatch(rich, /Protected|Foreign/);
+    assert.equal((rich.match(/<tg-button-row/g) ?? []).length, 10);
+    assert.equal((rich.match(/type="callback_data"/g) ?? []).length, 10);
+    assert.equal((rich.match(/style="link"/g) ?? []).length, 10);
+    await f.click("Next"); assert.match(f.panels.at(-1)!.richMessage!.html!, /Session 8 &lt;test&gt;/);
+  });
+}
+
+test("resume panel uses its original selection after paging and sorting changes and schedules exactly once", async () => {
+  const f = createSessionDeletionFixture(9, "resume"); let scans = 0;
+  f.setScanHook(async () => { scans++; }); await f.open(); await f.click("Next"); await f.click("Previous");
+  assert.equal(scans, 1, "Navigation retains the open snapshot");
+  f.change(); const data = f.button("Session 0"), query = f.query(data);
+  assert.equal(await f.runtime.handleCallback(query, f.ctx), true);
+  assert.deepEqual(f.scheduled, [{ id: "history-0", source: query }]); assert.equal(scans, 2, "Selection checks fresh availability");
+  assert.match(f.panels.at(-1)!.html, /Switching Pi session/);
+  assert.deepEqual(f.panels.at(-1)!.markup.inline_keyboard, []);
+  assert.doesNotMatch(f.panels.at(-1)!.richMessage!.html!, /tg-button/);
+  await f.runtime.handleCallback(query, f.ctx); assert.equal(f.scheduled.length, 1);
+  assert.equal(await f.runtime.handleCallback(f.query("sessiondelete:0000000000000000:done"), f.ctx), false);
+});
+
+for (const flag of ["idle", "pending", "turn", "dispatch", "queued", "compacting"] as const) {
+  test(`resume selection refuses ${flag} both before and after fresh availability lookup`, async () => {
+    const f = createSessionDeletionFixture(2, "resume"); await f.open();
+    f.state[flag] = flag !== "idle"; await f.click("Session 0");
+    assert.deepEqual(f.scheduled, []); assert.match(f.answers.at(-1)!, /busy/);
+    f.state[flag] = flag === "idle";
+    f.setScanHook(async () => { f.state[flag] = flag !== "idle"; });
+    await f.click("Session 0"); assert.deepEqual(f.scheduled, []);
+  });
+}
+
+test("resume selection fences wrong targets, stale and malformed data, expiry, replaced sessions and workspaces", async () => {
+  const f = createSessionDeletionFixture(2, "resume"); await f.open(); const data = f.button("Session 0");
+  for (const patch of [
+    (q: ReturnType<typeof f.query>) => { q.message.chat.id++; },
+    (q: ReturnType<typeof f.query>) => { q.message.message_thread_id++; },
+    (q: ReturnType<typeof f.query>) => { q.message.message_id++; },
+  ]) { const q = f.query(data); patch(q); await f.runtime.handleCallback(q, f.ctx); }
+  for (const suffix of [":confirm", ":select:../../x", ":page", ":select:999999", ":done:1"])
+    await f.runtime.handleCallback(f.query(data.replace(/:select:0$/, suffix)), f.ctx);
+  await f.open(); await f.runtime.handleCallback(f.query(data), f.ctx);
+  f.ctx.id = "different"; await f.click("Session 0"); f.ctx.id = "current";
+  f.ctx.cwd = "/different"; await f.click("Session 0"); f.ctx.cwd = "/repo";
+  f.ctx.active = false; await f.click("Session 0"); f.ctx.active = true;
+  const now = Date.now;
+  try { Date.now = () => now() + 16 * 60_000; await f.click("Session 0"); } finally { Date.now = now; }
+  assert.deepEqual(f.scheduled, []);
+});
+
+test("resume selection refreshes missing destinations, supports Done on an empty list, and never switches", async () => {
+  const f = createSessionDeletionFixture(2, "resume"); await f.open(); f.remove(); await f.click("Session 0");
+  assert.deepEqual(f.scheduled, []); assert.match(f.panels.at(-1)!.html, /could not be completed/);
+  assert.match(f.panels.at(-1)!.html, /No other saved sessions/); await f.click("完成");
+  assert.match(f.panels.at(-1)!.html, /selection closed/); assert.deepEqual(f.panels.at(-1)!.markup.inline_keyboard, []);
+});
+
+for (const loss of ["busy", "context", "execution"] as const) {
+  test(`resume selection refuses ${loss} after its awaited message edit`, async () => {
+    const f = createSessionDeletionFixture(2, "resume"); await f.open(); let current = true;
+    f.setEditHook(() => { if (loss === "busy") f.state.pending = true; else if (loss === "context") f.ctx.active = false; else current = false; });
+    const clicked = f.runtime.handleCallback(f.query(f.button("Session 0")), f.ctx, () => { if (!current) throw new Error("execution revoked"); });
+    if (loss === "execution") await assert.rejects(clicked, /execution revoked/); else await clicked;
+    assert.deepEqual(f.scheduled, []);
+  });
+}
+
+test("resume duplicate clicks stay fenced while availability is pending", async () => {
+  const f = createSessionDeletionFixture(2, "resume"); await f.open(); let finish!: () => void;
+  f.setScanHook(() => new Promise<void>(resolve => { finish = resolve; }));
+  const q = f.query(f.button("Session 0")); const first = f.runtime.handleCallback(q, f.ctx);
+  await new Promise(resolve => setImmediate(resolve)); await f.runtime.handleCallback(q, f.ctx);
+  finish(); await first; assert.equal(f.scheduled.length, 1);
+});
+test("session action source reads classic and Thread callback targets only from a durable root carrier", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-session-choice-source-")), ctx = {};
+  const options = { path: join(dir, "journal.json"), botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "fixture" }) };
+  const journal = createTelegramUpdateJournalStore(options), key = createTelegramUpdateJournalBindingKey(options);
+  const observed: unknown[] = [];
+  const worker = createTelegramUpdateAdmissionWorkerRuntime<TelegramJournaledUpdate, typeof ctx>({ journal,
+    getJournalBindingKey: () => key, hasAuthority: () => true, isContextCurrent: value => value === ctx,
+    async defaultHandle(update) {
+      const source = update.callback_query ?? update.message;
+      observed.push(getTelegramSessionActionSource(source));
+      assert.throws(() => getTelegramSessionActionSource({ ...source! }), /durable update authority/);
+    },
+  });
+  worker.start(ctx);
+  try {
+    await worker.waitForDrain();
+    journal.appendBatch([
+      { update_id: 1, message: { message_id: 10, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false } } },
+      { update_id: 2, callback_query: { id: "choice", from: { id: 7, is_bot: false }, data: "choice",
+        message: { message_id: 99, chat: { id: 7, type: "private" }, message_thread_id: 41 } } },
+    ]);
+    worker.signal(); await worker.waitForDrain();
+    assert.deepEqual(observed, [{ updateId: 1, target: { chatId: 7, messageId: 10 } },
+      { updateId: 2, target: { chatId: 7, messageId: 99, threadId: 41 } }]);
+  } finally { await worker.stop(); rmSync(dir, { recursive: true, force: true }); }
 });

@@ -14464,3 +14464,71 @@ test("Routing refuses Thinking menu callbacks while the active turn replies by v
   await click("text");
   assert.ok(harness.events.includes("answer:This model has no reasoning controls"), harness.events.join("\n"));
 });
+
+
+test("admitted /delete callbacks continuously refresh the panel without queueing a model turn", async () => {
+  let sessions = [{ id: "historical", cwd: "/repo", name: "Historical", modified: new Date(1000) }];
+  const panels: { html: string; markup: Menu.TelegramReplyMarkup }[] = [];
+  let deletes = 0;
+  const harness = createRouteHarness({ isContextActive: () => true,
+    sessionDeletion: { listSessions: async () => sessions, getSessionId: () => "current", getCwd: ctx => ctx.cwd,
+      async trashSession(_ctx, id, _modified, assertCurrent) { assertCurrent(); assert.equal(id, "historical"); deletes++; sessions = []; } },
+    async sendInteractiveMessage(_chat, html, _mode, markup, options) {
+      options?.assertAuthority?.(); panels.push({ html, markup }); return 99;
+    },
+    async editInteractiveMessage(_chat, _message, html, _mode, markup, options) {
+      options?.assertAuthority?.(); panels.push({ html, markup });
+    },
+  });
+  const ctx = { cwd: "/repo" };
+  const message: TestMessage = { message_id: 10, chat: { id: 100, type: "private" }, from: { id: 7, is_bot: false }, text: "/delete" };
+  await harness.routeRuntime.handleUpdate({ message: { ...message, from: { id: 8, is_bot: false } } }, ctx);
+  assert.equal(panels.length, 0);
+  await harness.routeRuntime.handleUpdate({ message }, ctx);
+  assert.equal(panels.length, 1);
+  const click = async (label: string, owner = 7) => {
+    const markup = panels.at(-1)!.markup;
+    assert.ok("inline_keyboard" in markup);
+    const button = markup.inline_keyboard.flat().find(b => "text" in b && b.text.includes(label));
+    assert.ok(button && "callback_data" in button);
+    await harness.routeRuntime.handleUpdate({ callback_query: { id: `click-${panels.length}`, from: { id: owner, is_bot: false },
+      message: { message_id: 99, chat: { id: 100, type: "private" } }, data: button.callback_data } }, ctx);
+  };
+  await click("Historical", 8); assert.equal(panels.length, 1);
+  await click("Historical"); await click("Confirm delete");
+  assert.equal(deletes, 1); assert.match(panels.at(-1)!.html, /No other saved sessions/);
+  await click("完成"); assert.match(panels.at(-1)!.html, /Deleted 1 session/);
+  assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0);
+  assert.equal(harness.events.filter(e => e.startsWith("user:")).length, 0);
+});
+
+
+test("admitted native /resume choices retain the callback execution source and never enqueue a model prompt", async () => {
+  const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", panels: Menu.TelegramReplyMarkup[] = [];
+  const sources: unknown[] = [], scheduled: string[] = [];
+  const harness = createRouteHarness({ isContextActive: () => true,
+    sessionResume: { listSessions: async () => [{ id, cwd: "/repo", name: "Saved", modified: new Date(1000) }],
+      getSessionId: () => "current", getCwd: ctx => ctx.cwd,
+      requestResumeSession(source, selected) { sources.push(source); scheduled.push(selected); } },
+    async sendInteractiveMessage(_chat, _html, _mode, markup, options) {
+      options?.assertAuthority?.(); assert.match(options?.richMessage?.html ?? "", /align="left"/); panels.push(markup); return 99;
+    },
+    async editInteractiveMessage(_chat, _message, _html, _mode, markup, options) {
+      options?.assertAuthority?.(); panels.push(markup);
+    },
+  });
+  const ctx = { cwd: "/repo" };
+  await harness.routeRuntime.handleUpdate({ message: { message_id: 10, chat: { id: 100, type: "private" },
+    from: { id: 7, is_bot: false }, text: "/resume" } }, ctx);
+  assert.equal(panels.length, 1); const markup = panels[0]!; assert.ok("inline_keyboard" in markup);
+  const button = markup.inline_keyboard.flat().find(b => "text" in b && b.text.includes("Saved"));
+  assert.ok(button && "callback_data" in button);
+  const query: TestCallbackQuery = { id: "resume-choice", from: { id: 7, is_bot: false }, data: button.callback_data,
+    message: { message_id: 99, chat: { id: 100, type: "private" } } };
+  await harness.routeRuntime.handleUpdate({ callback_query: { ...query, from: { id: 8, is_bot: false } } }, ctx);
+  assert.deepEqual(scheduled, []);
+  await harness.routeRuntime.handleUpdate({ callback_query: query }, ctx);
+  assert.deepEqual(scheduled, [id]); assert.equal(sources[0], query, "The root callback retains its durable execution carrier");
+  await harness.routeRuntime.handleUpdate({ callback_query: query }, ctx); assert.equal(scheduled.length, 1);
+  assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0); assert.equal(harness.events.filter(e => e.startsWith("user:")).length, 0);
+});

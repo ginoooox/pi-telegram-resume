@@ -48,7 +48,7 @@ import { createTelegramThreadTarget } from "../lib/target.ts";
 import { createDefaultTelegramBridgeApiRuntime, TelegramApiAuthorityError, TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
 
-type RenderedFenceSurface = "plain" | "interactive" | "edit" | "html" | "native" | "rich";
+type RenderedFenceSurface = "plain" | "interactive" | "edit" | "html" | "native" | "rich" | "rich-interactive" | "rich-edit";
 type RenderedFenceOptions = { target: { chatId: number; threadId: number }; replyToMessageId: number; assertAuthority: () => void };
 
 function createRenderedFenceFixture(options: RenderedFenceOptions, ports: {
@@ -89,6 +89,8 @@ function createRenderedFenceFixture(options: RenderedFenceOptions, ports: {
 }
 
 function issueRenderedFenceSurface(surface: RenderedFenceSurface, runtime: ReturnType<typeof createRenderedFenceFixture>["runtime"], options: RenderedFenceOptions) {
+  if (surface === "rich-interactive") return runtime.sendInteractiveMessage(7, "unused", "html", {}, { ...options, richMessage: { html: '<p>Choices</p><tg-button-row align="left"><tg-button type="callback_data" data="sessionresume:0123456789abcdef:select:0">Saved</tg-button></tg-button-row>' } });
+  if (surface === "rich-edit") return runtime.editInteractiveMessage(7, 99, "unused", "html", {}, { ...options, richMessage: { html: "<p>Closed</p>" } });
   if (surface === "plain") return runtime.sendTextReply(7, 21, "text", options);
   if (surface === "interactive") return runtime.sendInteractiveMessage(7, "text", "html", {}, options);
   if (surface === "edit") return runtime.editInteractiveMessage(7, 99, "text", "html", {}, options);
@@ -97,7 +99,7 @@ function issueRenderedFenceSurface(surface: RenderedFenceSurface, runtime: Retur
   return runtime.sendSectionRichMessage(7, { markdown: "text" }, options);
 }
 
-for (const surface of ["plain", "interactive", "edit", "html", "native", "rich"] as const) {
+for (const surface of ["plain", "interactive", "edit", "html", "native", "rich", "rich-interactive", "rich-edit"] as const) {
   for (const revoke of [false, true]) {
     test(`Rendered reply fence ${surface} ${revoke ? "refuses response-time loss" : "retains current authority"} through actual direct API`, async () => {
       let current = true;
@@ -117,10 +119,16 @@ for (const surface of ["plain", "interactive", "edit", "html", "native", "rich"]
           assert.deepEqual(f.owned, []);
         } else {
           await issued;
-          assert.equal(f.requests.length, surface === "rich" ? 1 : 2);
+          assert.equal(f.requests.length, ["rich", "rich-interactive", "rich-edit"].includes(surface) ? 1 : 2);
           assert.equal(f.owned.length, f.requests.length);
           assert.deepEqual(f.requests.map(({ method }) => method), surface === "edit" ? ["editMessageText", "sendMessage"] :
-            Array(f.requests.length).fill(surface === "rich" || surface === "native" ? "sendRichMessage" : "sendMessage"));
+            Array(f.requests.length).fill(surface === "rich-edit" ? "editMessageText" :
+              ["rich", "native", "rich-interactive"].includes(surface) ? "sendRichMessage" : "sendMessage"));
+          if (surface === "rich-interactive" || surface === "rich-edit") {
+            assert.ok(f.requests[0]!.body.rich_message); assert.equal(f.requests[0]!.body.reply_markup, undefined);
+            assert.equal(f.requests[0]!.body.text, undefined);
+            if (surface === "rich-interactive") assert.match(JSON.stringify(f.requests[0]!.body.rich_message), /align=\\"left/);
+          }
         }
         assert.ok(f.requests.every(({ body }) => body.chat_id === 7 && body.message_thread_id === 42));
         assert.ok(f.requests.every(({ body }) => !("assertAuthority" in body)), "Local authority is not wire data.");
@@ -203,7 +211,7 @@ for (const boundary of ["adapter-return", "ownership-publication"] as const) {
   });
 }
 
-for (const surface of ["interactive", "edit", "rich"] as const) {
+for (const surface of ["interactive", "edit", "rich", "rich-interactive", "rich-edit"] as const) {
   test(`Rendered reply fence ${surface} cannot serialize recipient authority through follower IPC`, async () => {
     const options = { target: { chatId: 7, threadId: 42 }, replyToMessageId: 21, assertAuthority() {} };
     const f = createRenderedFenceFixture(options, { direct: false });

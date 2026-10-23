@@ -51,6 +51,7 @@ export type TelegramStatusLineProvider = (ctx: TelegramStatusLineProviderContext
 export interface TelegramStatusContext {
     sessionManager: {
         getEntries(): TelegramStatusSessionEntry[];
+        getSessionName?(): string | undefined;
     };
     getContextUsage(): TelegramContextUsage | undefined;
     isIdle?: () => boolean;

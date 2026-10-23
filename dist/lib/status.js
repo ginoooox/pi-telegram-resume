@@ -1174,6 +1174,7 @@ function buildStatusHtml(ctx, activeModel, bridgeStatus) {
     const lines = [
         buildStatusRow("Status", `${buildStatusSummary(ctx)}${buildTelegramStatusRoleSuffix(bridgeStatus)}`),
     ];
+    lines.push(buildStatusRow("Session", ctx.sessionManager.getSessionName?.()?.trim() || "Unnamed"));
     const usageSummary = buildUsageSummary(stats);
     const cacheSummary = buildCacheSummary(stats);
     const costSummary = buildCostSummary(stats, usesSubscription);

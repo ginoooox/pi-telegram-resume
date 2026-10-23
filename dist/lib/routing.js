@@ -1032,6 +1032,8 @@ const TELEGRAM_OWNED_CALLBACK_PREFIXES = [
     "menu:",
     "model:",
     "new:",
+    "sessiondelete:",
+    "sessionresume:",
     "queue:",
     "section:",
     "settings:",
@@ -6817,6 +6819,11 @@ export function createTelegramInboundRouteRuntime(deps) {
             }
             return;
         }
+        if (await sessionDeletion?.handleCallback(query, ctx, assertExecutionCurrent))
+            return;
+        if (await sessionResume?.handleCallback(query, ctx, assertExecutionCurrent))
+            return;
+        assertExecutionCurrent();
         const handledByNew = await Commands.handleTelegramNewConfirmationCallback(query, {
             ctx,
             answerCallbackQuery: deps.answerCallbackQuery,
@@ -6982,6 +6989,31 @@ export function createTelegramInboundRouteRuntime(deps) {
     const reservedCommandNames = () => new Set(Commands.getTelegramReservedCommandNames());
     const getPromptTemplateCommands = () => PromptTemplates.getTelegramPromptTemplateCommands(deps.getCommands(), reservedCommandNames());
     const expandPromptTemplateCommand = (name, args) => PromptTemplates.expandTelegramPromptTemplateCommand(name, args, getPromptTemplateCommands());
+    const sessionDeletion = deps.listSessions && deps.trashSession && deps.getSessionId && deps.getCwd &&
+        deps.sendInteractiveMessage && deps.editInteractiveMessage && deps.isContextActive
+        ? Commands.createTelegramSessionDeletionRuntime({
+            listSessions: deps.listSessions, trashSession: deps.trashSession,
+            getSessionId: deps.getSessionId, getCwd: deps.getCwd,
+            isContextActive: deps.isContextActive,
+            sendInteractiveMessage: deps.sendInteractiveMessage,
+            editInteractiveMessage: deps.editInteractiveMessage,
+            answerCallbackQuery: deps.answerCallbackQuery,
+            recordRuntimeEvent: deps.recordRuntimeEvent,
+        }) : undefined;
+    const sessionResume = deps.listSessions && deps.getSessionId && deps.getCwd && deps.requestResumeSession &&
+        deps.sendInteractiveMessage && deps.editInteractiveMessage && deps.isContextActive
+        ? Commands.createTelegramSessionResumeRuntime({
+            listSessions: deps.listSessions, getSessionId: deps.getSessionId, getCwd: deps.getCwd,
+            isContextActive: deps.isContextActive, sendInteractiveMessage: deps.sendInteractiveMessage,
+            editInteractiveMessage: deps.editInteractiveMessage, answerCallbackQuery: deps.answerCallbackQuery,
+            requestResumeSession: deps.requestResumeSession, recordRuntimeEvent: deps.recordRuntimeEvent,
+            isIdle: deps.isIdle,
+            hasPendingMessages: deps.hasPendingMessages,
+            hasActiveTelegramTurn: deps.activeTurnRuntime.has,
+            hasDispatchPending: deps.bridgeRuntime.lifecycle.hasDispatchPending,
+            hasQueuedTelegramItems: deps.telegramQueueStore.hasQueuedItems,
+            isCompactionInProgress: deps.bridgeRuntime.lifecycle.isCompactionInProgress,
+        }) : undefined;
     const commandHandler = Commands.createTelegramCommandHandlerTargetRuntime({
         assertExecutionCurrent(message) {
             Updates.assertTelegramUpdateExecutionCurrent(message);
@@ -7031,6 +7063,12 @@ export function createTelegramInboundRouteRuntime(deps) {
         requestNewSession: deps.requestNewSession,
         setSessionName: deps.setSessionName,
         listSessions: deps.listSessions,
+        openSessionDeletion: sessionDeletion
+            ? (message, ctx, options) => sessionDeletion.open(Commands.getTelegramCommandMessageTarget(message), ctx, options?.assertAuthority)
+            : undefined,
+        openSessionResume: sessionResume
+            ? (message, ctx, options) => sessionResume.open(Commands.getTelegramCommandMessageTarget(message), ctx, options?.assertAuthority)
+            : undefined,
         getSessionId: deps.getSessionId,
         getCwd: deps.getCwd,
         requestResumeSession: deps.requestResumeSession,

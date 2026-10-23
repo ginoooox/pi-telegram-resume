@@ -197,6 +197,17 @@ export async function editTelegramRenderedMessage(chatId, messageId, chunks, dep
     const assertAuthority = options.assertAuthority;
     assertTelegramApiCallAuthority(assertAuthority, false);
     assertTelegramInlineKeyboardCallbackData(options?.replyMarkup);
+    if (options.richMessage) {
+        if (!assertAuthority)
+            deps.recordOwnership?.({ chatId, messageId, target: options.target });
+        await deps.editMessage({ chat_id: chatId, message_id: messageId, rich_message: options.richMessage,
+            ...(options.target ? getTelegramTargetThreadParams(options.target) : {}) }, assertAuthority ? { assertAuthority } : undefined);
+        assertTelegramApiCallAuthority(assertAuthority, true);
+        if (assertAuthority)
+            deps.recordOwnership?.({ chatId, messageId, target: options.target });
+        assertTelegramApiCallAuthority(assertAuthority, true);
+        return messageId;
+    }
     if (chunks.length === 0)
         return messageId;
     const [firstChunk, ...remainingChunks] = chunks;
@@ -539,13 +550,15 @@ export function createTelegramRenderedMessageRuntime(deps) {
                 ...options,
                 target: options?.target && { ...options.target },
             };
-            await deps.replyTransport.editRenderedMessage(chatId, messageId, deps.renderTelegramMessage(text, { mode }), { ...options, replyMarkup });
+            await deps.replyTransport.editRenderedMessage(chatId, messageId, options.richMessage ? [] : deps.renderTelegramMessage(text, { mode }), { ...options, replyMarkup: options.richMessage ? undefined : replyMarkup });
         },
         sendInteractiveMessage: async (chatId, text, mode, replyMarkup, options) => {
             options = {
                 ...options,
                 target: options?.target && { ...options.target },
             };
+            if (options.richMessage)
+                return sendTelegramNativeRichMessage(chatId, options.richMessage, { recordOwnership: deps.recordOwnership, sendRichMessage: deps.sendRichMessage }, options);
             return deps.replyTransport.sendRenderedChunks(chatId, deps.renderTelegramMessage(text, { mode }), {
                 replyMarkup,
                 target: options?.target,

@@ -173,7 +173,8 @@ Use these in the bot DM.
 | `/start` | Pair when needed and open the main operator menu |
 | `/name [Name]` | Set a manual Thread title immediately, or open rename/reset controls when Name is omitted |
 | `/rename Name` | Rename the active Pi session without changing its Telegram Thread title |
-| `/resume [Name, number, or ID]` | List up to 12 recent sessions in the current workspace, or resume by exact name, a number from the last list, or a unique ID prefix |
+| `/delete` | Continuously remove historical workspace sessions through a paginated confirmation panel; select `✅ 完成` to finish. Files move to a recoverable session recycle folder. |
+| `/resume [Name or ID]` | Open a clickable, paged current-workspace session selector, or resume by exact name or a unique ID prefix |
 | `/new` | Start a new Pi session in the current classic chat or Thread after confirming the bridge is idle |
 | `/compact` | Confirm and run session compaction when safe |
 | `/next` | Dispatch the next queued turn, aborting first if needed |
@@ -181,7 +182,7 @@ Use these in the bot DM.
 | `/abort` | Abort the active run while preserving the queue |
 | `/stop` | Abort the active run and clear waiting Telegram turns |
 
-Hidden compatibility shortcuts: `/help`, `/status`, `/model`, `/thinking`, `/queue`, and `/settings` jump into the same menu system.
+Hidden compatibility shortcuts: `/help`, `/status`, `/model`, `/thinking`, `/queue`, and `/settings` jump into the same menu system. The status panel includes the current Pi session name (`Unnamed` until named), refreshed whenever the panel opens.
 
 ## Pi Commands
 
@@ -318,7 +319,7 @@ Configuration lives in `telegram.json`; runtime data lives under `<agent-dir>/tm
 - Replace Pi session lifecycle without an official Pi API.
 - Let non-owner Telegram users control the bridge.
 
-Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session; `/new` starts a new session, and `/resume` lists and switches saved sessions in the current workspace using Pi's public session API. Both switching flows require an idle bridge and preserve the connection's Thread ownership rules. Forking and tree navigation remain Pi TUI operations.
+Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session; `/new` starts a new session, and `/resume` lists and switches saved sessions in the current workspace using Pi's public session API. Both switching flows require an idle bridge and preserve the connection's Thread ownership rules. `/delete` provides a separate current-workspace cleanup panel: every confirmed historical deletion refreshes the same list, `✅ 完成` closes it, and current sessions remain protected. Session JSONL files move unchanged into the session directory's private `.trash/<operation>/` folder with restoration metadata; Telegram messages and bridge journals are preserved. Both `/resume` and `/delete` use a small disposable summary index, so unchanged histories are not rescanned. Cleanup paging and cancel reuse the open list; Pi loads only the selected session on resume. Forking and tree navigation remain Pi TUI operations.
 
 Telegram prompts run in the active Pi session and use its current context, just like prompts sent from the terminal.
 

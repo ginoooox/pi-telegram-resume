@@ -271,7 +271,7 @@ export interface TelegramReplyTransport<TReplyMarkup> {
     chatId: number,
     messageId: number,
     chunks: TelegramRenderedChunk[],
-    options?: TelegramReplyTargetOptions & { replyMarkup?: TReplyMarkup },
+    options?: TelegramReplyTargetOptions & { replyMarkup?: TReplyMarkup; richMessage?: TelegramInputRichMessage },
   ) => Promise<number | undefined>;
 }
 
@@ -380,12 +380,22 @@ export async function editTelegramRenderedMessage<TReplyMarkup>(
   messageId: number,
   chunks: TelegramRenderedChunk[],
   deps: TelegramReplyDeliveryDeps<TReplyMarkup>,
-  options?: TelegramReplyTargetOptions & { replyMarkup?: TReplyMarkup },
+  options?: TelegramReplyTargetOptions & { replyMarkup?: TReplyMarkup; richMessage?: TelegramInputRichMessage },
 ): Promise<number | undefined> {
   options = { ...options, target: options?.target && { ...options.target } };
   const assertAuthority = options.assertAuthority;
   assertTelegramApiCallAuthority(assertAuthority, false);
   assertTelegramInlineKeyboardCallbackData(options?.replyMarkup);
+  if (options.richMessage) {
+    if (!assertAuthority) deps.recordOwnership?.({ chatId, messageId, target: options.target });
+    await deps.editMessage({ chat_id: chatId, message_id: messageId, rich_message: options.richMessage,
+      ...(options.target ? getTelegramTargetThreadParams(options.target) : {}) },
+      assertAuthority ? { assertAuthority } : undefined);
+    assertTelegramApiCallAuthority(assertAuthority, true);
+    if (assertAuthority) deps.recordOwnership?.({ chatId, messageId, target: options.target });
+    assertTelegramApiCallAuthority(assertAuthority, true);
+    return messageId;
+  }
   if (chunks.length === 0) return messageId;
   const [firstChunk, ...remainingChunks] = chunks;
   if (!assertAuthority)
@@ -844,14 +854,14 @@ export interface TelegramRenderedMessageRuntime<TReplyMarkup> {
     text: string,
     mode: TelegramRenderMode,
     replyMarkup: TReplyMarkup,
-    options?: TelegramReplyTargetOptions,
+    options?: TelegramReplyTargetOptions & { richMessage?: TelegramInputRichMessage },
   ) => Promise<void>;
   sendInteractiveMessage: (
     chatId: number,
     text: string,
     mode: TelegramRenderMode,
     replyMarkup: TReplyMarkup,
-    options?: TelegramReplyTargetOptions,
+    options?: TelegramReplyTargetOptions & { richMessage?: TelegramInputRichMessage },
   ) => Promise<number | undefined>;
   sendSectionRichMessage: (
     chatId: number,
@@ -965,8 +975,8 @@ export function createTelegramRenderedMessageRuntime<TReplyMarkup>(
       await deps.replyTransport.editRenderedMessage(
         chatId,
         messageId,
-        deps.renderTelegramMessage(text, { mode }),
-        { ...options, replyMarkup },
+        options.richMessage ? [] : deps.renderTelegramMessage(text, { mode }),
+        { ...options, replyMarkup: options.richMessage ? undefined : replyMarkup },
       );
     },
     sendInteractiveMessage: async (
@@ -980,6 +990,8 @@ export function createTelegramRenderedMessageRuntime<TReplyMarkup>(
         ...options,
         target: options?.target && { ...options.target },
       };
+      if (options.richMessage) return sendTelegramNativeRichMessage(chatId, options.richMessage,
+        { recordOwnership: deps.recordOwnership, sendRichMessage: deps.sendRichMessage }, options);
       return deps.replyTransport.sendRenderedChunks(
         chatId,
         deps.renderTelegramMessage(text, { mode }),
